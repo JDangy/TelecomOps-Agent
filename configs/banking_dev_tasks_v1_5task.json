@@ -1,0 +1,33 @@
+{
+  "domain": "banking_knowledge",
+  "description": "Fixed 5-task dev evaluation set for banking_knowledge (RAG). Source: tau2-bench banking_knowledge. These task IDs are frozen so retrieval ablation runs (bm25 / embeddings / etc.) always evaluate on the same tasks.",
+  "task_ids": [
+    "task_001",
+    "task_003",
+    "task_004",
+    "task_007",
+    "task_008"
+  ],
+  "tasks_meta": [
+    {
+      "task_id": "task_001",
+      "num_required_documents": 4
+    },
+    {
+      "task_id": "task_003",
+      "num_required_documents": 5
+    },
+    {
+      "task_id": "task_004",
+      "num_required_documents": 1
+    },
+    {
+      "task_id": "task_007",
+      "num_required_documents": 4
+    },
+    {
+      "task_id": "task_008",
+      "num_required_documents": 6
+    }
+  ]
+}

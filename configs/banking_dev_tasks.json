@@ -1,17 +1,40 @@
 {
   "domain": "banking_knowledge",
-  "description": "Fixed 5-task dev evaluation set for banking_knowledge (RAG). Source: tau2-bench banking_knowledge. These task IDs are frozen so retrieval ablation runs (bm25 / embeddings / etc.) always evaluate on the same tasks.",
+  "description": "Fixed 24-task dev set (stratified by required_documents: 3 easy / 7 medium / 14 hard). Source: tau2-bench banking_knowledge, seed=42 stratified sample. Frozen for retrieval ablation comparison.",
   "task_ids": [
     "task_001",
+    "task_002",
     "task_003",
     "task_004",
     "task_007",
-    "task_008"
+    "task_008",
+    "task_010",
+    "task_020",
+    "task_021",
+    "task_024",
+    "task_026",
+    "task_027",
+    "task_029",
+    "task_037",
+    "task_046",
+    "task_053",
+    "task_054",
+    "task_070",
+    "task_077",
+    "task_080",
+    "task_088",
+    "task_092",
+    "task_095",
+    "task_100"
   ],
   "tasks_meta": [
     {
       "task_id": "task_001",
       "num_required_documents": 4
+    },
+    {
+      "task_id": "task_002",
+      "num_required_documents": 6
     },
     {
       "task_id": "task_003",
@@ -28,6 +51,78 @@
     {
       "task_id": "task_008",
       "num_required_documents": 6
+    },
+    {
+      "task_id": "task_010",
+      "num_required_documents": 2
+    },
+    {
+      "task_id": "task_020",
+      "num_required_documents": 8
+    },
+    {
+      "task_id": "task_021",
+      "num_required_documents": 8
+    },
+    {
+      "task_id": "task_024",
+      "num_required_documents": 6
+    },
+    {
+      "task_id": "task_026",
+      "num_required_documents": 8
+    },
+    {
+      "task_id": "task_027",
+      "num_required_documents": 8
+    },
+    {
+      "task_id": "task_029",
+      "num_required_documents": 10
+    },
+    {
+      "task_id": "task_037",
+      "num_required_documents": 4
+    },
+    {
+      "task_id": "task_046",
+      "num_required_documents": 3
+    },
+    {
+      "task_id": "task_053",
+      "num_required_documents": 9
+    },
+    {
+      "task_id": "task_054",
+      "num_required_documents": 9
+    },
+    {
+      "task_id": "task_070",
+      "num_required_documents": 16
+    },
+    {
+      "task_id": "task_077",
+      "num_required_documents": 12
+    },
+    {
+      "task_id": "task_080",
+      "num_required_documents": 19
+    },
+    {
+      "task_id": "task_088",
+      "num_required_documents": 14
+    },
+    {
+      "task_id": "task_092",
+      "num_required_documents": 12
+    },
+    {
+      "task_id": "task_095",
+      "num_required_documents": 15
+    },
+    {
+      "task_id": "task_100",
+      "num_required_documents": 12
     }
   ]
 }
