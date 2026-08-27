@@ -1,0 +1,183 @@
+# TelecomOps-Agent
+
+Evaluation-driven Agent system 实习项目：在电信客服 domain 上构建、评估并逐步改进一个客服 Agent。
+
+底层 benchmark 使用 [sierra-research/tau2-bench](https://github.com/sierra-research/tau2-bench)（τ³-bench）的 **telecom** domain。**本项目代码与官方 benchmark 解耦**：tau2-bench 只作为底层依赖（`third_party/tau2-bench`，editable 安装），所有 evaluation 逻辑、结果存储、指标计算都在本项目内实现。
+
+## 当前阶段：V0 baseline
+
+- **Agent**：tau2 官方 `llm_agent`（DeepSeek 驱动），作为可对比的 baseline
+- **Eval set**：固定的 20 个 telecom task（`configs/dev_tasks.json`），来源为 tau2 telecom 的 small split，任务 ID 已冻结——V0/V1/V2 永远在同一批任务上对比
+- **输出**：每次 run 一个独立 `runs/<run_id>/` 目录
+
+**本阶段明确不做**：Memory、RAG、RL、多 Agent、复杂 Planner/Verifier、网页 UI。Agent 看不到 `evaluation_criteria` 或标准答案。
+
+## 安装
+
+```bash
+# Python 3.12–3.13（本项目在 3.13 验证）
+uv venv .venv && source .venv/bin/activate
+uv pip install -r requirements.txt          # 会 editable 安装 third_party/tau2-bench
+
+# 配置 API key
+cp env.example .env                          # 然后编辑 .env 填入 DEEPSEEK_API_KEY
+# 或: export DEEPSEEK_API_KEY=...
+```
+
+> 注意：本仓库将 `.env.example` 命名为 `env.example`（你的 Claude Code 全局权限 deny 了 `./.env.*` 的读取，无法创建标准命名）。手动 `mv env.example .env.example` 即可恢复标准命名。
+
+## 运行 baseline
+
+一条命令跑固定 20 个 task：
+
+```bash
+python run_eval.py --tasks configs/dev_tasks.json --agent baseline
+```
+
+快速 smoke test（只跑前 5 个 task）：
+
+```bash
+python run_eval.py --tasks configs/dev_tasks.json --agent baseline --num-tasks 5
+```
+
+可选参数：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--tag` | `v0` | run 前缀，run_id 形如 `v0_20260825_160700` |
+| `--model` / `--user-model` | `deepseek/deepseek-chat` | agent / user simulator 模型（LiteLLM 格式） |
+| `--max-steps` | 60 | 每个 task 最大对话轮数 |
+| `--seed` | 42 | 随机种子 |
+| `--runs-dir` | `runs` | 输出根目录 |
+| `--domain` | 取自 tasks 文件 | 覆盖 domain（如 `telecom` / `banking_knowledge`） |
+| `--retrieval-config` | 无 | retrieval 变体名（banking_knowledge 用，如 `bm25` / `bm25_grep` / `no_knowledge`） |
+| `--retrieval-config-kwargs` | 无 | retrieval 配置覆盖参数，JSON（如 `'{"top_k": 5}'`） |
+
+## 运行 banking_knowledge（RAG）
+
+banking_knowledge domain 需要指定 retrieval 配置（vanilla baseline + BM25）：
+
+```bash
+python run_eval.py --domain banking_knowledge --retrieval-config bm25 \
+  --tasks configs/banking_dev_tasks.json --agent baseline
+```
+
+支持 retrieval 变体（见 tau2 `RETRIEVAL_VARIANTS`）：`bm25` / `bm25_grep` / `no_knowledge` / `openai_embeddings` / `qwen_embeddings` 等。embedding 类变体需要额外的 API key（OpenAI / OpenRouter）。
+
+> 说明：
+> - `openai/` 前缀模型（OpenAI 兼容端点，如 api.b.ai 的 `https://api.b.ai/v1`）会**保留 thinking**
+>   （reasoning），并自动读取 `OPENAI_BASE_URL` 作为端点。推荐使用，评测置信度更高。
+> - `anthropic/` 前缀模型（Anthropic 兼容端点）会自动禁用 thinking（litellm 多轮不回传
+>   reasoning_content 会触发 400 错误）。能用 OpenAI 端点时优先用 OpenAI 端点。
+> - 非标准模型的 cost 可能无法计算（litellm 无价格表），此时 cost 记为 $0.0。
+
+### api.b.ai 端点示例
+
+```bash
+export OPENAI_API_KEY="<你的 key>"
+export OPENAI_BASE_URL="https://api.b.ai/v1"
+
+python run_eval.py --domain banking_knowledge --retrieval-config bm25 \
+  --tasks configs/banking_dev_tasks.json --agent baseline \
+  --model openai/deepseek-v4-flash
+```
+
+## 查看结果
+
+每次 run 生成：
+
+```
+runs/
+└── v0_20260825_160700/
+    ├── summary.json     # run 级指标
+    ├── results.json     # per-task 指标
+    └── traces/          # 每任务一份完整轨迹
+        └── _mobile_data_issue_....json
+```
+
+`summary.json` 含：`total_tasks`、`success_count`、`success_rate`、`average_reward`、`average_turns`、`average_tool_calls`、`total_tokens`、`average_tokens`、`estimated_cost`。
+
+每个 trace 含完整 `system_prompt`、`conversation`（对话 + 工具调用 + 工具返回，按 `tool_call id` 精确配对）、`tool_calls`（有序 trajectory）。打开失败任务的 trace 即可人工定位失败原因。
+
+## 失败分类与统计
+
+12 类失败 taxonomy 定义在 `eval/taxonomy.py`（与 tau-bench 论文一致）：
+`planning / missing_information / wrong_tool / wrong_tool_args / policy_violation / observation_error / premature_stop / loop / bad_communication / wrong_transfer / environment_error / unknown`
+
+人工查看失败 trace，在 `failure_labels.json` 里标注每个失败 task 的类型，然后：
+
+```bash
+python analyze_failures.py runs/v0_20260825_160700 --labels failure_labels.json
+python analyze_failures.py runs/v0_20260825_160700 --labels failure_labels.json --csv failures.csv
+```
+
+输出失败数、每种类型的数量与百分比、failed task IDs，可选导出 CSV。未标注的失败任务会归为 `unknown`。
+
+## 版本对比
+
+```bash
+python compare_runs.py runs/v0_20260825_160700 runs/v1_20260825_180000
+```
+
+对比 success rate / average reward / average turns / average tool calls 的差值，并列出：
+- V0 fail → V1 success 的 task（转好）
+- V0 success → V1 fail 的 task（转坏）
+- reward 变化但成功状态未变的 task
+
+## 目录结构
+
+```
+TelecomOps-Agent/
+├── run_eval.py              # evaluation CLI 入口
+├── analyze_failures.py      # 失败分析 CLI
+├── compare_runs.py          # 版本对比 CLI（含 retrieval config 对比）
+├── configs/
+│   ├── dev_tasks.json       # 固定的 20-task telecom dev set（已冻结）
+│   └── banking_dev_tasks.json  # 固定的 5-task banking_knowledge (RAG) dev set
+├── agents/
+│   ├── __init__.py
+│   └── registry.py          # agent 注册表（baseline -> llm_agent）
+├── eval/
+│   ├── runner.py            # 核心：加载任务、跑仿真、保存 run
+│   ├── metrics.py           # per-task 指标 + run summary（含 retrieval 指标）
+│   ├── trace.py             # 轨迹提取（tool call 与返回配对，含 KB 检索记录）
+│   ├── taxonomy.py          # 12 类失败分类
+│   └── __init__.py
+├── failure_labels.json      # 人工失败标注模板
+├── runs/                    # run 输出（gitignored）
+├── third_party/tau2-bench/  # 底层 benchmark（editable install）
+├── env.example              # 环境变量模板（复制为 .env）
+├── requirements.txt
+└── .gitignore
+```
+
+## 指标口径（保证跨 run 可比）
+
+- `success`：`reward >= 1.0`（tau2 的 pass^1 判定）
+- `turns`：对话中 user 消息条数
+- `tool_calls`：assistant 发出的工具调用总数
+- `tokens`：从每条消息的 `usage` 字段汇总
+- `cost`：`agent_cost + user_cost`（美元）
+
+### Retrieval 指标（banking_knowledge，RAG ablation 用）
+
+- `retrieval_calls`：该 task 里 agent 发起的 retrieval 工具调用次数
+- `documents_retrieved`：该 task 累计返回的文档条数
+- `required_document_recall`：`task.required_documents` 中被检索返回过（任意 rank）的比例
+- `hit_at_k`：对每个 required doc 取"所有调用中的最低 rank"，统计 best_rank ≤ k（k=1,3,5,10）
+- run 级聚合：`average_retrieval_calls` / `average_documents_retrieved` / `average_required_document_recall` / `average_hit_at_k`
+
+> 注意：`required_documents` 只用于 evaluator 侧指标统计，绝不注入 agent prompt/context。
+
+## 添加新 agent（V1 等）
+
+在 `agents/registry.py` 注册一行：
+
+```python
+AGENT_REGISTRY = {
+    "baseline": "llm_agent",
+    # "v1": my_factory,   # 或指向自定义 agent factory
+}
+```
+
+然后 `python run_eval.py --agent v1`，与 V0 用 `compare_runs.py` 对比。

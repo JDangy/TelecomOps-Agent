@@ -1,0 +1,14 @@
+{
+  "run_id": "v0_20260825_165608",
+  "description": "人工失败标注文件。把每个失败 task 归类为 12 类之一（见 eval/taxonomy.py）。格式：task_id -> failure_type（或对象）。未标注的任务在 analyze_failures.py 里会归为 unknown。",
+  "labels": {
+    "[mobile_data_issue]user_abroad_roaming_enabled_off[PERSONA:None]": {
+      "failure_type": "loop",
+      "notes": "max_steps 耗尽。速度测试持续 No Connection，agent 无法识别需在设备端 toggle_roaming（账号侧 roaming 已开），反复尝试账号侧排查形成循环。"
+    },
+    "[service_issue]overdue_bill_suspension[PERSONA:Easy]": {
+      "failure_type": "wrong_transfer",
+      "notes": "终止于 user_stop（用户 #TRANSFER#）。agent 发完支付请求、用户确认接受后，agent 未确认账单支付结果，直接用 transfer_to_human_agents 把用户转给人工——但支付流程本可在自助完成，属于错误转移。"
+    }
+  }
+}

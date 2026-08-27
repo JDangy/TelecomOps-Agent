@@ -1,0 +1,19 @@
+# =============================================================================
+# TelecomOps-Agent 依赖
+#
+# tau2-bench 是底层 benchmark（通过 editable 安装，位于 third_party/tau2-bench）。
+# 我们的 run_eval.py 直接使用 tau2 的 Python API（get_tasks / build_text_orchestrator / run_simulation），
+# 因此必须保证 tau2 可被 import。
+# =============================================================================
+
+# 底层 benchmark（editable install）
+-e third_party/tau2-bench
+
+# Python 3.13 兼容：tau2 的 voice 模块 import audioop（3.13 已移除），需要此 backport
+audioop-lts>=0.2.2
+
+# 用于加载 .env 环境变量
+python-dotenv>=1.0.0
+
+# 项目自身的 CLI 参数解析
+# （用标准库 argparse，无额外依赖）
