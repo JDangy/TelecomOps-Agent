@@ -7,10 +7,26 @@ Evaluation-driven Agent system 实习项目：在电信客服 domain 上构建�
 ## 当前阶段：V0 baseline
 
 - **Agent**：tau2 官方 `llm_agent`（DeepSeek 驱动），作为可对比的 baseline
-- **Eval set**：固定的 20 个 telecom task（`configs/dev_tasks.json`），来源为 tau2 telecom 的 small split，任务 ID 已冻结——V0/V1/V2 永远在同一批任务上对比
+- **Eval set**：固定的 dev sets，任务 ID 已冻结——V0/V1/V2 永远在同一批任务上对比
+  - telecom：20 个 task（`configs/dev_tasks.json`），来源为 tau2 telecom small split
+  - banking_knowledge（RAG）：5 个 task（`configs/banking_dev_tasks.json`），BM25 检索
 - **输出**：每次 run 一个独立 `runs/<run_id>/` 目录
 
-**本阶段明确不做**：Memory、RAG、RL、多 Agent、复杂 Planner/Verifier、网页 UI。Agent 看不到 `evaluation_criteria` 或标准答案。
+**本阶段明确不做**：query rewriter、Memory、reranker、verifier、RL、多 Agent、复杂 Planner、网页 UI。Agent 看不到 `evaluation_criteria` / `required_documents` / 标准答案。
+
+### V0 实测结果（baseline，deepseek-v4-flash + thinking）
+
+| 场景 | success rate | 备注 |
+|---|---|---|
+| telecom（20 task）| **90%**（18/20）| 失败 2 个：loop / wrong_transfer |
+| banking + BM25（5 task）| **80%**（4/5）| 失败 1 个：task_003 推荐错卡 |
+
+## 版本历史
+
+| 版本 | 内容 | 状态 |
+|---|---|---|
+| V0 | 评估框架 + telecom baseline + banking_knowledge/BM25 支持 | ✅ 当前 |
+| V1 | 计划中：基于失败分析的 Agent 改进 | ⏳ |
 
 ## 安装
 
@@ -20,9 +36,11 @@ uv venv .venv && source .venv/bin/activate
 uv pip install -r requirements.txt          # 会 editable 安装 third_party/tau2-bench
 
 # 配置 API key
-cp env.example .env                          # 然后编辑 .env 填入 DEEPSEEK_API_KEY
+cp env.example .env                          # 然后编辑 .env 填入 API key（见下）
 # 或: export DEEPSEEK_API_KEY=...
 ```
+
+`.env` 支持三种 LLM 提供商（选一即可）：DeepSeek 官方 / OpenAI 兼容端点（如 api.b.ai）/ Anthropic 兼容端点。本项目实测用 api.b.ai 的 OpenAI 兼容端点 + `openai/deepseek-v4-flash`（保留 thinking）：
 
 > 注意：本仓库将 `.env.example` 命名为 `env.example`（你的 Claude Code 全局权限 deny 了 `./.env.*` 的读取，无法创建标准命名）。手动 `mv env.example .env.example` 即可恢复标准命名。
 
