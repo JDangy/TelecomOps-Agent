@@ -9,7 +9,8 @@ Evaluation-driven Agent system 实习项目：在电信客服 domain 上构建�
 - **Agent**：tau2 官方 `llm_agent`（DeepSeek 驱动），作为可对比的 baseline
 - **Eval set**：固定的 dev sets，任务 ID 已冻结——V0/V1/V2 永远在同一批任务上对比
   - telecom：20 个 task（`configs/dev_tasks.json`），来源为 tau2 telecom small split
-  - banking_knowledge（RAG）：5 个 task（`configs/banking_dev_tasks.json`），BM25 检索
+  - banking_knowledge（RAG）：24 个 task（`configs/banking_dev_tasks.json`），按 required_documents 分层抽样（简单 3 / 中等 7 / 困难 14），BM25 检索；旧 5-task 集保留于 `banking_dev_tasks_v1_5task.json`
+- **评测协议**：`bash run_benchmark.sh [telecom|banking] [repeats]`，模型固定 `openai/deepseek-v4-flash`（保留 thinking）、seed=42、max_steps=60；任务级 429 限流自动重试（不污染评测数据）
 - **输出**：每次 run 一个独立 `runs/<run_id>/` 目录
 
 **本阶段明确不做**：query rewriter、Memory、reranker、verifier、RL、多 Agent、复杂 Planner、网页 UI。Agent 看不到 `evaluation_criteria` / `required_documents` / 标准答案。
@@ -19,13 +20,16 @@ Evaluation-driven Agent system 实习项目：在电信客服 domain 上构建�
 | 场景 | success rate | 备注 |
 |---|---|---|
 | telecom（20 task）| **90%**（18/20）| 失败 2 个：loop / wrong_transfer |
-| banking + BM25（5 task）| **80%**（4/5）| 失败 1 个：task_003 推荐错卡 |
+| banking + BM25（24 task 分层）| **25%**（6/24）| 平均 required-doc recall 78%；失败集中在困难任务（Agent 找到文档但决策错误）|
+| banking + BM25（旧 5 task，参考）| 80%（4/5）| 5 个任务偏简单（required_docs 1~6），不代表全库难度 |
+
+> 注意：24-task 分层集是对 banking_knowledge 全库（97 task，required_docs 1~30）的代表性抽样，**25% 才是 baseline 的真实水平**；旧的 80% 因任务集偏简单而虚高。V1 改进将以此为对比锚点。
 
 ## 版本历史
 
 | 版本 | 内容 | 状态 |
 |---|---|---|
-| V0 | 评估框架 + telecom baseline + banking_knowledge/BM25 支持 | ✅ 当前 |
+| V0 | 评估框架 + telecom baseline + banking_knowledge/BM25（24-task 分层 dev set + 429 自动重试）| ✅ 当前 |
 | V1 | 计划中：基于失败分析的 Agent 改进 | ⏳ |
 
 ## 安装
