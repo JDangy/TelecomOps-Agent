@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -93,6 +94,21 @@ def run_single_task(config: TextRunConfig, task) -> SimulationRun:
     return sim
 
 
+def is_rate_limit_error(exc: Exception) -> bool:
+    """判断异常是否为 API 限流（429）——这类错误是环境问题，应重试而非算作任务失败。
+
+    兼容 litellm.RateLimitError 及其底层异常；通过异常类型名与消息内容双重判断。
+    """
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    return (
+        "ratelimit" in name
+        or "ratelimiterror" in msg
+        or "error code: 429" in msg
+        or "429" in msg
+    )
+
+
 def run_eval(
     *,
     tasks_file: Path,
@@ -108,6 +124,8 @@ def run_eval(
     run_tag: str = "run",
     runs_dir: Path = Path("runs"),
     num_tasks: Optional[int] = None,
+    task_max_retries: int = 5,
+    task_retry_cooldown: float = 20.0,
 ) -> dict:
     """运行一组 task 并保存结果。
 
@@ -209,31 +227,44 @@ def run_eval(
     print(f"[run] run_id={run_id}  dir={run_dir}")
     print()
 
-    # --- 逐个运行 ---
+    # --- 逐个运行（429 限流时自动重试）---
     per_task = []
     for i, task in enumerate(tasks, 1):
         print(f"[{i}/{len(tasks)}] running {task.id}")
         sys.stdout.flush()
-        try:
-            sim = run_single_task(config, task)
-            trace = extract_trace(
-                sim, task,
-                domain=domain,
-                retrieval_config=retrieval_config,
-                retrieval_config_kwargs=retrieval_config_kwargs,
-            )
-            m = task_metrics(
-                sim,
-                domain=domain,
-                retrieval_config=retrieval_config,
-                required_documents=list(getattr(task, "required_documents", None) or []),
-                retrieval=trace.get("retrieval"),
-            )
-        except Exception as exc:  # 单个任务失败不中断整个 run
-            print(f"    !! ERROR: {exc}")
-            m = task_metrics(None, error=f"{type(exc).__name__}: {exc}")
-            trace = None
-
+        m = None
+        trace = None
+        for attempt in range(1, task_max_retries + 1):
+            try:
+                sim = run_single_task(config, task)
+                trace = extract_trace(
+                    sim, task,
+                    domain=domain,
+                    retrieval_config=retrieval_config,
+                    retrieval_config_kwargs=retrieval_config_kwargs,
+                )
+                m = task_metrics(
+                    sim,
+                    domain=domain,
+                    retrieval_config=retrieval_config,
+                    required_documents=list(getattr(task, "required_documents", None) or []),
+                    retrieval=trace.get("retrieval"),
+                )
+                break  # 成功，跳出重试循环
+            except Exception as exc:
+                if is_rate_limit_error(exc) and attempt < task_max_retries:
+                    wait = task_retry_cooldown * attempt
+                    print(f"    !! RateLimit(429) attempt {attempt}/{task_max_retries}, "
+                          f"wait {wait:.0f}s, retry...")
+                    sys.stdout.flush()
+                    time.sleep(wait)
+                    continue
+                # 非限流错误 或 重试耗尽
+                print(f"    !! ERROR: {exc}")
+                m = task_metrics(None, error=f"{type(exc).__name__}: {exc}")
+                trace = None
+                break  # 跳出重试循环（不重试）
+        # 重试循环后，m 一定不为 None
         m["task_id"] = task.id
         if trace is not None:
             trace_file = traces_dir / f"{sanitize_filename(task.id)}.json"
