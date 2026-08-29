@@ -155,7 +155,7 @@ TelecomOps-Agent/
 ├── compare_runs.py          # 版本对比 CLI（含 retrieval config 对比）
 ├── configs/
 │   ├── dev_tasks.json       # 固定的 20-task telecom dev set（已冻结）
-│   └── banking_dev_tasks.json  # 固定的 5-task banking_knowledge (RAG) dev set
+│   └── banking_dev_tasks.json  # 固定的 24-task banking_knowledge (RAG) dev set（分层抽样）
 ├── agents/
 │   ├── __init__.py
 │   └── registry.py          # agent 注册表（baseline -> llm_agent）
@@ -186,8 +186,18 @@ TelecomOps-Agent/
 - `retrieval_calls`：该 task 里 agent 发起的 retrieval 工具调用次数
 - `documents_retrieved`：该 task 累计返回的文档条数
 - `required_document_recall`：`task.required_documents` 中被检索返回过（任意 rank）的比例
-- `hit_at_k`：对每个 required doc 取"所有调用中的最低 rank"，统计 best_rank ≤ k（k=1,3,5,10）
-- run 级聚合：`average_retrieval_calls` / `average_documents_retrieved` / `average_required_document_recall` / `average_hit_at_k`
+- `recall_at_k`：对每个 required doc 取"所有调用中的最低 rank"（best rank），统计 best_rank ≤ k 的比例（k=1,3,5,10）。
+  **注意这是跨所有检索调用的 *cumulative* recall@k，不是传统单次 Hit@K**——agent 多次搜索后
+  best rank 累积提升，指标会随检索次数增加而上升。
+- `first_hit_call`：每个 required doc 第一次被命中的检索调用序号（1-based），未命中为 null。
+  **衡量检索效率**：搜得越少越好。配套 `avg_first_hit_call` / `max_first_hit_call`
+  （捞齐全部文档至少需要的检索次数）。
+- run 级聚合：`average_retrieval_calls` / `average_documents_retrieved` / `average_required_document_recall` /
+  `average_recall_at_k` / `average_avg_first_hit_call` / `average_max_first_hit_call`
+
+> 为什么需要 first_hit_call：两个 Agent 可能有相近的 recall@k，但一个搜 2 次就捞全，
+> 另一个狂搜 12 次——后者检索效率低。first_hit_call 让"检索效率"可量化，用于对比
+> Agent 的查询策略好坏（对应 agent efficiency 评估）。
 
 > 注意：`required_documents` 只用于 evaluator 侧指标统计，绝不注入 agent prompt/context。
 

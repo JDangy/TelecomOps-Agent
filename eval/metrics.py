@@ -13,8 +13,17 @@ Retrieval 指标（banking_knowledge，RAG ablation 用）：
   - documents_retrieved:         该 task 累计返回的文档条数（跨所有 retrieval 调用）
   - avg_documents_per_call:      documents_retrieved / retrieval_calls
   - required_document_recall:    task.required_documents 中被检索系统返回过（任意 rank）的比例
-  - hit_at_k:                    对每个 required doc 取"所有调用中的最低 rank"，
-                                  计算 best_rank <= k 的比例（k=1,3,5,10）
+  - recall_at_k:                 对每个 required doc 取"所有调用中的最低 rank"（best rank），
+                                 计算 best_rank <= k 的比例（k=1,3,5,10）。
+                                 注意：这是跨所有检索调用的 *cumulative* recall@k，
+                                 不是传统意义的单次 Hit@K——agent 多次搜索后 best rank 会
+                                 累积提升，因此 recall_at_k 会随检索次数增加而上升。
+  - first_hit_call:              每个 required doc 第一次被命中的检索调用序号（1-based），
+                                 未命中为 null。衡量"agent 要搜几次才捞到目标文档"，
+                                 用于评估检索效率（检索次数越少越好）。
+  - avg_first_hit_call:          命中的 required docs 的 first_hit_call 平均值
+  - max_first_hit_call:          命中的 required docs 中最大的 first_hit_call（捞齐全部文档
+                                 至少需要的检索调用次数）
 
 注意：required_documents 只用于 evaluator 侧指标统计，绝不注入 agent prompt/context。
 """
@@ -25,8 +34,8 @@ from typing import Any, Optional
 
 from tau2.data_model.simulation import SimulationRun
 
-# hit@k 评测的 k 值（仅当有 retrieval 数据时计算）
-HIT_AT_KS = [1, 3, 5, 10]
+# recall@k 评测的 k 值（仅当有 retrieval 数据时计算；累计语义，见模块 docstring）
+RECALL_AT_KS = [1, 3, 5, 10]
 
 
 def count_user_turns(messages) -> int:
@@ -56,20 +65,39 @@ def aggregate_usage(messages) -> dict:
     }
 
 
-def _hit_at_k(required_docs: list[str], best_ranks: dict[str, Optional[int]]) -> dict:
-    """对每个 required doc 统计 best_rank <= k 的比例。best_ranks 为 {doc_id: 最低rank}。"""
+def _recall_at_k(required_docs: list[str], best_ranks: dict[str, Optional[int]]) -> dict:
+    """对每个 required doc 统计 best_rank <= k 的比例（cumulative recall@k）。
+
+    best_ranks 为 {doc_id: 跨所有调用最低rank}。
+    注意：这是累计召回——agent 多次检索后 best rank 累积提升，因此该指标
+    会随检索次数增加而上升，不等同于单次 Hit@K。
+    """
     out = {}
     total = len(required_docs)
-    for k in HIT_AT_KS:
+    for k in RECALL_AT_KS:
         if total == 0:
-            out[f"hit_at_{k}"] = None
+            out[f"recall_at_{k}"] = None
             continue
         hit = sum(
             1 for doc in required_docs
             if best_ranks.get(doc) is not None and best_ranks[doc] <= k
         )
-        out[f"hit_at_{k}"] = round(hit / total, 4)
+        out[f"recall_at_{k}"] = round(hit / total, 4)
     return out
+
+
+def _first_hit_calls(calls: list[dict], required_docs: list[str]) -> dict[str, Optional[int]]:
+    """对每个 required doc 计算它第一次被命中的检索调用序号（1-based）。
+
+    返回 {doc_id: first_hit_call 或 None(从未命中)}。用于评估检索效率：
+    需要的检索次数越少，说明 agent 的查询策略越高效。
+    """
+    first_hit: dict[str, Optional[int]] = {doc: None for doc in required_docs}
+    for call_idx, c in enumerate(calls, start=1):
+        for doc_id in c.get("doc_ids", []):
+            if doc_id in first_hit and first_hit[doc_id] is None:
+                first_hit[doc_id] = call_idx
+    return first_hit
 
 
 def compute_retrieval_metrics(
@@ -83,10 +111,13 @@ def compute_retrieval_metrics(
             "documents_retrieved": 0,
             "avg_documents_per_call": None,
             "required_document_recall": None,
-            "hit_at_1": None,
-            "hit_at_3": None,
-            "hit_at_5": None,
-            "hit_at_10": None,
+            "recall_at_1": None,
+            "recall_at_3": None,
+            "recall_at_5": None,
+            "recall_at_10": None,
+            "first_hit_call": None,
+            "avg_first_hit_call": None,
+            "max_first_hit_call": None,
         }
 
     calls = retrieval.get("calls") or []
@@ -109,14 +140,23 @@ def compute_retrieval_metrics(
     else:
         recall = None
 
-    hits = _hit_at_k(required_docs, best_ranks)
+    recalls = _recall_at_k(required_docs, best_ranks)
+
+    # 检索效率：每个 required doc 第一次被命中的调用序号
+    first_hit = _first_hit_calls(calls, required_docs)
+    hit_vals = [v for v in first_hit.values() if v is not None]
+    avg_first_hit = round(sum(hit_vals) / len(hit_vals), 2) if hit_vals else None
+    max_first_hit = max(hit_vals) if hit_vals else None
 
     return {
         "retrieval_calls": retrieval_calls,
         "documents_retrieved": documents_retrieved,
         "avg_documents_per_call": avg_docs,
         "required_document_recall": recall,
-        **hits,
+        **recalls,
+        "first_hit_call": first_hit,
+        "avg_first_hit_call": avg_first_hit,
+        "max_first_hit_call": max_first_hit,
     }
 
 
@@ -189,7 +229,7 @@ def _agg_retrieval(per_task: list[dict]) -> dict:
     docs_per_call = [
         t["avg_documents_per_call"] for t in per_task if t.get("avg_documents_per_call") is not None
     ]
-    # required_document_recall / hit@k 仅对"有 required docs 且发生了检索"的任务取平均
+    # required_document_recall / recall@k 仅对"有 required docs 且发生了检索"的任务取平均
     recall_vals = [
         t["required_document_recall"] for t in per_task if t.get("required_document_recall") is not None
     ]
@@ -199,9 +239,15 @@ def _agg_retrieval(per_task: list[dict]) -> dict:
         "average_documents_per_call": _avg(docs_per_call),
         "average_required_document_recall": _avg(recall_vals),
     }
-    for k in HIT_AT_KS:
-        vals = [t[f"hit_at_{k}"] for t in per_task if t.get(f"hit_at_{k}") is not None]
-        out[f"average_hit_at_{k}"] = _avg(vals)
+    for k in RECALL_AT_KS:
+        vals = [t[f"recall_at_{k}"] for t in per_task if t.get(f"recall_at_{k}") is not None]
+        out[f"average_recall_at_{k}"] = _avg(vals)
+
+    # 检索效率聚合：平均/最大 first_hit_call（每任务先各自聚合，再跨任务平均）
+    avg_fh = [t["avg_first_hit_call"] for t in per_task if t.get("avg_first_hit_call") is not None]
+    max_fh = [t["max_first_hit_call"] for t in per_task if t.get("max_first_hit_call") is not None]
+    out["average_avg_first_hit_call"] = _avg(avg_fh)
+    out["average_max_first_hit_call"] = _avg(max_fh)
     return out
 
 

@@ -65,9 +65,12 @@ def compare(old_dir: Path, new_dir: Path) -> int:
             ("average_documents_retrieved", "Avg docs retrieved"),
             ("average_documents_per_call", "Avg docs/call"),
             ("average_required_document_recall", "Avg req-doc recall"),
+            # 检索效率：首次命中调用的平均/最大值（越低越好——搜得越少越高效）
+            ("average_avg_first_hit_call", "Avg first-hit call"),
+            ("average_max_first_hit_call", "Avg max first-hit call"),
         ]
         for k in (1, 3, 5, 10):
-            metrics.append((f"average_hit_at_{k}", f"Avg hit@{k}"))
+            metrics.append((f"average_recall_at_{k}", f"Avg recall@{k}"))
 
     print(f"Compare: {old_dir}  vs  {new_dir}")
     print(f"  {old_dir}  (old): run_id={get(old, 'run_id')}  domain={get(old, 'domain')}  "
@@ -76,10 +79,11 @@ def compare(old_dir: Path, new_dir: Path) -> int:
           f"retrieval={new_rc}  tasks={get(new, 'total_tasks')}")
     print()
 
-    # 指标方向：success/reward/hit@k/recall 上升好；turns/tool_calls/cost/retrieval_calls 下降好
+    # 指标方向：success/reward/recall@k 上升好；turns/tool_calls/cost/first_hit_call 下降好
     lower_is_better = {
         "average_turns", "average_tool_calls", "estimated_cost",
         "average_retrieval_calls", "average_documents_retrieved", "average_documents_per_call",
+        "average_avg_first_hit_call", "average_max_first_hit_call",
     }
     print("  {:<26} {:>12} {:>12} {:>14}".format("metric", "old", "new", "delta"))
     print("  " + "-" * 68)
