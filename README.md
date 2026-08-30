@@ -20,10 +20,10 @@ Evaluation-driven Agent system 实习项目：在电信客服 domain 上构建�
 | 场景 | success rate | 备注 |
 |---|---|---|
 | telecom（20 task）| **90%**（18/20）| 失败 2 个：loop / wrong_transfer |
-| banking + BM25（24 task 分层）| **25%**（6/24）| 平均 required-doc recall 78%；失败集中在困难任务（Agent 找到文档但决策错误）|
+| banking + BM25（24 task 分层）| **27.1%**（6.5/24 平均）| 两次完整 run 取平均：25%（6/24）+ 29.2%（7/24）|
 | banking + BM25（旧 5 task，参考）| 80%（4/5）| 5 个任务偏简单（required_docs 1~6），不代表全库难度 |
 
-> 注意：24-task 分层集是对 banking_knowledge 全库（97 task，required_docs 1~30）的代表性抽样，**25% 才是 baseline 的真实水平**；旧的 80% 因任务集偏简单而虚高。V1 改进将以此为对比锚点。
+> 注意：24-task 分层集是对 banking_knowledge 全库（97 task，required_docs 1~30）的代表性抽样。**V0 banking 基线 = 27.1%（两次运行平均）**；两次运行相差 4.2pp（25% vs 29.2%），说明 LLM 有随机性，对比时应看平均而非单次。旧的 80% 因任务集偏简单而虚高。V1 改进将以此为对比锚点。
 
 ## 版本历史
 
