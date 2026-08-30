@@ -7,6 +7,20 @@
 # ============================================================
 set -euo pipefail
 
+# 定位项目根目录（脚本所在目录），优先用 .venv 的 python（tau2 装在 venv 里，
+# 系统 python 通常没有 tau2，直接用 `python` 会 ModuleNotFoundError）
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+if [ -x ".venv/bin/python" ]; then
+  PYTHON=".venv/bin/python"
+elif python3 -c "import tau2" 2>/dev/null; then
+  PYTHON="python3"
+else
+  echo "错误: 找不到可用的 python（需安装 tau2）。请先执行:" >&2
+  echo "  uv venv .venv && uv pip install -r requirements.txt" >&2
+  exit 1
+fi
+
 DOMAIN="${1:-banking}"
 REPEATS="${2:-3}"
 
@@ -40,7 +54,7 @@ echo ""
 
 for i in $(seq 1 $REPEATS); do
   echo "--- Run $i/$REPEATS ---"
-  python run_eval.py \
+  "$PYTHON" run_eval.py \
     --tasks "$TASKS" \
     --agent baseline \
     --model openai/deepseek-v4-flash \

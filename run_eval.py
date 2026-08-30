@@ -135,8 +135,18 @@ def main():
         default_agent_model = "openai/deepseek-v4-flash"
     llm_agent = args.model or os.environ.get("TELECOMOPS_AGENT_LLM") or default_agent_model
     llm_user = args.user_model or os.environ.get("TELECOMOPS_USER_LLM") or llm_agent
-    max_steps = args.max_steps or int(os.environ.get("TELECOMOPS_MAX_STEPS", "60"))
-    seed = args.seed or int(os.environ.get("TELECOMOPS_SEED", "42"))
+    # 用显式 None 判断而非 `or`：--seed 0 / --max-steps 0 是合法值，
+    # falsy 的 0 会被 `or` 吞掉导致静默落入 env/默认值。
+    max_steps = (
+        args.max_steps
+        if args.max_steps is not None
+        else int(os.environ.get("TELECOMOPS_MAX_STEPS", "60"))
+    )
+    seed = (
+        args.seed
+        if args.seed is not None
+        else int(os.environ.get("TELECOMOPS_SEED", "42"))
+    )
 
     tasks_file = Path(args.tasks)
     if not tasks_file.exists():

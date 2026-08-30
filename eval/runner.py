@@ -97,15 +97,21 @@ def run_single_task(config: TextRunConfig, task) -> SimulationRun:
 def is_rate_limit_error(exc: Exception) -> bool:
     """判断异常是否为 API 限流（429）——这类错误是环境问题，应重试而非算作任务失败。
 
-    兼容 litellm.RateLimitError 及其底层异常；通过异常类型名与消息内容双重判断。
+    兼容 litellm.RateLimitError 及其底层异常。注意不能裸匹配 "429" 子串——
+    消息里含 "4290"（token 数）或 "$429"（金额）的非限流错误会被误判，
+    导致 400 这类确定性错误被无意义重试 5 次。
     """
     name = type(exc).__name__.lower()
     msg = str(exc).lower()
-    return (
-        "ratelimit" in name
+    if "ratelimit" in name:
+        return True
+    # 消息层面：只认 "code: 429" / "status 429" 这类明确上下文，
+    # 避免金额 $429、token 数 4290 等被误判
+    return bool(
+        re.search(r"code:?\s*429\b", msg)
+        or "rate limit" in msg
         or "ratelimiterror" in msg
-        or "error code: 429" in msg
-        or "429" in msg
+        or "too many requests" in msg
     )
 
 

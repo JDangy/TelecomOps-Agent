@@ -126,6 +126,42 @@ def render_task(t: dict, include_kb_content: bool) -> list[str]:
 # ---------------------------------------------------------------------------
 # 人类阅读版渲染
 # ---------------------------------------------------------------------------
+def _scenario_text(us: dict) -> str:
+    """把 user_scenario 转成人类可读文本。
+
+    banking 域的 instructions 是 str；telecom 域是 dict
+    （含 domain / reason_for_call / known_info 等），逐字段转成可读行。
+    """
+    if not isinstance(us, dict):
+        return str(us or "")
+    inst = us.get("instructions")
+    if isinstance(inst, str):
+        return inst.strip()
+    if isinstance(inst, dict):
+        lines = []
+        label_map = {
+            "domain": "领域",
+            "reason_for_call": "来电原因",
+            "known_info": "已知信息",
+            "persona": "角色设定",
+        }
+        for k, v in inst.items():
+            label = label_map.get(k, k)
+            if isinstance(v, (list, dict)):
+                v = json.dumps(v, ensure_ascii=False)
+            lines.append(f"- **{label}**: {v}")
+        return "\n".join(lines)
+    if inst is not None:
+        return str(inst)
+    # instructions 缺失时兜底：把整个 scenario 逐字段展开
+    lines = []
+    for k, v in us.items():
+        if isinstance(v, (list, dict)):
+            v = json.dumps(v, ensure_ascii=False)
+        lines.append(f"- **{k}**: {v}")
+    return "\n".join(lines)
+
+
 def render_task_human(t: dict) -> list[str]:
     tid = t["task_id"]
     r = t["reward"]
@@ -141,10 +177,11 @@ def render_task_human(t: dict) -> list[str]:
 
     # 任务背景（客观事实：用户角色设定）
     us = task.get("user_scenario") or {}
-    instructions = (us.get("instructions") or "").strip()
+    instructions = _scenario_text(us) if us else ""
     if instructions:
         out.append(f"\n**任务背景（用户角色设定）**")
-        out.append(f"> {instructions}")
+        for line in instructions.split("\n"):
+            out.append(f"> {line}" if line.strip() else ">")
     elif task.get("description"):
         out.append(f"\n**任务背景**")
         out.append(f"> {json.dumps(task['description'], ensure_ascii=False)}")
@@ -244,6 +281,26 @@ def main() -> int:
         print(f"错误: {traces_dir} 下没有 trace 文件", file=sys.stderr)
         return 1
 
+    # 找出"任务在 run 里但 trace 缺失"的情况（如环境错误任务没有 trace）。
+    # 注意 trace 文件名是 sanitize_filename(task.id)（与 eval/runner.py 保持一致），
+    # telecom 的 task id 含 []/: 等字符，需要用同样的规则对齐。
+    def _sanitize(s: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.\-]", "_", s)
+
+    missing: list[tuple[str, str]] = []
+    results_file = run_dir / "results.json"
+    if results_file.is_file():
+        try:
+            results = json.loads(results_file.read_text(encoding="utf-8"))
+            trace_names = {tp.stem for tp in trace_files}
+            for rr in results:
+                tid = rr.get("task_id") or ""
+                if tid and _sanitize(tid) not in trace_names:
+                    err = rr.get("error") or "无 trace（原因未知）"
+                    missing.append((tid, err))
+        except Exception as exc:
+            print(f"警告: 读取 {results_file} 失败，无法检查缺失任务: {exc}", file=sys.stderr)
+
     out = []
     out.append(f"# {run_dir.name} — {'人类阅读版' if args.human else '完整 Trace 阅读版'} Trace")
     if args.human:
@@ -253,6 +310,12 @@ def main() -> int:
         out.append(f"\n> 共 {len(trace_files)} 个任务。由 `export_trace_readme.py` 生成；"
                    f"检索结果的文档全文默认省略，仅列文档 ID；"
                    f"需要全文请加 `--include-kb-content` 重新生成。")
+
+    if missing:
+        out.append(f"\n> ⚠️ **注意**：该 run 共 {len(missing) + len(trace_files)} 个任务，"
+                   f"其中 {len(missing)} 个任务没有 trace（通常是环境错误导致未完成仿真）：")
+        for tid, err in missing:
+            out.append(f"> - `{tid}`: {err}")
 
     for tp in trace_files:
         try:
@@ -268,7 +331,8 @@ def main() -> int:
     suffix = "_human.md" if args.human else "_README.md"
     output = Path(args.output) if args.output else run_dir / f"TRACES{suffix}"
     output.write_text("\n".join(out), encoding="utf-8")
-    print(f"已生成: {output} ({output.stat().st_size / 1024:.0f} KB, {len(trace_files)} 个任务)")
+    note = f"（另有 {len(missing)} 个任务无 trace）" if missing else ""
+    print(f"已生成: {output} ({output.stat().st_size / 1024:.0f} KB, {len(trace_files)} 个任务{note})")
     return 0
 
 
