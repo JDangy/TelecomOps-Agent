@@ -173,6 +173,9 @@ _CALL_NAME_TO_ACTOR = {
     "agent_gt_response": "agent_gt",
     "agent_solo_response": "agent_solo",
     "user_simulator_response": "user_simulator",
+    # V1 2-Agent：Decision Agent 复用 agent_response（LLMAgent 子类），
+    # Knowledge Agent 用独立 call_name 区分
+    "knowledge_agent_response": "knowledge_agent",
     "classify_authentication": "evaluator",
     "nl_assertions_eval": "evaluator",
     "llm_judge_hallucination_check": "evaluator",
@@ -301,6 +304,8 @@ def install_llm_patch() -> Callable[[], None]:
         "tau2.evaluator.hallucination_reviewer",
         "tau2.evaluator.review_llm_judge",
         "tau2.evaluator.review_llm_judge_user_only",
+        # V1 2-Agent：KnowledgeAgent 在此模块内引用 generate
+        "agents.two_agent",
     ]
     originals: dict[str, Callable] = {}
 

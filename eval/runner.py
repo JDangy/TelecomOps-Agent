@@ -127,6 +127,89 @@ def is_rate_limit_error(exc: Exception) -> bool:
     )
 
 
+def _extract_handoff_summary(recorder) -> list[dict]:
+    """从 v2 events 提取 handoff/Evidence Packet 摘要（注入 v1 trace 的 two_agent 区）。
+
+    每个 handoff 一条：question + packet 关键字段。原始检索文本不进 v1 trace。
+    """
+    summary = []
+    events = getattr(recorder, "events", [])
+    pending = {}
+    for e in events:
+        if e["event_type"] == "handoff":
+            pending[e["span_id"] if "span_id" in e else id(e)] = {
+                "question": e.get("question"),
+                "context": None,
+            }
+        elif e["event_type"] == "handoff_result":
+            summary.append({
+                "question": None,  # 由配对 handoff 填
+                "latency_ms": e.get("latency_ms"),
+                "evidence_packet_chars": e.get("evidence_packet_chars"),
+                "facts": e.get("evidence_fact_count"),
+                "document_ids": e.get("evidence_doc_ids"),
+                "confidence": e.get("evidence_confidence"),
+                "missing_information": e.get("missing_information_count"),
+            })
+    # handoff 与 result 按出现顺序一一对应（串行执行保证）
+    hands = [e for e in events if e["event_type"] == "handoff"]
+    for i, s in enumerate(summary):
+        if i < len(hands):
+            s["question"] = hands[i].get("question")
+    return summary
+
+
+def _extract_two_agent_metrics(v2_trace: dict) -> dict:
+    """从 v2 events 提取 2-Agent 协作指标（V0 单 Agent 时返回空 dict）。"""
+    events = v2_trace.get("events") or []
+    hands = [e for e in events if e["event_type"] == "handoff"]
+    results = [e for e in events if e["event_type"] == "handoff_result"]
+    if not hands and not results:
+        return {}
+    ka_llm_end = [e for e in events
+                  if e["event_type"] == "llm_call_end" and e.get("actor") == "knowledge_agent"]
+    ka_llm_all = [e for e in events
+                  if e["event_type"] in ("llm_call_end", "llm_call_error")
+                  and e.get("actor") == "knowledge_agent"]
+    ka_retr = [e for e in events
+               if e["event_type"] == "tool_call_end" and e.get("agent") == "knowledge_agent"]
+    da_llm_end = [e for e in events
+                  if e["event_type"] == "llm_call_end" and e.get("actor") == "agent"]
+    return {
+        "handoff_count": len(hands),
+        "knowledge_agent_llm_calls": len(ka_llm_all),
+        "knowledge_agent_prompt_tokens": sum(e.get("prompt_tokens") or 0 for e in ka_llm_end),
+        "knowledge_agent_completion_tokens": sum(e.get("completion_tokens") or 0 for e in ka_llm_end),
+        "knowledge_agent_max_prompt_tokens": max(
+            (e.get("prompt_tokens") or 0 for e in ka_llm_end), default=None
+        ),
+        "knowledge_retrieval_calls": len(ka_retr),
+        "evidence_packet_chars_total": sum(e.get("evidence_packet_chars") or 0 for e in results),
+        "evidence_packet_chars_avg": (
+            round(sum(e.get("evidence_packet_chars") or 0 for e in results) / len(results), 1)
+            if results else None
+        ),
+        "decision_agent_llm_calls": len(da_llm_end),
+        "decision_agent_prompt_tokens": sum(e.get("prompt_tokens") or 0 for e in da_llm_end),
+        "decision_agent_completion_tokens": sum(e.get("completion_tokens") or 0 for e in da_llm_end),
+        "decision_agent_max_prompt_tokens": max(
+            (e.get("prompt_tokens") or 0 for e in da_llm_end), default=None
+        ),
+    }
+
+
+def _register_factory_agent(name: str, factory) -> None:
+    """把自定义 agent factory 注册进 tau2 registry（幂等）。
+
+    tau2 build.py 用 registry.get_agent_factory(name) 解析 agent；我们的
+    agents/registry.py 只是本地映射。factory 签名遵循 tau2 约定：
+    factory(tools, domain_policy, **kwargs)。
+    """
+    from tau2 import registry as tau2_registry
+    if tau2_registry.get_agent_factory(name) is None:
+        tau2_registry.register_agent_factory(factory, name)
+
+
 def extract_timing_metrics(v2_trace: dict) -> dict:
     """从 trace v2 事件流提取 per-task timing 指标。
 
@@ -202,13 +285,16 @@ def run_eval(
     Returns:
         summary dict（含 run_id / run_dir / 各项指标）。
     """
-    # --- agent 解析（V0: baseline -> tau2 官方 llm_agent）---
+    # --- agent 解析（baseline -> tau2 官方名；two_agent 等 -> 自定义 factory）---
     impl, is_factory = resolve_agent(agent_name)
     if is_factory:
-        raise NotImplementedError(
-            "自定义 agent factory 尚未支持（V0 baseline 使用 tau2 官方 llm_agent）。"
-        )
-    tau2_agent = impl
+        # 自定义 factory 由 tau2 build.py 按 (tools, domain_policy, llm, llm_args,
+        # task, ...) 约定调用；config.agent 直接传逻辑名，registry 查不到时
+        # 需要预先注册到 tau2 registry（见 _register_factory_agent）。
+        _register_factory_agent(agent_name, impl)
+        tau2_agent = agent_name
+    else:
+        tau2_agent = impl
 
     # --- 加载任务 ---
     file_domain, task_ids = load_task_ids(tasks_file)
@@ -352,6 +438,12 @@ def run_eval(
         m["task_id"] = task.id
         # v1 trace（保持原有文件名，向后兼容）
         if trace is not None:
+            # 2-Agent：把 handoff/Evidence Packet 摘要注入 v1 trace
+            # （拦截的 ask 调用发生在 agent state 内，orchestrator 对话里不可见；
+            #  v2 events 已有完整记录，这里补一个 v1 侧可读的摘要区）
+            handoff_summary = _extract_handoff_summary(recorder)
+            if handoff_summary:
+                trace["two_agent"] = handoff_summary
             trace_file = traces_dir / f"{sanitize_filename(task.id)}.json"
             trace_file.write_text(
                 json.dumps(trace, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -365,6 +457,8 @@ def run_eval(
         )
         m["trace_v2_path"] = str(v2_file.relative_to(run_dir))
         m["timing"] = extract_timing_metrics(v2)
+        # 2-Agent 协作指标（无 handoff 时为空 dict，不影响 V0）
+        m["two_agent_metrics"] = _extract_two_agent_metrics(v2)
 
         status = "SUCCESS" if m["success"] else "FAIL"
         cost = (m.get("agent_cost") or 0.0) + (m.get("user_cost") or 0.0)
