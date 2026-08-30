@@ -35,6 +35,12 @@ from tau2.evaluator.evaluator import EvaluationType
 from tau2.runner import build_text_orchestrator, get_tasks, run_simulation
 
 from agents.registry import resolve_agent
+from eval.instrumentation import (
+    TraceV2Recorder,
+    install_llm_patch,
+    set_active_recorder,
+    wrap_environment,
+)
 from eval.metrics import compute_summary, task_metrics
 from eval.trace import extract_trace
 
@@ -72,7 +78,7 @@ def sanitize_filename(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.\-]", "_", s)
 
 
-def run_single_task(config: TextRunConfig, task) -> SimulationRun:
+def run_single_task(config: TextRunConfig, task, recorder=None) -> SimulationRun:
     """运行单个 task：构建 orchestrator 并跑完整仿真。
 
     注意：banking_knowledge 的 EnvEvaluator 会在回放时重建 retrieval 环境。
@@ -80,12 +86,18 @@ def run_single_task(config: TextRunConfig, task) -> SimulationRun:
     run_simulation 的 env_kwargs 也会透传给 evaluator 的环境构造函数，
     因此这里需要把 retrieval 配置一并传入，否则回放时用默认变体（alltools，
     含 dense embedding）会导致与运行时的 bm25 不一致，甚至触发 OpenAI key 报错。
+
+    recorder: TraceV2Recorder（可选）。传入时启用 tool 层插桩——
+    environment.get_response 被无行为影响的代理包装（仅计时/记录）。
     """
     env_kwargs = {}
     if config.domain == "banking_knowledge" and config.retrieval_config:
         env_kwargs["retrieval_variant"] = config.retrieval_config
         env_kwargs["retrieval_kwargs"] = dict(config.retrieval_config_kwargs or {})
     orchestrator = build_text_orchestrator(config, task, seed=config.seed)
+    if recorder is not None:
+        # 只观察不干预：包装代理不改 tool schema / retrieval config / 结果内容
+        orchestrator.environment = wrap_environment(orchestrator.environment, recorder)
     sim = run_simulation(
         orchestrator,
         evaluation_type=EvaluationType.ALL,
@@ -113,6 +125,53 @@ def is_rate_limit_error(exc: Exception) -> bool:
         or "ratelimiterror" in msg
         or "too many requests" in msg
     )
+
+
+def extract_timing_metrics(v2_trace: dict) -> dict:
+    """从 trace v2 事件流提取 per-task timing 指标。
+
+    只统计真实发生的事件；拿不到的记 None（不猜）。
+    """
+    events = v2_trace.get("events") or []
+    llm_events = [e for e in events if e["event_type"] in ("llm_call_end", "llm_call_error")]
+    agent_llm = [e for e in llm_events if e["event_type"] == "llm_call_end" and e["actor"] == "agent"]
+    user_llm = [e for e in llm_events if e["event_type"] == "llm_call_end" and e["actor"] == "user_simulator"]
+    retr_events = [e for e in events if e["event_type"] == "tool_call_end" and e.get("actor") == "retrieval"]
+    tool_events = [
+        e for e in events
+        if e["event_type"] == "tool_call_end" and e.get("actor") == "environment"
+    ]
+    rl_waits = [e for e in events if e["event_type"] == "rate_limit_wait"]
+
+    def _sum(evts, key):
+        vals = [e.get(key) for e in evts if isinstance(e.get(key), (int, float))]
+        return round(sum(vals), 3) if vals else None
+
+    def _avg_ms(evts):
+        vals = [e.get("latency_ms") for e in evts if isinstance(e.get("latency_ms"), (int, float))]
+        return round(sum(vals) / len(vals), 1) if vals else None
+
+    llm_success = [e for e in llm_events if e["event_type"] == "llm_call_end"]
+    prompt_tokens = sum(e.get("prompt_tokens") or 0 for e in llm_success)
+    completion_tokens = sum(e.get("completion_tokens") or 0 for e in llm_success)
+    llm_total_ms = _sum(llm_success, "latency_ms")
+    return {
+        "task_wall_seconds": (v2_trace.get("summary") or {}).get("task_wall_seconds"),
+        "llm_calls": len(llm_events),
+        "agent_llm_calls": len(agent_llm),
+        "user_llm_calls": len(user_llm),
+        "llm_total_latency_seconds": (
+            round(llm_total_ms / 1000, 3) if llm_total_ms is not None else None
+        ),
+        "llm_avg_latency_ms": _avg_ms(llm_success),
+        "retrieval_calls": len(retr_events),
+        "retrieval_total_latency_ms": _sum(retr_events, "latency_ms"),
+        "tool_total_latency_ms": _sum(tool_events, "latency_ms"),
+        "retry_count": (v2_trace.get("summary") or {}).get("attempt_count", 1) - 1,
+        "rate_limit_wait_seconds": (v2_trace.get("summary") or {}).get("rate_limit_wait_seconds"),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+    }
 
 
 def run_eval(
@@ -233,6 +292,10 @@ def run_eval(
     print(f"[run] run_id={run_id}  dir={run_dir}")
     print()
 
+    # --- LLM 层插桩：patch 调用方模块的 generate（只观察不干预）---
+    uninstall_llm_patch = install_llm_patch()
+    run_wall_start = time.perf_counter()
+
     # --- 逐个运行（429 限流时自动重试）---
     per_task = []
     for i, task in enumerate(tasks, 1):
@@ -240,44 +303,68 @@ def run_eval(
         sys.stdout.flush()
         m = None
         trace = None
-        for attempt in range(1, task_max_retries + 1):
-            try:
-                sim = run_single_task(config, task)
-                trace = extract_trace(
-                    sim, task,
-                    domain=domain,
-                    retrieval_config=retrieval_config,
-                    retrieval_config_kwargs=retrieval_config_kwargs,
-                )
-                m = task_metrics(
-                    sim,
-                    domain=domain,
-                    retrieval_config=retrieval_config,
-                    required_documents=list(getattr(task, "required_documents", None) or []),
-                    retrieval=trace.get("retrieval"),
-                )
-                break  # 成功，跳出重试循环
-            except Exception as exc:
-                if is_rate_limit_error(exc) and attempt < task_max_retries:
-                    wait = task_retry_cooldown * attempt
-                    print(f"    !! RateLimit(429) attempt {attempt}/{task_max_retries}, "
-                          f"wait {wait:.0f}s, retry...")
-                    sys.stdout.flush()
-                    time.sleep(wait)
-                    continue
-                # 非限流错误 或 重试耗尽
-                print(f"    !! ERROR: {exc}")
-                m = task_metrics(None, error=f"{type(exc).__name__}: {exc}")
-                trace = None
-                break  # 跳出重试循环（不重试）
+        recorder = TraceV2Recorder(run_id=run_id, task_id=task.id, trial_id="trial_1")
+        token = set_active_recorder(recorder)
+        try:
+            for attempt in range(1, task_max_retries + 1):
+                if attempt > 1:
+                    recorder.attempt_count = attempt
+                try:
+                    if attempt == 1:
+                        recorder.mark_task_start(attempt=attempt)
+                    sim = run_single_task(config, task, recorder=recorder)
+                    trace = extract_trace(
+                        sim, task,
+                        domain=domain,
+                        retrieval_config=retrieval_config,
+                        retrieval_config_kwargs=retrieval_config_kwargs,
+                    )
+                    m = task_metrics(
+                        sim,
+                        domain=domain,
+                        retrieval_config=retrieval_config,
+                        required_documents=list(getattr(task, "required_documents", None) or []),
+                        retrieval=trace.get("retrieval"),
+                    )
+                    recorder.mark_task_end(
+                        reward=m.get("reward"),
+                        termination_reason=getattr(sim, "termination_reason", None),
+                    )
+                    break  # 成功，跳出重试循环
+                except Exception as exc:
+                    if is_rate_limit_error(exc) and attempt < task_max_retries:
+                        wait = task_retry_cooldown * attempt
+                        print(f"    !! RateLimit(429) attempt {attempt}/{task_max_retries}, "
+                              f"wait {wait:.0f}s, retry...")
+                        sys.stdout.flush()
+                        recorder.mark_rate_limit_wait(wait, attempt)
+                        time.sleep(wait)
+                        continue
+                    # 非限流错误 或 重试耗尽
+                    print(f"    !! ERROR: {exc}")
+                    m = task_metrics(None, error=f"{type(exc).__name__}: {exc}")
+                    trace = None
+                    recorder.mark_task_end(reward=None, termination_reason="error")
+                    break  # 跳出重试循环（不重试）
+        finally:
+            set_active_recorder(token)
         # 重试循环后，m 一定不为 None
         m["task_id"] = task.id
+        # v1 trace（保持原有文件名，向后兼容）
         if trace is not None:
             trace_file = traces_dir / f"{sanitize_filename(task.id)}.json"
             trace_file.write_text(
                 json.dumps(trace, indent=2, ensure_ascii=False), encoding="utf-8"
             )
             m["trace_path"] = str(trace_file.relative_to(run_dir))
+        # v2 event-sourced trace（新增；v1 不动）
+        v2 = recorder.to_dict()
+        v2_file = traces_dir / f"{sanitize_filename(task.id)}.v2.json"
+        v2_file.write_text(
+            json.dumps(v2, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        m["trace_v2_path"] = str(v2_file.relative_to(run_dir))
+        m["timing"] = extract_timing_metrics(v2)
 
         status = "SUCCESS" if m["success"] else "FAIL"
         cost = (m.get("agent_cost") or 0.0) + (m.get("user_cost") or 0.0)
@@ -311,6 +398,11 @@ def run_eval(
     summary = compute_summary(run_meta, per_task)
     summary["run_dir"] = str(run_dir)
 
+    # --- run 级 timing 汇总（基于 trace v2）---
+    uninstall_llm_patch()
+    total_wall = time.perf_counter() - run_wall_start
+    summary["timing"] = compute_run_timing(per_task, total_wall)
+
     (run_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
     )
@@ -319,3 +411,41 @@ def run_eval(
     )
 
     return summary
+
+
+def compute_run_timing(per_task: list[dict], total_wall_seconds: float) -> dict:
+    """聚合 run 级 timing 指标（per_task 的 timing 来自 extract_timing_metrics）。"""
+    timings = [t.get("timing") or {} for t in per_task]
+
+    def _vals(key: str) -> list[float]:
+        return [t[key] for t in timings if isinstance(t.get(key), (int, float))]
+
+    def _avg(key: str) -> Optional[float]:
+        vals = _vals(key)
+        return round(sum(vals) / len(vals), 3) if vals else None
+
+    def _p(key: str, pct: float) -> Optional[float]:
+        """pct=0.5 -> p50, pct=0.95 -> p95。样本不足时返回 None（不猜）。"""
+        vals = sorted(_vals(key))
+        if not vals:
+            return None
+        import math
+        idx = min(len(vals) - 1, max(0, math.ceil(pct * len(vals)) - 1))
+        return round(vals[idx], 3)
+
+    wall_vals = _vals("task_wall_seconds")
+    return {
+        "total_wall_time": round(total_wall_seconds, 1),
+        "average_task_wall_time": _avg("task_wall_seconds"),
+        "p50_task_wall_time": _p("task_wall_seconds", 0.5),
+        "p95_task_wall_time": _p("task_wall_seconds", 0.95),
+        "total_llm_calls": sum(t.get("llm_calls") or 0 for t in timings),
+        "average_llm_latency_ms": _avg("llm_avg_latency_ms"),
+        "p95_llm_latency_ms": _p("llm_avg_latency_ms", 0.95),
+        "total_rate_limit_wait_seconds": round(
+            sum(t.get("rate_limit_wait_seconds") or 0 for t in timings), 3
+        ),
+        "throughput_tasks_per_minute": round(
+            len(per_task) / (total_wall_seconds / 60), 3
+        ) if total_wall_seconds > 0 else None,
+    }
