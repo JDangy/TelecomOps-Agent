@@ -300,25 +300,142 @@ class KnowledgeWorkingMemory(_WorkingMemory):
         removed = before - len(self._state["open_questions"])
         return {"open_questions_resolved": [removed]} if removed else {}
 
-    # -- context 渲染 ---------------------------------------------------------
+    # -- V1.2 选择性检索与复用 -------------------------------------------------
+    def start_task(self, task_id: str) -> None:
+        super().start_task(task_id)
+        self._answered: list = []        # [{"question", "packet"}] 已回答记录
+        self._low_progress_streak = 0    # 连续无新信息的检索次数
+
+    def end_task(self) -> dict:
+        snap = super().end_task()
+        snap["answered_packets"] = len(getattr(self, "_answered", []))
+        self._answered = []
+        self._low_progress_streak = 0
+        return snap
+
+    def reset(self) -> None:
+        super().reset()
+        self._answered = []
+        self._low_progress_streak = 0
+
+    LOW_PROGRESS_LIMIT = 3  # 连续 N 次无新信息 → 建议停止（可配置，不写进 prompt）
+
+    def record_answered(self, question: str, packet: dict) -> None:
+        """记录一次已回答的 request 及其 packet（hit 判定与复用依据）。
+
+        不做 question 字符串精确缓存——不同问法可能需要同一份事实，
+        hit 判定靠 retrieve() 的词重叠匹配。
+        """
+        if not hasattr(self, "_answered"):
+            self._answered = []
+        self._answered.append({"question": question or "", "packet": packet or {}})
+
+    def note_retrieval_progress(self, new_docs: int, new_facts: int) -> dict:
+        """检索后记录 progress（停止条件的依据）。
+
+        low = 本次检索既无新文档也无新事实。
+        """
+        if not hasattr(self, "_low_progress_streak"):
+            self._low_progress_streak = 0
+        if new_docs <= 0 and new_facts <= 0:
+            self._low_progress_streak += 1
+            progress = "low"
+        else:
+            self._low_progress_streak = 0
+            progress = "new"
+        return {"progress": progress, "streak": self._low_progress_streak}
+
+    def should_stop_searching(self) -> bool:
+        return getattr(self, "_low_progress_streak", 0) >= self.LOW_PROGRESS_LIMIT
+
+    @staticmethod
+    def _content_words(text: str) -> set:
+        """内容词提取（去停用词）——确定性相关性匹配的基础。"""
+        STOP = {"the", "a", "an", "is", "are", "was", "were", "be", "to", "of",
+                "for", "in", "on", "at", "and", "or", "if", "it", "its", "this",
+                "that", "with", "as", "by", "from", "what", "which", "how",
+                "does", "do", "can", "any", "there", "their", "they", "user",
+                "customer", "bank", "rho", "policy", "information", "details"}
+        return {w for w in _norm(text).split() if len(w) > 2 and w not in STOP}
+
+    def _retrieve(self, request: dict) -> dict:
+        """确定性相关性匹配（V1.2 核心接口；无 LLM）。
+
+        匹配信号：
+        1. 相似已回答问题：question 与 answered question 的词重叠
+           overlap = |q∩a| / |a| ≥ 0.5 → 同题（packet 可复用）
+        2. 相关事实：facts_found 的 claim 与 question+needed 内容词重叠 ≥ 1
+        3. verdict：
+           hit     —— 存在相似已回答问题（其 packet status 达标）
+           partial —— 无相似问题但有相关事实（只搜缺的部分）
+           miss    —— 都没有
+
+        已知局限（诚实记录，误差方向是"多搜"而非"错答"）：
+        - 词面重叠无法识别同义改写（fee↔charge）→ 漏判 miss 会多搜
+        - 不理解否定（"no annual fee" 与 "annual fee" 强相关）→ 可能提前 hit
+        宁可保守：宁可多搜一次，不基于错误记忆直接回答。
+        """
+        q_words = self._content_words(
+            request.get("question", "") + " " +
+            " ".join(request.get("needed_information") or [])
+        )
+        empty = {"verdict": "miss", "relevant_facts": [],
+                 "relevant_documents": [], "relevant_queries": [],
+                 "known_missing": [], "matched_packet_count": 0}
+        if not q_words:
+            return empty
+
+        # 1) 相似已回答问题
+        best, best_overlap = None, 0.0
+        for rec in getattr(self, "_answered", []):
+            aq_words = self._content_words(rec.get("question", ""))
+            if not aq_words:
+                continue
+            overlap = len(q_words & aq_words) / max(1, len(aq_words))
+            if overlap > best_overlap:
+                best_overlap, best = overlap, rec
+        matched_packets, hit = 0, False
+        if best is not None and best_overlap >= 0.5:
+            matched_packets = 1
+            if (best.get("packet") or {}).get("status") in ("sufficient", "partial"):
+                hit = True
+
+        # 2) 相关事实（按重叠词数排序，最多 6 条）
+        scored = []
+        for f in self._state.get("facts_found", []):
+            claim_words = self._content_words(f.split(" [")[0])
+            score = len(q_words & claim_words)
+            if score >= 1:
+                scored.append((score, f))
+        scored.sort(key=lambda x: -x[0])
+        relevant_facts = [f for _, f in scored[:6]]
+
+        # 3) 相关文档（相关事实的来源，最多 8 个）
+        doc_set = set(self._state.get("documents_seen", []))
+        relevant_docs = []
+        for f in relevant_facts:
+            if "[" in f:
+                doc_id = f.split("[")[-1].rstrip("]")
+                if doc_id in doc_set and doc_id not in relevant_docs:
+                    relevant_docs.append(doc_id)
+        relevant_docs = relevant_docs[:8]
+
+        verdict = "hit" if hit else ("partial" if relevant_facts else "miss")
+        return {
+            "verdict": verdict,
+            "relevant_facts": relevant_facts,
+            "relevant_documents": relevant_docs,
+            "relevant_queries": [],  # queries_tried 不再注入（V1.1 反向激励教训）
+            "known_missing": list(self._state.get("open_questions", []))[:4],
+            "matched_packet_count": matched_packets,
+            "similar_question": best.get("question") if best else None,
+            "similar_packet": best.get("packet") if hit else None,
+        }
+
+    # -- context 渲染（V1.2: 默认不再全量渲染——KA 走 retrieve 相关视图）--
     def _render(self) -> str:
-        s = self._state
-        lines = ["[Knowledge Agent Working Memory — what you already know from earlier in this task]"]
-        if s["facts_found"]:
-            lines.append("Facts already established:")
-            lines += [f"- {x}" for x in s["facts_found"][-10:]]
-        if s["queries_tried"]:
-            lines.append("Queries you already tried (do NOT repeat these):")
-            lines += [f"- {x}" for x in s["queries_tried"][-10:]]
-        if s["documents_seen"]:
-            docs = s["documents_seen"]
-            shown = docs[-20:]
-            more = f" (+{len(docs)-20} more)" if len(docs) > 20 else ""
-            lines.append(f"Documents already seen: {', '.join(shown)}{more}")
-        if s["open_questions"]:
-            lines.append("Still unresolved:")
-            lines += [f"- {x}" for x in s["open_questions"][-5:]]
-        if len(lines) == 1:
-            return ""
-        return "\n".join(lines)
+        # V1.1 的全量渲染是负结果根因之一。保留方法以满足 base 接口，
+        # 但 KA 不再调用 context_block()；相关视图由 retrieve() 提供，
+        # 由 KnowledgeAgent 渲染（见 two_agent.py _render_relevant_view）。
+        return ""
 

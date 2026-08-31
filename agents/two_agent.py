@@ -139,11 +139,13 @@ EVIDENCE_PACKET_SYSTEM_PROMPT = """You are a knowledge specialist for a bank's c
 
 You have access to knowledge base search tools. Your job:
 1. Read the question from the decision agent, plus any provided constraints and known facts.
-2. If a [Working Memory] block is provided, use it: do NOT repeat queries listed there, and build on facts already established.
-3. Formulate search queries and search the knowledge base as many times as needed.
-4. Read the search results carefully.
-5. Decide: do you have enough evidence to answer? If not, search again with better queries.
-6. When you have enough evidence, return your final answer AS A JSON EVIDENCE PACKET.
+2. If a block of "[Already established facts...]" is provided, REUSE those facts — do not search
+   for information you already have. Only search for the specific missing pieces.
+3. If recent searches stop returning new documents or new facts (the system will tell you),
+   stop searching and produce your packet with what you have.
+4. Each search should target a distinct piece of missing information. Do not keep reformulating
+   variations of the same question hoping for different results.
+5. When you have enough evidence, return your final answer AS A JSON EVIDENCE PACKET.
 
 The evidence packet schema:
 {
@@ -156,10 +158,10 @@ The evidence packet schema:
 }
 
 - confidence: how certain you are about the individual facts.
-- status: whether this evidence is SUFFICIENT for the requesting agent to act on, only PARTIAL, or clearly INSUFFICIENT (needs more work). These are different: you can be highly confident in a fact yet the packet may be insufficient for the task.
+- status: whether this evidence is SUFFICIENT for the requesting agent to act on, only PARTIAL, or clearly INSUFFICIENT. These are different: you can be highly confident in a fact yet the packet may be insufficient for the task.
 
 STRICT RULES:
-- source_doc_id values MUST be actual document IDs you saw in search results. Never invent IDs.
+- source_doc_id values MUST be actual document IDs you saw in search results or in provided established facts. Never invent IDs.
 - Do not copy large passages of raw text into the packet — distill facts.
 - If evidence is insufficient, say so in missing_information, set confidence low, and status to "insufficient".
 - You return ONLY the JSON packet as your final message — no other text around it.
@@ -191,22 +193,55 @@ class KnowledgeAgent:
         self.memory = memory  # None 时不启用（向后兼容 V1 行为）
 
     def answer(self, request) -> dict:
-        """回答一个 KnowledgeRequest，返回 EvidencePacket dict。
+        """回答一个 KnowledgeRequest，返回 EvidencePacket dict（V1.2 三段式）。
 
-        V1.1：context = system + memory block（若有）+ 结构化 request。
-        不携带历史 handoff 的原始 messages——KA context 不随 handoff 数累积。
+        Memory Hit   —— retrieve() 判定已有相似已回答问题：
+                       直接复用 similar_packet 组装回答（零检索、零额外 LLM）。
+        Partial Hit  —— 有相关事实但缺明确内容：把相关事实+缺口交给 KA，
+                       只搜缺的部分（progress 检测防转圈）。
+        Memory Miss  —— 正常检索流程。
 
-        流程：构建消息 → 循环（LLM → 若调工具则执行+记 memory → 回填）→
-        LLM 输出 JSON packet → packet facts/missing 写入 memory。
-        失败时返回带 missing_information 的降级 packet。
+        防膨胀三件套：
+        - 不再全量注入 memory（relevant view 最多 6 facts + 8 docs）
+        - prompt 不再写"勿重复 query"（V1.1 反向激励教训）
+        - 每次检索后 note_retrieval_progress：连续 LOW_PROGRESS_LIMIT 次无
+          新文档且无新事实 → 建议停止（KA 收到停止提示后收尾）
         """
-        # 结构化 request（兼容旧的 str 输入）
         if isinstance(request, str):
             request = KnowledgeRequest(question=request)
+
+        # ---- 三段式判定 ----
+        view = None
+        if self.memory is not None:
+            view = self.memory.retrieve(request.model_dump())
+            self._emit_memory_event_safe("memory_retrieve", request=request,
+                                        verdict=view.get("verdict"),
+                                        matched_facts=len(view.get("relevant_facts") or []),
+                                        matched_packets=view.get("matched_packet_count") or 0)
+
+        if view is not None and view.get("verdict") == "hit":
+            # Memory Hit：零检索直接出 packet
+            self._emit_memory_event_safe("memory_hit", request=request,
+                                         matched_fact_count=len(view.get("relevant_facts") or []),
+                                         matched_packet_count=view.get("matched_packet_count") or 0,
+                                         retrieval_skipped=True)
+            packet = self._reuse_packet(view, request)
+            self._record_packet_memory(request, packet)
+            return packet
+
+        if view is not None and view.get("verdict") == "partial":
+            self._emit_memory_event_safe("memory_partial_hit", request=request,
+                                         matched_fact_count=len(view.get("relevant_facts") or []),
+                                         matched_packet_count=0)
+        elif view is not None:
+            self._emit_memory_event_safe("memory_miss", request=request,
+                                         matched_fact_count=0, matched_packet_count=0)
+
         # memory 记录本次 request
         if self.memory is not None:
             self.memory.update({"type": "request", "question": request.question})
 
+        # ---- Partial / Miss：构建 context（relevant view，非全量）----
         user_lines = [f"Question from the decision agent:\n{request.question}"]
         if request.known_constraints:
             user_lines.append("Known user constraints:\n" +
@@ -217,21 +252,35 @@ class KnowledgeAgent:
         if request.needed_information:
             user_lines.append("Specifically, find:\n" +
                               "\n".join(f"- {x}" for x in request.needed_information))
-
-        # memory block 注入（预算内、空则不注入）
-        mem_block = self.memory.context_block() if self.memory is not None else ""
-        if mem_block:
-            user_lines.append(mem_block)
+        # V1.2: 只注入 request 相关视图（partial 时），miss 时零注入
+        if view is not None and view.get("verdict") == "partial":
+            block = self._render_relevant_view(view)
+            if block:
+                user_lines.append(block)
 
         system = SystemMessage(role="system", content=EVIDENCE_PACKET_SYSTEM_PROMPT)
         user_msg = UserMessage(role="user", content="\n\n".join(user_lines))
         messages: List[Message] = [system, user_msg]
 
+        forced_stop = False
         for _round in range(KNOWLEDGE_AGENT_MAX_ROUNDS):
+            # 停止条件：连续 LOW_PROGRESS_LIMIT 次检索无新信息 → 强制收尾
+            if (self.memory is not None and not forced_stop
+                    and self.memory.should_stop_searching()):
+                self._emit_memory_event_safe("retrieval_progress", request=request,
+                                             progress="low", streak=None,
+                                             stopped=True)
+                messages.append(UserMessage(
+                    role="user",
+                    content=("Recent searches are not finding new documents or facts. "
+                             "Stop searching and return your evidence packet JSON now "
+                             "with what you have; use missing_information for gaps."),
+                ))
+                forced_stop = True
             assistant = generate(
                 model=self.llm,
                 messages=messages,
-                tools=self.tools,
+                tools=None if forced_stop else self.tools,
                 call_name="knowledge_agent_response",
                 **self.llm_args,
             )
@@ -242,7 +291,7 @@ class KnowledgeAgent:
             for tc in assistant.tool_calls:
                 result = self._run_tool(tc)
                 messages.append(result)
-                # memory 记录 query + docs（确定性，无 LLM）
+                # memory 记录 query + docs；progress 检测（确定性，无 LLM）
                 if self.memory is not None and not result.error:
                     args = tc.arguments or {}
                     self.memory.update({"type": "retrieval_query",
@@ -251,6 +300,16 @@ class KnowledgeAgent:
                     doc_ids = [m.group(1).strip()
                                for m in _re.finditer(r"ID:\s*(\S+)", result.content or "")]
                     if doc_ids:
+                        # progress: 本次返回的文档里有多少是 memory 没见过的
+                        # （必须在 update memory 之前算，否则全算重复）
+                        if hasattr(self.memory, "note_retrieval_progress"):
+                            seen_before = set(self.memory.read().get("documents_seen", []))
+                            new_docs = len(set(doc_ids) - seen_before)
+                            prog = self.memory.note_retrieval_progress(new_docs, 0)
+                            self._emit_memory_event_safe(
+                                "retrieval_progress", request=request,
+                                progress=prog["progress"],
+                                new_docs=new_docs, streak=prog["streak"])
                         self.memory.update({"type": "documents", "doc_ids": doc_ids})
         else:
             # 轮次耗尽：强制收尾
@@ -268,17 +327,66 @@ class KnowledgeAgent:
             messages.append(assistant)
 
         packet = self._parse_packet(assistant)
-        # packet 结果写入 memory（facts + missing_information）
-        if self.memory is not None:
-            if packet.get("facts"):
-                self.memory.update({"type": "facts", "facts": packet["facts"]})
-            for miss in packet.get("missing_information") or []:
-                self.memory.update({"type": "open_question", "question": miss})
-            # request 的问题若已答出且非 insufficient，标记解决
-            if packet.get("status") in ("sufficient", "partial"):
-                self.memory.update({"type": "resolve_question",
-                                    "question": request.question})
+        self._record_packet_memory(request, packet)
         return packet
+
+    def _record_packet_memory(self, request, packet) -> None:
+        """packet 结果写 memory（facts/missing/answered 记录）。"""
+        if self.memory is None:
+            return
+        if packet.get("facts"):
+            self.memory.update({"type": "facts", "facts": packet["facts"]})
+        for miss in packet.get("missing_information") or []:
+            self.memory.update({"type": "open_question", "question": miss})
+        if packet.get("status") in ("sufficient", "partial"):
+            self.memory.update({"type": "resolve_question",
+                                "question": request.question})
+        # V1.2: 记录已回答问题（hit 复用依据）
+        if hasattr(self.memory, "record_answered"):
+            self.memory.record_answered(request.question, packet)
+
+    def _reuse_packet(self, view, request) -> dict:
+        """Memory Hit 路径：复用相似问题的 packet（零检索）。
+
+        直接返回 similar_packet（其 facts/来源保留原样——事实本身不变），
+        answer 加一行说明这是基于已确认信息，供 DA 理解上下文。
+        不重新调用 LLM——纯程序复用。
+        """
+        packet = dict(view.get("similar_packet") or {})
+        note = (f"(Reused verified evidence previously gathered for a similar "
+                f"question: '{view.get('similar_question', '')[:120]}')")
+        packet["answer"] = (packet.get("answer", "") + "\n" + note).strip()
+        return packet
+
+    def _render_relevant_view(self, view) -> str:
+        """渲染 retrieve() 的相关视图（小而聚焦，替代 V1.1 全量注入）。"""
+        lines = ["[Already established facts relevant to this question — reuse them, only search for what is missing:]"]
+        for f in view.get("relevant_facts") or []:
+            lines.append(f"- {f}")
+        if view.get("known_missing"):
+            lines.append("Known gaps from earlier: " + "; ".join(view["known_missing"][:3]))
+        if len(lines) <= 1:
+            return ""
+        return "\n".join(lines)
+
+    def _emit_memory_event_safe(self, event_type, request=None, **fields) -> None:
+        """发 memory 行为事件（无 recorder 静默跳过；不影响执行）。"""
+        try:
+            from eval.instrumentation import get_active_recorder
+            rec = get_active_recorder()
+        except Exception:
+            return
+        if rec is None:
+            return
+        payload = {k: v for k, v in fields.items()}
+        if request is not None:
+            payload["question"] = (getattr(request, "question", "") or "")[:200]
+        try:
+            rec.emit(event_type, "knowledge_agent",
+                     parent_span_id=getattr(rec, "task_span_id", None),
+                     **payload)
+        except Exception:
+            pass
 
     # -- 内部 -------------------------------------------------------------
     def _run_tool(self, tool_call) -> ToolMessage:

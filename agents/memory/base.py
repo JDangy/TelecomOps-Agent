@@ -85,7 +85,43 @@ class AgentMemory(ABC):
     def _render(self) -> str:  # pragma: no cover - 子类实现
         raise NotImplementedError
 
-    # -- trace 事件辅助 ---------------------------------------------------
+    # -- 选择性检索（V1.2 正式接口）-----------------------------------------
+    def retrieve(self, request: dict) -> dict:
+        """按当前 request 返回相关的一小部分 memory（relevant view）。
+
+        V1.1 的教训：全量 memory 注入 context 会形成新的膨胀源，且
+        "勿重复 query" 清单会反向激励 Agent 换说法继续搜。retrieve()
+        改为只返回与当前问题相关的内容，供 Agent 判断 hit/partial/miss。
+
+        Args:
+            request: KnowledgeRequest dict（question/known_constraints/
+                     needed_information 等）。
+
+        Returns:
+            {
+              "verdict": "hit" | "partial" | "miss",
+              "relevant_facts": [...],       # 相关事实（含 source_doc_id）
+              "relevant_documents": [...],    # 相关已见文档 ID
+              "relevant_queries": [...],     # 相关已试 query（仅分析用）
+              "known_missing": [...],        # 已知缺失项
+              "matched_packet_count": int,   # 相关的历史 packet 数
+            }
+        空记忆返回 verdict="miss"。
+        """
+        view = self._retrieve(request)
+        if not isinstance(view, dict) or "verdict" not in view:
+            view = {"verdict": "miss",
+                    "relevant_facts": [], "relevant_documents": [],
+                    "relevant_queries": [], "known_missing": [],
+                    "matched_packet_count": 0}
+        return view
+
+    def _retrieve(self, request: dict) -> dict:  # pragma: no cover - 子类实现
+        """子类实现相关性匹配（确定性规则，禁止 LLM）。"""
+        return {"verdict": "miss", "relevant_facts": [], "relevant_documents": [],
+                "relevant_queries": [], "known_missing": [],
+                "matched_packet_count": 0}
+
     def _emit_memory_event(self, event_type: str, **fields: Any) -> None:
         """向 active TraceV2Recorder 发 memory 事件（无 recorder 时静默跳过）。
 

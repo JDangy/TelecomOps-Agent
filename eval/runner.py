@@ -284,6 +284,24 @@ def _memory_metrics(events, ka_retr, hands, results) -> dict:
     da_snap = next((e.get("snapshot") or {} for e in snaps
                     if e.get("actor") == "decision_agent"), {})
 
+    # ---- V1.2 Selective Retrieval 指标 ----
+    mem_hits = [e for e in events if e["event_type"] == "memory_hit"]
+    mem_partial = [e for e in events if e["event_type"] == "memory_partial_hit"]
+    mem_miss = [e for e in events if e["event_type"] == "memory_miss"]
+    mem_verdicts = len(mem_hits) + len(mem_partial) + len(mem_miss)
+    skipped = sum(1 for e in mem_hits if e.get("retrieval_skipped"))
+    prog_events = [e for e in events if e["event_type"] == "retrieval_progress"]
+    low_prog = [e for e in prog_events if e.get("progress") == "low"]
+
+    # per-retrieval new docs（流式：第一次见到的才算 new）
+    seen_stream: set = set()
+    new_docs_per_retr: list = []
+    for e in ka_retr:
+        docs = e.get("doc_ids") or []
+        new_n = sum(1 for d in docs if d not in seen_stream)
+        seen_stream.update(docs)
+        new_docs_per_retr.append(new_n)
+
     return {
         "ka_unique_queries": unique_q,
         "ka_repeated_queries": repeated_q,
@@ -301,6 +319,22 @@ def _memory_metrics(events, ka_retr, hands, results) -> dict:
             s: sum(1 for r in results if r.get("evidence_status") == s)
             for s in ("sufficient", "partial", "insufficient")
         },
+        # ---- V1.2 Selective Memory Retrieval ----
+        "memory_hit_count": len(mem_hits),
+        "memory_partial_hit_count": len(mem_partial),
+        "memory_miss_count": len(mem_miss),
+        "memory_hit_rate": (
+            round(len(mem_hits) / mem_verdicts, 3) if mem_verdicts else None
+        ),
+        "retrieval_avoided_count": skipped,
+        "new_documents_per_retrieval": (
+            round(sum(new_docs_per_retr) / len(new_docs_per_retr), 2)
+            if new_docs_per_retr else None
+        ),
+        "repeated_document_ratio": (
+            round(repeated_doc_hits / len(doc_seq), 3) if doc_seq else None
+        ),
+        "low_progress_retrieval_count": len(low_prog),
     }
 
 
