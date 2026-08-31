@@ -1,0 +1,43 @@
+{
+  "domain": "banking_knowledge",
+  "description": "V1.1 memory diagnostic set: 4 个 V1 转坏任务 + 1 个转好 + 1 个稳定成功 + 1 个稳定失败",
+  "task_ids": [
+    "task_003",
+    "task_008",
+    "task_010",
+    "task_037",
+    "task_046",
+    "task_004",
+    "task_095"
+  ],
+  "tasks_meta": [
+    {
+      "task_id": "task_003",
+      "num_required_documents": 5
+    },
+    {
+      "task_id": "task_008",
+      "num_required_documents": 6
+    },
+    {
+      "task_id": "task_010",
+      "num_required_documents": 2
+    },
+    {
+      "task_id": "task_037",
+      "num_required_documents": 4
+    },
+    {
+      "task_id": "task_046",
+      "num_required_documents": 3
+    },
+    {
+      "task_id": "task_004",
+      "num_required_documents": 1
+    },
+    {
+      "task_id": "task_095",
+      "num_required_documents": 15
+    }
+  ]
+}

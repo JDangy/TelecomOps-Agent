@@ -100,16 +100,50 @@ class EvidencePacket(BaseModel):
         default="medium",
         description="high / medium / low — how confident the knowledge agent is in the evidence"
     )
+    status: str = Field(
+        default="partial",
+        description=(
+            "sufficient / partial / insufficient — whether THIS evidence is enough "
+            "for the requesting agent to proceed. Note: confidence (certainty of "
+            "individual facts) and status (sufficiency for the task) are different things."
+        )
+    )
+
+
+# ---------------------------------------------------------------------------
+# 结构化 KnowledgeRequest（V1.1）：减少宽泛 handoff
+# ---------------------------------------------------------------------------
+class KnowledgeRequest(BaseModel):
+    """Decision → Knowledge 的结构化请求。
+
+    目的：让 Knowledge Agent 明确知道——用户要什么、已经知道什么、这次缺什么。
+    替代 V1 的纯文本 question + context，避免"帮我找所有信用卡信息"式宽泛请求。
+    不做 Planner——只是结构化传递既有信息。
+    """
+    question: str = Field(description="The specific question to answer")
+    known_constraints: List[str] = Field(
+        default_factory=list,
+        description="User constraints relevant to this question, e.g. 'annual fee <= $100'",
+    )
+    known_facts: List[str] = Field(
+        default_factory=list,
+        description="Facts the decision agent already established",
+    )
+    needed_information: List[str] = Field(
+        default_factory=list,
+        description="What specific information is missing that this request should find",
+    )
 
 
 EVIDENCE_PACKET_SYSTEM_PROMPT = """You are a knowledge specialist for a bank's customer service system.
 
 You have access to knowledge base search tools. Your job:
-1. Read the question from the decision agent (and any user constraints provided).
-2. Formulate search queries and search the knowledge base as many times as needed.
-3. Read the search results carefully.
-4. Decide: do you have enough evidence to answer? If not, search again with better queries.
-5. When you have enough evidence, return your final answer AS A JSON EVIDENCE PACKET.
+1. Read the question from the decision agent, plus any provided constraints and known facts.
+2. If a [Working Memory] block is provided, use it: do NOT repeat queries listed there, and build on facts already established.
+3. Formulate search queries and search the knowledge base as many times as needed.
+4. Read the search results carefully.
+5. Decide: do you have enough evidence to answer? If not, search again with better queries.
+6. When you have enough evidence, return your final answer AS A JSON EVIDENCE PACKET.
 
 The evidence packet schema:
 {
@@ -117,13 +151,17 @@ The evidence packet schema:
   "facts": [{"claim": "<factual claim>", "source_doc_id": "<doc id from search results>"}],
   "relevant_document_ids": ["<doc ids consulted>"],
   "missing_information": ["<aspects you could not answer>"],
-  "confidence": "high|medium|low"
+  "confidence": "high|medium|low",
+  "status": "sufficient|partial|insufficient"
 }
+
+- confidence: how certain you are about the individual facts.
+- status: whether this evidence is SUFFICIENT for the requesting agent to act on, only PARTIAL, or clearly INSUFFICIENT (needs more work). These are different: you can be highly confident in a fact yet the packet may be insufficient for the task.
 
 STRICT RULES:
 - source_doc_id values MUST be actual document IDs you saw in search results. Never invent IDs.
 - Do not copy large passages of raw text into the packet — distill facts.
-- If evidence is insufficient, say so in missing_information and set confidence to low.
+- If evidence is insufficient, say so in missing_information, set confidence low, and status to "insufficient".
 - You return ONLY the JSON packet as your final message — no other text around it.
 """
 
@@ -135,29 +173,59 @@ class KnowledgeAgent:
 
     不继承 HalfDuplexAgent——它不直接参与 user 对话轮，而是由
     DecisionAgent 通过 ask_knowledge_agent 工具同步调用。
-    每次 handoff 是一个全新 context（不跨 handoff 记忆，V1 保持最小）。
+
+    V1.1 memory 语义：
+    - 持有 KnowledgeWorkingMemory（task 内跨 handoff 累积）
+    - 每次 handoff 的 context = system + memory block + 本次 KnowledgeRequest
+      ——不带上一次 handoff 的完整 messages（原始检索文档不无限累积，
+         防 context explosion 从 DA 搬到 KA）
+    - 检索 query / 返回 doc_ids / packet facts 全部程序化写入 memory
+    - task 边界由 runner 调 start_task/end_task
     """
 
-    def __init__(self, tools: List[Tool], llm: str, llm_args: Optional[dict] = None):
+    def __init__(self, tools: List[Tool], llm: str, llm_args: Optional[dict] = None,
+                 memory: Optional["KnowledgeWorkingMemory"] = None):
         self.tools = tools  # 只有 KB 检索工具
         self.llm = llm
         self.llm_args = dict(llm_args or {})
+        self.memory = memory  # None 时不启用（向后兼容 V1 行为）
 
-    def answer(self, question: str, context_note: str = "") -> dict:
-        """回答一个知识问题，返回 EvidencePacket dict。
+    def answer(self, request) -> dict:
+        """回答一个 KnowledgeRequest，返回 EvidencePacket dict。
 
-        流程：构建 system + user 消息 → 循环（LLM → 若调工具则执行 → 回填）→
-        LLM 输出 JSON packet。失败时返回带 missing_information 的降级 packet。
+        V1.1：context = system + memory block（若有）+ 结构化 request。
+        不携带历史 handoff 的原始 messages——KA context 不随 handoff 数累积。
+
+        流程：构建消息 → 循环（LLM → 若调工具则执行+记 memory → 回填）→
+        LLM 输出 JSON packet → packet facts/missing 写入 memory。
+        失败时返回带 missing_information 的降级 packet。
         """
-        user_content = f"Question from the decision agent:\n{question}"
-        if context_note:
-            user_content += f"\n\nUser constraints / task context (for query formulation only):\n{context_note}"
+        # 结构化 request（兼容旧的 str 输入）
+        if isinstance(request, str):
+            request = KnowledgeRequest(question=request)
+        # memory 记录本次 request
+        if self.memory is not None:
+            self.memory.update({"type": "request", "question": request.question})
+
+        user_lines = [f"Question from the decision agent:\n{request.question}"]
+        if request.known_constraints:
+            user_lines.append("Known user constraints:\n" +
+                              "\n".join(f"- {x}" for x in request.known_constraints))
+        if request.known_facts:
+            user_lines.append("Facts the decision agent already established:\n" +
+                              "\n".join(f"- {x}" for x in request.known_facts))
+        if request.needed_information:
+            user_lines.append("Specifically, find:\n" +
+                              "\n".join(f"- {x}" for x in request.needed_information))
+
+        # memory block 注入（预算内、空则不注入）
+        mem_block = self.memory.context_block() if self.memory is not None else ""
+        if mem_block:
+            user_lines.append(mem_block)
 
         system = SystemMessage(role="system", content=EVIDENCE_PACKET_SYSTEM_PROMPT)
-        user_msg = UserMessage(role="user", content=user_content)
+        user_msg = UserMessage(role="user", content="\n\n".join(user_lines))
         messages: List[Message] = [system, user_msg]
-
-        tools_schema = [t.openai_schema for t in self.tools] or None
 
         for _round in range(KNOWLEDGE_AGENT_MAX_ROUNDS):
             assistant = generate(
@@ -174,6 +242,16 @@ class KnowledgeAgent:
             for tc in assistant.tool_calls:
                 result = self._run_tool(tc)
                 messages.append(result)
+                # memory 记录 query + docs（确定性，无 LLM）
+                if self.memory is not None and not result.error:
+                    args = tc.arguments or {}
+                    self.memory.update({"type": "retrieval_query",
+                                         "query": args.get("query", "")})
+                    import re as _re
+                    doc_ids = [m.group(1).strip()
+                               for m in _re.finditer(r"ID:\s*(\S+)", result.content or "")]
+                    if doc_ids:
+                        self.memory.update({"type": "documents", "doc_ids": doc_ids})
         else:
             # 轮次耗尽：强制收尾
             messages.append(UserMessage(
@@ -189,7 +267,18 @@ class KnowledgeAgent:
             )
             messages.append(assistant)
 
-        return self._parse_packet(assistant)
+        packet = self._parse_packet(assistant)
+        # packet 结果写入 memory（facts + missing_information）
+        if self.memory is not None:
+            if packet.get("facts"):
+                self.memory.update({"type": "facts", "facts": packet["facts"]})
+            for miss in packet.get("missing_information") or []:
+                self.memory.update({"type": "open_question", "question": miss})
+            # request 的问题若已答出且非 insufficient，标记解决
+            if packet.get("status") in ("sufficient", "partial"):
+                self.memory.update({"type": "resolve_question",
+                                    "question": request.question})
+        return packet
 
     # -- 内部 -------------------------------------------------------------
     def _run_tool(self, tool_call) -> ToolMessage:
@@ -292,12 +381,16 @@ class KnowledgeAgent:
             try:
                 obj = json.loads(raw[s:e + 1])
                 if isinstance(obj, dict) and "answer" in obj:
+                    status = str(obj.get("status", "partial"))
+                    if status not in ("sufficient", "partial", "insufficient"):
+                        status = "partial"
                     packet = EvidencePacket(
                         answer=str(obj.get("answer", "")),
                         facts=[EvidenceFact(**f) for f in obj.get("facts", []) if isinstance(f, dict) and "claim" in f],
                         relevant_document_ids=[str(d) for d in obj.get("relevant_document_ids", [])],
                         missing_information=[str(m) for m in obj.get("missing_information", [])],
                         confidence=str(obj.get("confidence", "medium")),
+                        status=status,
                     )
                     return packet.model_dump()
             except Exception:
@@ -307,6 +400,7 @@ class KnowledgeAgent:
             answer=raw[:2000] if raw else "(knowledge agent returned empty output)",
             missing_information=["knowledge agent failed to produce a structured evidence packet"],
             confidence="low",
+            status="insufficient",
         ).model_dump()
 
 
@@ -322,12 +416,25 @@ You cannot do both at the same time.
 
 You have business tools for account actions. For KNOWLEDGE QUESTIONS (product details,
 fees, rates, eligibility, policies, procedures), do NOT guess — call
-ask_knowledge_agent with a clear, specific question. It returns a structured
-evidence packet with verified facts and source document IDs.
+ask_knowledge_agent with a SPECIFIC question. It returns a structured
+evidence packet with verified facts, source document IDs, a confidence level,
+and a status field.
 
-Use the evidence packet to answer the user or inform your decisions. If the packet
-reports missing_information or low confidence, you may ask the knowledge agent
-a refined question, or tell the user honestly what is unclear.
+Calling ask_knowledge_agent effectively:
+- question: one focused question (not "tell me everything about X").
+- known_constraints: pass the user's relevant constraints (e.g. annual fee limits)
+  so the knowledge agent searches accordingly.
+- needed_information: list what specifically you still need to know.
+
+Reading the packet:
+- facts are verified claims with source document IDs.
+- status says whether the evidence is sufficient for you to act:
+  "sufficient" = proceed; "partial" = usable but gaps remain;
+  "insufficient" = ask a refined question or tell the user what is unclear.
+- Do not treat high confidence on individual facts as proof the whole task is solved.
+
+If a [Working Memory] block appears in your system prompt, it summarizes what you
+already know in this task — use it to avoid re-asking questions already answered.
 
 Try to be helpful and always follow the policy. Always make sure you generate valid JSON only.
 """.strip()
@@ -350,13 +457,18 @@ class DecisionAgent(LLMAgent):
 
     MAX_INTERCEPT_ROUNDS = 12  # 单轮内拦截上限：防 ask 无限循环（远超合理用量）
 
-    def __init__(self, tools, domain_policy, knowledge_agent: KnowledgeAgent, **kwargs):
+    def __init__(self, tools, domain_policy, knowledge_agent: KnowledgeAgent,
+                 memory: Optional["DecisionWorkingMemory"] = None, **kwargs):
         super().__init__(tools=tools, domain_policy=domain_policy, **kwargs)
         self._knowledge_agent = knowledge_agent
+        self.memory = memory  # None 时不启用（向后兼容 V1 行为）
 
     @property
     def system_prompt(self) -> str:
         from tau2.agent.llm_agent import SYSTEM_PROMPT
+        # 注意：memory block 不在这里注入——system_prompt 只在 agent init 时
+        # 渲染一次，那时 memory 为空。动态注入见 _messages_with_memory()
+        # （每次 generate 前把最新 memory block 拼到 system 消息尾部）。
         return SYSTEM_PROMPT.format(
             domain_policy=self.domain_policy,
             agent_instruction=DECISION_AGENT_INSTRUCTION,
@@ -374,7 +486,10 @@ class DecisionAgent(LLMAgent):
 
         assistant_message = None
         for _ in range(self.MAX_INTERCEPT_ROUNDS):
-            full = state.system_messages + state.messages
+            # V1.1: 每次生成前注入最新 memory block——system_prompt property
+            # 只在 init 时渲染一次，动态 memory 必须在这里按需拼装。
+            # base_prompt 缓存无 memory 版本，memory block 追加其上（不改 state）。
+            full = self._messages_with_memory(state)
             assistant_message = generate(
                 model=self.llm,
                 tools=self.tools,
@@ -415,7 +530,7 @@ class DecisionAgent(LLMAgent):
             assistant_message = None  # 纯 ask：吃掉本条，循环继续生成
         # 兜底：不应到达（MAX 轮内必有非 ask 输出），防御性生成纯文本
         if assistant_message is None:
-            full = state.system_messages + state.messages
+            full = self._messages_with_memory(state)
             assistant_message = generate(
                 model=self.llm,
                 tools=[t for t in self.tools if t.name != "ask_knowledge_agent"],
@@ -426,15 +541,44 @@ class DecisionAgent(LLMAgent):
         state.messages.append(assistant_message)
         return assistant_message, state
 
+    def _messages_with_memory(self, state):
+        """返回 system(含最新 memory block) + 历史消息。不修改 state 本身。"""
+        mem_block = self.memory.context_block() if self.memory is not None else ""
+        if not mem_block or not state.system_messages:
+            return state.system_messages + state.messages
+        # 复制 system 消息并追加 memory block（原 state 不动）
+        sys_msg = state.system_messages[0].model_copy(deep=True)
+        sys_msg.content = (sys_msg.content or "") + "\n\n" + mem_block
+        return [sys_msg] + list(state.system_messages[1:]) + state.messages
+
     def _do_ask(self, tool_call) -> str:
         """执行 ask_knowledge_agent：handoff 到 Knowledge Agent，返回 packet JSON。
 
-        向 trace v2 发 handoff 事件（记录 question + packet 摘要）。
+        V1.1：构建结构化 KnowledgeRequest；packet 的 facts/missing_information
+        程序化写入 Decision memory（无 LLM）。trace 记 handoff 事件。
         """
         import time as _time
         args = tool_call.arguments or {}
-        question = args.get("question", "")
-        context = args.get("context", "")
+
+        # 结构化 KnowledgeRequest（从 ask 参数直接映射）
+        request = KnowledgeRequest(
+            question=args.get("question", ""),
+            known_constraints=args.get("known_constraints") or [],
+            known_facts=args.get("known_facts") or [],
+            needed_information=args.get("needed_information") or [],
+        )
+        # 若 DA 有 memory：把已知约束/事实自动补充进 request（省 LLM 复述）
+        if self.memory is not None:
+            mem = self.memory.read()
+            known = set(request.known_constraints)
+            for c in mem.get("user_constraints", []):
+                if c not in known:
+                    request.known_constraints.append(c)
+            # DA memory 的 verified_facts 作为 known_facts 补充（去重）
+            kf = {f for f in request.known_facts}
+            for f in mem.get("verified_facts", []):
+                if f not in kf:
+                    request.known_facts.append(f)
 
         rec = None
         try:
@@ -447,13 +591,29 @@ class DecisionAgent(LLMAgent):
                 rec.emit("handoff", "decision_agent",
                          parent_span_id=getattr(rec, "task_span_id", None),
                          to_agent="knowledge_agent",
-                         question=question[:500])
+                         question=request.question[:500],
+                         known_constraints=request.known_constraints,
+                         needed_information=request.needed_information)
             except Exception:
                 pass
 
         t0 = _time.perf_counter()
-        packet = self._knowledge_agent.answer(question, context_note=context)
+        packet = self._knowledge_agent.answer(request)
         packet_json = json.dumps(packet, ensure_ascii=False)
+
+        # packet → DA memory（确定性提取，无 LLM）：
+        # facts 作为已确认事实；missing 作为待决问题
+        if self.memory is not None:
+            for f in packet.get("facts") or []:
+                claim = f.get("claim")
+                doc = f.get("source_doc_id")
+                if claim:
+                    self.memory.update({
+                        "type": "verified_fact",
+                        "fact": f"{claim} [source: {doc}]" if doc else claim,
+                    })
+            for miss in packet.get("missing_information") or []:
+                self.memory.update({"type": "open_question", "question": miss})
 
         if rec is not None:
             try:
@@ -464,6 +624,7 @@ class DecisionAgent(LLMAgent):
                          evidence_doc_ids=packet.get("relevant_document_ids", []),
                          evidence_fact_count=len(packet.get("facts", [])),
                          evidence_confidence=packet.get("confidence"),
+                         evidence_status=packet.get("status"),
                          missing_information_count=len(packet.get("missing_information", [])),
                          )
             except Exception:
@@ -486,23 +647,34 @@ def make_ask_knowledge_tool() -> Tool:
     """
     from tau2.environment.tool import as_tool
 
-    def ask_knowledge_agent(question: str, context: str = "") -> str:
+    def ask_knowledge_agent(question: str,
+                            known_constraints: List[str] = None,
+                            known_facts: List[str] = None,
+                            needed_information: List[str] = None) -> str:
         """Ask the knowledge specialist agent to look up verified facts from the
         knowledge base. Use for product details, fees, rates, eligibility rules,
-        procedures, or policy questions. Returns a structured evidence packet
-        with an answer, verified facts with source document IDs, and confidence.
+        procedures, or policy questions. Returns a structured evidence packet:
+        answer, verified facts with source document IDs, confidence, and a
+        status field (sufficient/partial/insufficient) telling you whether the
+        evidence is enough to proceed.
 
         Args:
-            question: The specific knowledge question to answer, e.g. 'What is
-                the annual fee and cash back rate of the Platinum Rewards Card?'
-            context: Optional user constraints or task context the knowledge
-                agent should account for, e.g. 'user wants no annual fee'.
+            question: One focused question, e.g. 'What is the annual fee and
+                cash back rate of the Platinum Rewards Card?' — do NOT ask
+                broad open-ended questions like 'tell me about all cards'.
+            known_constraints: User constraints relevant to this question,
+                e.g. ['annual fee <= $100', 'user travels monthly'].
+            known_facts: Facts you already established, e.g.
+                ['user has a Gold Rewards Card'].
+            needed_information: What specifically you still need to find,
+                e.g. ['fee waiver conditions'].
         """
         # 实际不会走到这里（DecisionAgent 拦截执行）；保底实现防御性调用
         return json.dumps(
             EvidencePacket(
                 answer="(executed via agent-side interception path)",
                 confidence="low",
+                status="insufficient",
             ).model_dump()
         )
 
@@ -513,9 +685,10 @@ def make_ask_knowledge_tool() -> Tool:
 # Factory：注册进 agents/registry.py
 # ---------------------------------------------------------------------------
 def create_two_agent(tools, domain_policy, **kwargs) -> DecisionAgent:
-    """V1 factory：分流工具 → 构造 KnowledgeAgent → 注入 ask 工具 → DecisionAgent。
+    """V1.1 factory：分流工具 → 双 memory → KnowledgeAgent → DecisionAgent。
 
     与 create_llm_agent 同签名（build.py 调用约定）。
+    memory 由 runner 在 task 边界调 start_task/end_task（见 eval/runner.py）。
     """
     llm = kwargs.get("llm")
     llm_args = kwargs.get("llm_args") or {}
@@ -527,14 +700,21 @@ def create_two_agent(tools, domain_policy, **kwargs) -> DecisionAgent:
             "但 environment.get_tools() 里没有找到。请确认 domain/retrieval config。"
         )
 
+    # V1.1: per-agent working memory（默认启用；disable_memory=True 回退 V1 行为）
+    from agents.memory import DecisionWorkingMemory, KnowledgeWorkingMemory
+    da_memory = DecisionWorkingMemory()
+    ka_memory = KnowledgeWorkingMemory()
+
     knowledge_agent = KnowledgeAgent(
         tools=knowledge_tools, llm=llm, llm_args=llm_args,
+        memory=ka_memory,
     )
     ask_tool = make_ask_knowledge_tool()
     return DecisionAgent(
         tools=business_tools + [ask_tool],
         domain_policy=domain_policy,
         knowledge_agent=knowledge_agent,
+        memory=da_memory,
         llm=llm,
         llm_args=llm_args,
     )

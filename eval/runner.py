@@ -89,6 +89,10 @@ def run_single_task(config: TextRunConfig, task, recorder=None) -> SimulationRun
 
     recorder: TraceV2Recorder（可选）。传入时启用 tool 层插桩——
     environment.get_response 被无行为影响的代理包装（仅计时/记录）。
+
+    V1.1 memory 生命周期：build_text_orchestrator 每 task 重建 agent，
+    memory 随 agent 实例新建（天然零跨 task 泄漏）。这里补 start_task
+    （激活）与 end_task（快照+清空）。agent 无 memory 属性时跳过（V0/baseline）。
     """
     env_kwargs = {}
     if config.domain == "banking_knowledge" and config.retrieval_config:
@@ -98,12 +102,54 @@ def run_single_task(config: TextRunConfig, task, recorder=None) -> SimulationRun
     if recorder is not None:
         # 只观察不干预：包装代理不改 tool schema / retrieval config / 结果内容
         orchestrator.environment = wrap_environment(orchestrator.environment, recorder)
-    sim = run_simulation(
-        orchestrator,
-        evaluation_type=EvaluationType.ALL,
-        env_kwargs=env_kwargs,
-    )
+
+    # V1.1: 激活 per-agent working memory（task 开始）
+    _start_memories(orchestrator, task.id, recorder)
+    try:
+        sim = run_simulation(
+            orchestrator,
+            evaluation_type=EvaluationType.ALL,
+            env_kwargs=env_kwargs,
+        )
+    finally:
+        # task 结束（含异常路径）：快照 + 清空，防泄漏
+        _end_memories(orchestrator, recorder)
     return sim
+
+
+def _iter_agent_memories(orchestrator):
+    """收集 orchestrator.agent（及其 KnowledgeAgent 成员）上的 memory 实例。"""
+    agent = getattr(orchestrator, "agent", None)
+    seen = []
+    for m in (getattr(agent, "memory", None),
+              getattr(getattr(agent, "_knowledge_agent", None), "memory", None)):
+        if m is not None and hasattr(m, "start_task") and not any(m is x for x in seen):
+            seen.append(m)
+    return seen
+
+
+def _start_memories(orchestrator, task_id, recorder) -> None:
+    for m in _iter_agent_memories(orchestrator):
+        try:
+            m.start_task(task_id)
+        except Exception as exc:  # memory 失败不打断评测
+            print(f"    (memory start_task 失败: {exc})")
+
+
+def _end_memories(orchestrator, recorder) -> None:
+    for m in _iter_agent_memories(orchestrator):
+        try:
+            snap = m.end_task()
+            # memory_snapshot 事件：task end 写一次完整快照（分析用）
+            if recorder is not None and snap:
+                rec = recorder
+                actor = getattr(m, "_actor", lambda: "system")() \
+                    if hasattr(m, "_actor") else "system"
+                rec.emit("memory_snapshot", actor,
+                         parent_span_id=getattr(rec, "task_span_id", None),
+                         snapshot=snap)
+        except Exception as exc:
+            print(f"    (memory end_task 失败: {exc})")
 
 
 def is_rate_limit_error(exc: Exception) -> bool:
@@ -195,6 +241,66 @@ def _extract_two_agent_metrics(v2_trace: dict) -> dict:
         "decision_agent_max_prompt_tokens": max(
             (e.get("prompt_tokens") or 0 for e in da_llm_end), default=None
         ),
+        # ---- V1.1 memory 指标 ----
+        **_memory_metrics(events, ka_retr, hands, results),
+    }
+
+
+def _norm_query(q: str) -> str:
+    return " ".join((q or "").lower().split())
+
+
+def _memory_metrics(events, ka_retr, hands, results) -> dict:
+    """从 memory events / 检索事件提取 V1.1 新指标。
+
+    重复检测口径：query/doc 与本 task 更早出现过的相同（规范化后）。
+    retrieval/doc 层面从事件流重建（memory_update 只是增量通知，不重复计）。
+    """
+    # KA 侧：retrieval query 序列（tool_call_start 上有 query）
+    ka_retr_starts = [e for e in events
+                      if e["event_type"] == "tool_call_start"
+                      and e.get("agent") == "knowledge_agent"
+                      and e.get("query")]
+    queries = [_norm_query(e.get("query") or "") for e in ka_retr_starts]
+    unique_q, repeated_q = 0, 0
+    seen_q = set()
+    for q in queries:
+        if q in seen_q:
+            repeated_q += 1
+        else:
+            seen_q.add(q)
+            unique_q += 1
+    # KA docs 序列（tool_call_end 上有 doc_ids）
+    doc_seq: list = []
+    for e in ka_retr:
+        doc_seq.extend(e.get("doc_ids") or [])
+    unique_docs = len(set(doc_seq))
+    repeated_doc_hits = len(doc_seq) - unique_docs
+
+    # memory snapshot（task end 记录的完整快照）
+    snaps = [e for e in events if e["event_type"] == "memory_snapshot"]
+    ka_snap = next((e.get("snapshot") or {} for e in snaps
+                    if e.get("actor") == "knowledge_agent"), {})
+    da_snap = next((e.get("snapshot") or {} for e in snaps
+                    if e.get("actor") == "decision_agent"), {})
+
+    return {
+        "ka_unique_queries": unique_q,
+        "ka_repeated_queries": repeated_q,
+        "ka_unique_documents_seen": unique_docs,
+        "ka_repeated_document_hits": repeated_doc_hits,
+        "retrievals_per_handoff": (
+            round(len(ka_retr) / len(hands), 2) if hands else None
+        ),
+        "ka_memory_fact_count": len(ka_snap.get("facts_found") or []),
+        "ka_memory_doc_count": len(ka_snap.get("documents_seen") or []),
+        "ka_memory_queries_count": len(ka_snap.get("queries_tried") or []),
+        "da_memory_constraint_count": len(da_snap.get("user_constraints") or []),
+        "da_memory_fact_count": len(da_snap.get("verified_facts") or []),
+        "evidence_status_counts": {
+            s: sum(1 for r in results if r.get("evidence_status") == s)
+            for s in ("sufficient", "partial", "insufficient")
+        },
     }
 
 
