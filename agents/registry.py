@@ -14,13 +14,16 @@ V0 baseline = tau2 官方 ``llm_agent``（文本半双工，工具调用 + 对�
 注意：不要在这里注册会读到 evaluation_criteria 的 agent —— 那是作弊。
 """
 
-from agents.two_agent import create_two_agent
+from agents.two_agent import create_two_agent, create_two_agent_efficient
 
 AGENT_REGISTRY = {
     # 逻辑名 -> tau2 registry agent 名
     "baseline": "llm_agent",
-    # V1: 2-Agent（Decision + Knowledge，context 隔离）-> 自定义 factory
+    # V1.1/V1.2: 2-Agent（Decision + Knowledge，context 隔离 + selective memory）
     "two_agent": create_two_agent,
+    # V1.3: 同架构 + procedural efficiency instruction（长流程批处理/合并/少解说）
+    # 回退方式：评测时改回 --agent two_agent 即为 V1.2 原样
+    "two_agent_efficient": create_two_agent_efficient,
 }
 
 

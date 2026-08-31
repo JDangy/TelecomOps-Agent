@@ -548,6 +548,75 @@ Try to be helpful and always follow the policy. Always make sure you generate va
 """.strip()
 
 
+# ---------------------------------------------------------------------------
+# V1.3: procedural efficiency instruction（失败分析驱动的最小改进，可回退）
+#
+# 数据依据（12 个顽固失败任务，V0 winter trace 实测）：
+#   - 动作数 >8 的任务成功率 0/8；成功任务平均 2 个动作、失败任务平均 11.7
+#   - max_steps 死亡任务停在 31 轮 assistant 响应：
+#     纯文本轮占 23%~58%（task_088 一半是解说）
+#     单调用轮约一半（能并行的没并行）
+#     unlock 与 call 分离成两轮
+# 三条指令全部针对"长动作序列执行持久力"：
+#   1. 并行批处理（多对象同流程 → 一轮发出所有调用）
+#   2. unlock+call 同轮合并
+#   3. 减少解说轮（先讲完整计划，然后连续执行）
+# 不改变：检索/KM/memory/评分/工具 schema——变量只有 DA 的执行风格。
+# ---------------------------------------------------------------------------
+DECISION_AGENT_INSTRUCTION_EFFICIENT = """
+You are a customer service agent that helps the user according to the <policy> provided below.
+In each turn you can either:
+- Send a message to the user.
+- Make a tool call.
+You cannot do both at the same time.
+
+You have business tools for account actions. For KNOWLEDGE QUESTIONS (product details,
+fees, rates, eligibility, policies, procedures), do NOT guess — call
+ask_knowledge_agent with a SPECIFIC question. It returns a structured
+evidence packet with verified facts, source document IDs, a confidence level,
+and a status field.
+
+Calling ask_knowledge_agent effectively:
+- question: one focused question (not "tell me everything about X").
+- known_constraints: pass the user's relevant constraints (e.g. annual fee limits)
+  so the knowledge agent searches accordingly.
+- needed_information: list what specifically you still need to know.
+
+Reading the packet:
+- facts are verified claims with source document IDs.
+- status says whether the evidence is sufficient for you to act:
+  "sufficient" = proceed; "partial" = usable but gaps remain;
+  "insufficient" = ask a refined question or tell the user what is unclear.
+- Do not treat high confidence on individual facts as proof the whole task is solved.
+
+If a [Working Memory] block appears in your system prompt, it summarizes what you
+already know in this task — use it to avoid re-asking questions already answered.
+
+WORKING EFFICIENTLY ON MULTI-STEP PROCEDURES (important — your turn budget is limited):
+- When a procedure requires the same steps for MULTIPLE cards/accounts (e.g. freeze
+  three cards, or close two accounts), do them ALL in one response: issue every
+  independent tool call together in parallel instead of one per turn.
+- When a procedure requires an unlock tool before calling the actual tool, put the
+  unlock call AND the follow-up call in the SAME response — do not split them across
+  turns waiting for the unlock result when the follow-up arguments are already known.
+- Before starting a multi-step procedure, briefly tell the user the full plan in ONE
+  message. Then execute the steps continuously without pausing to explain each one.
+  A short progress note every few completed steps is enough — do not spend a whole
+  turn narrating each individual action.
+- Only pause for user input when the policy or a missing fact genuinely requires it.
+
+Try to be helpful and always follow the policy. Always make sure you generate valid JSON only.
+""".strip()
+
+
+# instruction 变体注册表：logical agent 名 → instruction 文本。
+# two_agent = V1.2 原样；two_agent_efficient = V1.3（唯一变量：DA 执行风格提示）。
+INSTRUCTION_VARIANTS = {
+    "two_agent": DECISION_AGENT_INSTRUCTION,
+    "two_agent_efficient": DECISION_AGENT_INSTRUCTION_EFFICIENT,
+}
+
+
 class DecisionAgent(LLMAgent):
     """LLMAgent 子类：换 instruction + 拦截 ask_knowledge_agent 调用。
 
@@ -566,10 +635,13 @@ class DecisionAgent(LLMAgent):
     MAX_INTERCEPT_ROUNDS = 12  # 单轮内拦截上限：防 ask 无限循环（远超合理用量）
 
     def __init__(self, tools, domain_policy, knowledge_agent: KnowledgeAgent,
-                 memory: Optional["DecisionWorkingMemory"] = None, **kwargs):
+                 memory: Optional["DecisionWorkingMemory"] = None,
+                 instruction_variant: str = "two_agent", **kwargs):
         super().__init__(tools=tools, domain_policy=domain_policy, **kwargs)
         self._knowledge_agent = knowledge_agent
         self.memory = memory  # None 时不启用（向后兼容 V1 行为）
+        # V1.3: instruction 变体（two_agent = V1.2 原样；two_agent_efficient = 执行效率版）
+        self._instruction_variant = instruction_variant
 
     @property
     def system_prompt(self) -> str:
@@ -577,9 +649,12 @@ class DecisionAgent(LLMAgent):
         # 注意：memory block 不在这里注入——system_prompt 只在 agent init 时
         # 渲染一次，那时 memory 为空。动态注入见 _messages_with_memory()
         # （每次 generate 前把最新 memory block 拼到 system 消息尾部）。
+        instruction = INSTRUCTION_VARIANTS.get(
+            self._instruction_variant, DECISION_AGENT_INSTRUCTION
+        )
         return SYSTEM_PROMPT.format(
             domain_policy=self.domain_policy,
-            agent_instruction=DECISION_AGENT_INSTRUCTION,
+            agent_instruction=instruction,
         )
 
     def generate_next_message(self, message, state):
@@ -792,11 +867,16 @@ def make_ask_knowledge_tool() -> Tool:
 # ---------------------------------------------------------------------------
 # Factory：注册进 agents/registry.py
 # ---------------------------------------------------------------------------
-def create_two_agent(tools, domain_policy, **kwargs) -> DecisionAgent:
-    """V1.1 factory：分流工具 → 双 memory → KnowledgeAgent → DecisionAgent。
+def create_two_agent(tools, domain_policy, instruction_variant="two_agent", **kwargs) -> DecisionAgent:
+    """V1.1+ factory：分流工具 → 双 memory → KnowledgeAgent → DecisionAgent。
 
     与 create_llm_agent 同签名（build.py 调用约定）。
     memory 由 runner 在 task 边界调 start_task/end_task（见 eval/runner.py）。
+
+    Args:
+        instruction_variant: "two_agent" = V1.2 原样 instruction；
+            "two_agent_efficient" = V1.3 执行效率 instruction
+            （唯一变量：长流程批处理/合并/少解说——完全可回退）。
     """
     llm = kwargs.get("llm")
     llm_args = kwargs.get("llm_args") or {}
@@ -825,4 +905,16 @@ def create_two_agent(tools, domain_policy, **kwargs) -> DecisionAgent:
         memory=da_memory,
         llm=llm,
         llm_args=llm_args,
+        instruction_variant=instruction_variant,
+    )
+
+
+def create_two_agent_efficient(tools, domain_policy, **kwargs) -> DecisionAgent:
+    """V1.3 factory：two_agent_efficient 逻辑名入口。
+
+    与 create_two_agent 完全同构，唯一差异 instruction_variant
+    （V1.2 行为用 --agent two_agent 即可完整回退）。
+    """
+    return create_two_agent(
+        tools, domain_policy, instruction_variant="two_agent_efficient", **kwargs
     )
