@@ -1,0 +1,38 @@
+{
+  "domain": "banking_knowledge",
+  "description": "V1.3 stubborn-failure focus set: 6 个跨版本全败任务（A类序列不全×3 + C类中段遗漏×3）",
+  "task_ids": [
+    "task_080",
+    "task_092",
+    "task_026",
+    "task_054",
+    "task_070",
+    "task_020"
+  ],
+  "tasks_meta": [
+    {
+      "task_id": "task_080",
+      "num_required_documents": 19
+    },
+    {
+      "task_id": "task_092",
+      "num_required_documents": 12
+    },
+    {
+      "task_id": "task_026",
+      "num_required_documents": 8
+    },
+    {
+      "task_id": "task_054",
+      "num_required_documents": 9
+    },
+    {
+      "task_id": "task_070",
+      "num_required_documents": 16
+    },
+    {
+      "task_id": "task_020",
+      "num_required_documents": 8
+    }
+  ]
+}
