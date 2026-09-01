@@ -347,17 +347,35 @@ def _harness_metrics(events: list) -> dict:
     # verdict 分类（从 action_validation 事件聚合）
     verdict_counts: dict = {}
     mismatched_fields = []
+    conflict_fields = []       # V2.2: task_state 冲突字段
+    constraint_sources = []     # V2.2: 拦截依据来源
     for e in [x for x in events if x["event_type"] == "action_validation"]:
         for v in e.get("verdicts") or []:
             verdict_counts[v.get("verdict")] = verdict_counts.get(v.get("verdict"), 0) + 1
             if v.get("verdict") == "evidence_mismatch":
                 mismatched_fields.append(v.get("field"))
+            if v.get("verdict") == "task_state_conflict":
+                conflict_fields.append(v.get("field"))
+                src = (v.get("detail") or {}).get("value_source")
+                if src and src not in constraint_sources:
+                    constraint_sources.append(src)
     schema_fails = sum(
         1 for e in rejected
         if any(v.get("verdict") == "schema_violation"
                for v in e.get("verdicts_summary") or [])
     )
-    evidence_rej = len(rejected) - schema_fails
+    # V2.2: 三类新拦截细分
+    task_state_rej = sum(
+        1 for e in rejected
+        if any(v.get("verdict") == "task_state_conflict"
+               for v in e.get("verdicts_summary") or [])
+    )
+    kb_rej = sum(
+        1 for e in rejected
+        if any(str(v.get("verdict", "")).startswith("kb_")
+               for v in e.get("verdicts_summary") or [])
+    )
+    evidence_rej = len(rejected) - schema_fails - task_state_rej - kb_rej
     # rejected 工具在后续 proposed 中再次出现 = 修正重试（近似）
     tool_seq = [e.get("tool_name") for e in proposed]
     rej_tools = [e.get("tool_name") for e in rejected]
@@ -391,6 +409,11 @@ def _harness_metrics(events: list) -> dict:
         "rejections": len(rejected),
         "schema_validation_failures": schema_fails,
         "evidence_mismatches": evidence_rej,
+        # V2.2: 三源拦截细分 + 冲突字段 + 来源
+        "task_state_conflict_rejections": task_state_rej,
+        "kb_constraint_rejections": kb_rej,
+        "conflict_fields": list(dict.fromkeys(conflict_fields))[:10],
+        "conflict_sources": constraint_sources,
         "corrected_after_rejection": corrected,
         "verdict_counts": verdict_counts,
         "mismatched_fields": list(dict.fromkeys(mismatched_fields))[:10],

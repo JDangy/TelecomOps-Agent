@@ -118,6 +118,18 @@ class EvidencePacket(BaseModel):
             "(no paraphrasing, no translation, no humanized rewriting)."
         )
     )
+    constraints: List[dict] = Field(
+        default_factory=list,
+        description=(
+            "V2.2: DEFINITE constraints from the KB — not case answers. Each: "
+            "{tool_name?, parameter_name, constraint_type(enum|threshold|format), "
+            "allowed_values?[], min?, max?, unit?, format?, source_doc_id}. "
+            "Only include constraints the KB states explicitly (an enum set a tool "
+            "accepts, a documented max transfer amount, a required date format). "
+            "Never use this to pick WHICH legal value applies to the current case "
+            "— that is the decision agent's job."
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -162,6 +174,7 @@ The evidence packet schema:
   "answer": "<concise synthesized answer>",
   "facts": [{"claim": "<factual claim>", "source_doc_id": "<doc id from search results>"}],
   "grounded_values": [{"tool_name": "<tool the value is used in>", "parameter_name": "<parameter of that tool>", "value": "<exact value>", "value_type": "enum|number|string|boolean", "source_doc_id": "<doc id>"}],
+  "constraints": [{"tool_name": "<tool>", "parameter_name": "<parameter>", "constraint_type": "enum|threshold|format", "allowed_values": ["..."], "min": 0, "max": 5000, "unit": "USD", "format": "MM/DD/YYYY", "source_doc_id": "<doc id>"}],
   "relevant_document_ids": ["<doc ids consulted>"],
   "missing_information": ["<aspects you could not answer>"],
   "confidence": "high|medium|low",
@@ -182,6 +195,16 @@ grounded_values — CRITICAL FOR DOWNSTREAM TOOL USE:
   "account_closure", write "account_closure" — NOT "closure", "account closing",
   or any paraphrase. Numbers keep their exact digits and units.
 - If no precise tool-usable value is needed, an empty list is fine.
+
+constraints — DEFINITE RULES ONLY (never case answers):
+- Include a constraint ONLY when the knowledge base explicitly states it:
+  - "enum": the complete set of legal values a parameter accepts
+    (e.g. allowed_values: ["fraud", "customer_request", "account_closure"]).
+  - "threshold": a documented numeric bound (max transfer amount, min balance).
+  - "format": a required value format (e.g. MM/DD/YYYY for dates).
+- Do NOT use constraints to say which legal value fits THIS case — deciding that
+  is the decision agent's job. "enum" constrains the set; it does not pick one.
+- If the KB does not state a constraint explicitly, leave the list empty.
 
 - confidence: how certain you are about the individual facts.
 - status: whether this evidence is SUFFICIENT for the requesting agent to act on, only PARTIAL, or clearly INSUFFICIENT. These are different: you can be highly confident in a fact yet the packet may be insufficient for the task.
@@ -540,6 +563,43 @@ class KnowledgeAgent:
                             else:
                                 entry["name"] = str(gv["name"])
                             grounded.append(entry)
+                    # V2.2: KB 明确约束（enum 集合/阈值/格式——非案例值）。
+                    # 只收 constraint_type 明确且带 parameter_name 的条目，
+                    # 缺关键字段的丢弃（不猜）。
+                    constraints_out = []
+                    for c in obj.get("constraints") or []:
+                        if not isinstance(c, dict) or not c.get("parameter_name"):
+                            continue
+                        ctype = str(c.get("constraint_type", "")).lower()
+                        if ctype not in ("enum", "threshold", "format"):
+                            continue
+                        entry_c = {
+                            "parameter_name": str(c["parameter_name"]),
+                            "constraint_type": ctype,
+                            "source_doc_id": c.get("source_doc_id"),
+                        }
+                        if c.get("tool_name"):
+                            entry_c["tool_name"] = str(c["tool_name"])
+                        if ctype == "enum":
+                            av = [v for v in (c.get("allowed_values") or [])
+                                  if v not in (None, "")]
+                            if not av:
+                                continue  # 空 enum 约束不可用——丢弃
+                            entry_c["allowed_values"] = av
+                        elif ctype == "threshold":
+                            if c.get("min") is not None:
+                                entry_c["min"] = c["min"]
+                            if c.get("max") is not None:
+                                entry_c["max"] = c["max"]
+                            if c.get("unit"):
+                                entry_c["unit"] = c["unit"]
+                            if "min" not in entry_c and "max" not in entry_c:
+                                continue
+                        elif ctype == "format":
+                            if not c.get("format"):
+                                continue
+                            entry_c["format"] = str(c["format"])
+                        constraints_out.append(entry_c)
                     packet = EvidencePacket(
                         answer=str(obj.get("answer", "")),
                         facts=[EvidenceFact(**f) for f in obj.get("facts", []) if isinstance(f, dict) and "claim" in f],
@@ -548,6 +608,7 @@ class KnowledgeAgent:
                         confidence=str(obj.get("confidence", "medium")),
                         status=status,
                         grounded_values=grounded,
+                        constraints=constraints_out,
                     )
                     return packet.model_dump()
             except Exception:
@@ -703,10 +764,54 @@ class DecisionAgent(LLMAgent):
         # V1.3: instruction 变体（two_agent = V1.2 原样；two_agent_efficient = 执行效率版）
         self._instruction_variant = instruction_variant
         # V2: Action Harness（None = 关闭，V1.2 行为；registry two_agent_harness 启用）
-        from agents.harness import ActionHarness
+        from agents.harness import ActionHarness, TaskState
+        self.task_state = TaskState()  # V2.2: 参数级 provenance registry
         self.harness = ActionHarness() if harness_enabled else None
-        self._packets: list = []  # 本任务收到的 Evidence Packets（grounded_values 来源）
+        if self.harness is not None:
+            # 三源接线：TaskState 由本 agent 喂（user/tool result），
+            # KB 约束由 packets 累积（_do_ask 里 update）
+            self.harness.wire(task_state=self.task_state, kb_constraints=[])
+        self._packets: list = []  # 本任务收到的 Evidence Packets
         self._tool_by_name = {t.name: t for t in tools if t.name != "ask_knowledge_agent"}
+
+    # -- V2.2: TaskState 三源喂入 ------------------------------------------------
+    def _feed_task_state(self, message) -> None:
+        """把进入 agent 的消息中的明确值灌入 TaskState（确定性，无 LLM）。
+
+        user 消息 → UserValueExtractor（显式金额）
+        tool 结果（MultiToolMessage）→ ToolResultExtractor（返回的 ID 字段）
+        ask packet → KnowledgeConstraints（在 _do_ask 里累积）
+        """
+        if self.harness is None or self.task_state is None:
+            return
+        try:
+            if isinstance(message, UserMessage):
+                from agents.harness import UserValueExtractor
+                UserValueExtractor.feed(
+                    self.task_state, message.content or "",
+                    turn_ref="user_message")
+            elif hasattr(message, "tool_messages"):
+                from agents.harness import ToolResultExtractor
+                for tm in message.tool_messages:
+                    ToolResultExtractor.feed(
+                        self.task_state, tm.name or "", tm.content or "")
+        except Exception:
+            pass  # 状态喂入失败不影响对话流
+
+    def _update_kb_constraints(self) -> None:
+        """把累积 packets 中的明确 KB 约束刷新进 harness（_do_ask 后调用）。"""
+        if self.harness is None:
+            return
+        try:
+            from agents.harness import constraints_from_packets
+            for p in self.policies_of_harness():
+                if hasattr(p, "constraints"):
+                    p.constraints = constraints_from_packets(self._packets)
+        except Exception:
+            pass
+
+    def policies_of_harness(self):
+        return getattr(self.harness, "policies", [])
 
     def _harness_context(self, arguments: dict):
         """构建校验上下文（V2.1 provenance 修复）。
@@ -746,6 +851,8 @@ class DecisionAgent(LLMAgent):
 
     def generate_next_message(self, message, state):
         """覆盖：拦截 ask_knowledge_agent，其余行为与 LLMAgent 一致。"""
+        # V2.2: 进入消息的明确值 → TaskState（user 金额 / tool ID）
+        self._feed_task_state(message)
         # 与官方实现相同的入队逻辑（UserMessage/MultiToolMessage）
         if isinstance(message, UserMessage) and message.is_audio:
             raise ValueError("User message cannot be audio.")
@@ -811,6 +918,7 @@ class DecisionAgent(LLMAgent):
                     self._packets.append(json.loads(packet_json))
                 except Exception:
                     pass
+                self._update_kb_constraints()  # V2.2: KB 明确约束刷新进 harness
             for tc, err in rejected.items():
                 state.messages.append(ToolMessage(
                     id=tc, role="tool", requestor="assistant",
