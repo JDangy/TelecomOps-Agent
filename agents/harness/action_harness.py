@@ -260,8 +260,8 @@ def constraints_from_packets(packets: list) -> list:
     return out
 
 
-# 兼容 V2/V2.1 的 context_from_packets（历史入口保留）
+# 兼容 V2/V2.1 的 context_from_packets（历史入口保留——evidence policy 用）
 def context_from_packets(packets: list[dict],
                          user_values: Optional[dict] = None) -> HarnessContext:
-    from agents.harness.validators import context_from_packets as _cfp
-    return _cfp(packets, user_values)
+    from agents.harness.validators import build_evidence_context
+    return build_evidence_context(packets, user_values)

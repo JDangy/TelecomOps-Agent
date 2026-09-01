@@ -96,6 +96,9 @@ class KnowledgeConstraintValidator:
 
             if ctype == "threshold":
                 mn, mx = c.get("min"), c.get("max")
+                # 类型安全：threshold 只对数值参数有意义——proposed 是布尔
+                # 或 min/max 不是数字（如 doc 的 "true or false" 混入）时，
+                # 该约束不可用 → 放行（不猜）
                 try:
                     v = float(proposed)
                 except (TypeError, ValueError):
@@ -103,14 +106,25 @@ class KnowledgeConstraintValidator:
                         field=f, verdict="no_kb_constraint", detail={},
                     ))
                     continue
-                if mn is not None and v < float(mn):
+                def _num(x):
+                    try:
+                        return float(x)
+                    except (TypeError, ValueError):
+                        return None
+                mn_v, mx_v = _num(mn), _num(mx)
+                if mn_v is None and mx_v is None:
+                    verdicts.append(ValidationVerdict(
+                        field=f, verdict="no_kb_constraint", detail={},
+                    ))
+                    continue
+                if mn_v is not None and v < mn_v:
                     verdicts.append(ValidationVerdict(
                         field=f, verdict="kb_threshold_violation",
                         detail={"proposed": proposed, "kb_min": mn,
                                 "unit": c.get("unit"),
                                 "source_doc_id": c.get("source_doc_id")},
                     ))
-                elif mx is not None and v > float(mx):
+                elif mx_v is not None and v > mx_v:
                     verdicts.append(ValidationVerdict(
                         field=f, verdict="kb_threshold_violation",
                         detail={"proposed": proposed, "kb_max": mx,

@@ -261,3 +261,57 @@ class EvidenceParameterValidation:
         if isinstance(proposed, str) and isinstance(evidence, str):
             return proposed.strip().lower() == evidence.strip().lower()
         return False
+
+
+# ---------------------------------------------------------------------------
+# V2/V2.1 兼容：Evidence policy 的 context 构建（历史入口，主线不调用）
+# ---------------------------------------------------------------------------
+def build_evidence_context(packets: list, user_values=None) -> "HarnessContext":
+    """从 packets 的 grounded_values 构建 evidence 索引（V2.1 双键格式）。
+
+    供 include_evidence_policy=True 的历史复现路径使用；V2.2 主线
+    不挂 evidence policy，此函数保留兼容。
+    """
+    import json as _json
+    from agents.harness.base import norm_param_name
+    ev = {}
+    seen_values = {}
+    for p in packets or []:
+        for gv in p.get("grounded_values") or []:
+            if not isinstance(gv, dict):
+                continue
+            if gv.get("tool_name") and gv.get("parameter_name"):
+                key = (f"{norm_param_name(gv['tool_name'])}/"
+                       f"{norm_param_name(gv['parameter_name'])}")
+            elif gv.get("name"):
+                key = norm_param_name(gv["name"])
+            else:
+                continue
+            seen_values.setdefault(key, set())
+            try:
+                seen_values[key].add(_json.dumps(gv.get("value"), sort_keys=True, default=str))
+            except Exception:
+                seen_values[key].add(str(gv.get("value")))
+    conflicting = [k for k, vs in seen_values.items() if len(vs) > 1]
+    for p in packets or []:
+        for gv in p.get("grounded_values") or []:
+            if not isinstance(gv, dict):
+                continue
+            entry = {
+                "value": gv.get("value"),
+                "value_type": gv.get("value_type"),
+                "source_doc_id": gv.get("source_doc_id"),
+                "unit": gv.get("unit"),
+            }
+            if gv.get("tool_name") and gv.get("parameter_name"):
+                key = (f"{norm_param_name(gv['tool_name'])}/"
+                       f"{norm_param_name(gv['parameter_name'])}")
+                ev[key] = entry
+            elif gv.get("name"):
+                ev[norm_param_name(gv["name"])] = entry
+    uv = {}
+    for k, v in (user_values or {}).items():
+        uv[norm_param_name(k)] = {"value": v}
+    ctx = HarnessContext(evidence_values=ev, user_context_values=uv)
+    ctx.conflicting_keys = conflicting
+    return ctx
