@@ -43,20 +43,32 @@ class SchemaValidation:
     def validate_action(self, action: ResolvedAction,
                         context: HarnessContext) -> list:
         schema = action.inner_schema or {}
-        return self._check(schema, action.arguments, action.tool_name)
+        # 内层 discoverable 工具的 required 不做 blocking：
+        # schema 来自 toolkit 方法 signature/docstring 的静态推导，
+        # 真实约束在运行时（method(**args) 自己抛 TypeError——错误信息
+        # 更完整回传 DA）。V1.2 的实践证明 DA 不全填也能成功
+        # （evaluator 只记录 logged call）。
+        # wrapper 外层普通工具的 required 仍 blocking（官方 schema 强约束）。
+        strict_required = not action.is_wrapper
+        return self._check(schema, action.arguments, action.tool_name,
+                           strict_required=strict_required)
 
-    def _check(self, schema: dict, arguments: dict, tool_name: str) -> list:
+    def _check(self, schema: dict, arguments: dict, tool_name: str,
+               strict_required: bool = True) -> list:
         verdicts = []
         props = schema.get("properties", {}) or {}
         required = set(schema.get("required", []) or [])
         enums = schema.get("enum_from_doc", {}) or {}
         tool_label = f"{tool_name}: " if tool_name else ""
 
-        # required 缺失
+        # required 缺失（strict_required=False 时降级为观察记录，不拦截——
+        # V2.1.3: inner discoverable 工具的 signature required 非运行时强制）
         for f in required:
             if f not in arguments or arguments[f] in (None, ""):
                 verdicts.append(ValidationVerdict(
-                    field=f, verdict=ValidationVerdict.SCHEMA_VIOLATION,
+                    field=f,
+                    verdict=ValidationVerdict.SCHEMA_VIOLATION
+                    if strict_required else "not_grounded_inner_optional",
                     detail={"error": "missing_required", "tool": tool_label.strip(": "),
                             "proposed": arguments.get(f)},
                 ))
