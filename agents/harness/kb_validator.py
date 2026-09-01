@@ -60,6 +60,9 @@ class KnowledgeConstraintValidator:
     def validate_action(self, action: ResolvedAction,
                         context: HarnessContext) -> list:
         verdicts = []
+        # 参数类型表（inner schema 的 properties.type——resolver 从方法
+        # signature 推导）——threshold/enum 约束不得跨类型施用
+        props = (action.inner_schema or {}).get("properties", {}) or {}
         for f, proposed in action.arguments.items():
             c = self._find(action.tool_name, f)
             if c is None:
@@ -68,6 +71,19 @@ class KnowledgeConstraintValidator:
                 ))
                 continue
             ctype = (c.get("constraint_type") or "").lower()
+            param_type = (props.get(f) or {}).get("type")
+
+            # 类型安全：threshold 只对数值参数有意义——参数类型是布尔
+            # （signature 推导），或 proposed 是 bool → 约束不可用放行。
+            # （KA 曾把"最低消费 $25"的数值阈值挂到布尔参数上：float(True)
+            # =1.0 < 25 → 误拦。签名推导的类型是可靠防线。）
+            if ctype == "threshold" and (param_type == "boolean"
+                                         or isinstance(proposed, bool)):
+                verdicts.append(ValidationVerdict(
+                    field=f, verdict="no_kb_constraint",
+                    detail={"reason": "threshold_on_boolean_param"},
+                ))
+                continue
 
             if ctype == "enum":
                 allowed = c.get("allowed_values") or []
