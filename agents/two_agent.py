@@ -161,7 +161,7 @@ The evidence packet schema:
 {
   "answer": "<concise synthesized answer>",
   "facts": [{"claim": "<factual claim>", "source_doc_id": "<doc id from search results>"}],
-  "grounded_values": [{"name": "<parameter-like name>", "value": "<exact value>", "value_type": "enum|number|string|boolean", "source_doc_id": "<doc id>"}],
+  "grounded_values": [{"tool_name": "<tool the value is used in>", "parameter_name": "<parameter of that tool>", "value": "<exact value>", "value_type": "enum|number|string|boolean", "source_doc_id": "<doc id>"}],
   "relevant_document_ids": ["<doc ids consulted>"],
   "missing_information": ["<aspects you could not answer>"],
   "confidence": "high|medium|low",
@@ -172,10 +172,15 @@ grounded_values — CRITICAL FOR DOWNSTREAM TOOL USE:
 - Extract every machine-usable value the decision agent might need to fill tool
   parameters: enum codes, exact amounts/fees/limits/thresholds, type/class names,
   reason codes, option names.
+- Each grounded value MUST name the TOOL it belongs to (tool_name) and the exact
+  PARAMETER of that tool (parameter_name) — e.g. tool_name="close_bank_account_7392",
+  parameter_name="reason", value="early_closure". Only do this when the document
+  clearly indicates which tool and parameter the value is for.
+- If you CANNOT reliably tell which tool/parameter a value belongs to, do NOT guess —
+  put it in facts as a plain claim instead.
 - Preserve values EXACTLY as written in the source document. If the document says
   "account_closure", write "account_closure" — NOT "closure", "account closing",
   or any paraphrase. Numbers keep their exact digits and units.
-- Give each a short parameter-like name (e.g. "transfer_reason", "max_amount").
 - If no precise tool-usable value is needed, an empty list is fine.
 
 - confidence: how certain you are about the individual facts.
@@ -513,19 +518,28 @@ class KnowledgeAgent:
                     status = str(obj.get("status", "partial"))
                     if status not in ("sufficient", "partial", "insufficient"):
                         status = "partial"
-                    # grounded_values：结构化精确值（保留 LLM 原样输出；
-                    # 缺 name/value 的条目丢弃，不伪造）
+                    # grounded_values：结构化精确值（V2.1 新格式
+                    # tool_name+parameter_name；缺关键字段的条目丢弃，不伪造）
                     grounded = []
                     for gv in obj.get("grounded_values") or []:
-                        if isinstance(gv, dict) and gv.get("name") is not None \
-                                and "value" in gv:
-                            grounded.append({
-                                "name": str(gv["name"]),
+                        if not isinstance(gv, dict):
+                            continue
+                        has_new = gv.get("tool_name") and gv.get("parameter_name")
+                        has_old = gv.get("name") is not None
+                        if (has_new or has_old) and "value" in gv:
+                            entry = {
                                 "value": gv["value"],
                                 "value_type": str(gv.get("value_type", "string")),
                                 "source_doc_id": gv.get("source_doc_id"),
-                                **({"unit": gv["unit"]} if gv.get("unit") else {}),
-                            })
+                            }
+                            if gv.get("unit"):
+                                entry["unit"] = gv["unit"]
+                            if has_new:
+                                entry["tool_name"] = str(gv["tool_name"])
+                                entry["parameter_name"] = str(gv["parameter_name"])
+                            else:
+                                entry["name"] = str(gv["name"])
+                            grounded.append(entry)
                     packet = EvidencePacket(
                         answer=str(obj.get("answer", "")),
                         facts=[EvidenceFact(**f) for f in obj.get("facts", []) if isinstance(f, dict) and "claim" in f],
@@ -695,19 +709,26 @@ class DecisionAgent(LLMAgent):
         self._tool_by_name = {t.name: t for t in tools if t.name != "ask_knowledge_agent"}
 
     def _harness_context(self, arguments: dict):
-        """构建校验上下文：evidence 来自本任务 packets 的 grounded_values；
-        user_context 来自 Decision memory（用户明确提供过的值不要求 KB 证据）。"""
+        """构建校验上下文（V2.1 provenance 修复）。
+
+        evidence：本任务 packets 的 grounded_values（tool/param 索引）。
+        user_context：只提取【可可靠确定参数归属】的用户值——
+        Decision memory verified_facts 里形如 "<param> = <value>" 的显式
+        赋值（如 "amount = 500"）。匹配不上的（自然语言约束）不构造键
+        ——缺 provenance 保持 not_grounded 放行（不猜）。
+        """
+        import re as _re
         from agents.harness import context_from_packets
         user_values = {}
         if self.memory is not None:
             mem = self.memory.read()
-            # 用户约束/已验证事实里的显式值不与 KB 比对（来源=用户/业务）
-            for i, c in enumerate(mem.get("user_constraints", [])):
-                user_values[f"_uc_{i}"] = c
-        # 把 arguments 中命中 memory 语义的字段标记为 user-context 需要更精细的
-        # 映射——V2 简化策略：amount 类参数若用户在约束中给出则放行。
-        # 保守实现：不猜测，靠 evidence 缺失（not_grounded）天然放行。
-        return context_from_packets(self._packets, user_values=None)
+            # 保守提取：verified_facts 中 "param = value" 显式模式
+            for fact in mem.get("verified_facts", []):
+                m = _re.match(r"^\s*([a-z_][a-z0-9_]*)\s*=\s*(\S+)\s*$",
+                              str(fact), _re.IGNORECASE)
+                if m:
+                    user_values[m.group(1).lower()] = m.group(2)
+        return context_from_packets(self._packets, user_values=user_values or None)
 
     @property
     def system_prompt(self) -> str:

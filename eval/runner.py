@@ -377,6 +377,16 @@ def _harness_metrics(events: list) -> dict:
             last_rej_tool = None
     return {
         "proposed_tool_calls": len(proposed),
+        # V2.1: wrapper 穿透统计
+        "resolved_wrapper_calls": len([e for e in events
+                                       if e["event_type"] == "action_resolved"
+                                       and e.get("is_wrapper")]),
+        "resolved_inner_tools": len(set(
+            e.get("inner_tool_name") for e in events
+            if e["event_type"] == "action_resolved" and e.get("inner_tool_name"))),
+        "resolve_errors": len([e for e in events
+                               if e["event_type"] == "action_resolved"
+                               and e.get("resolve_error")]),
         "validated_tool_calls": len([e for e in events if e["event_type"] == "action_validation"]),
         "rejections": len(rejected),
         "schema_validation_failures": schema_fails,

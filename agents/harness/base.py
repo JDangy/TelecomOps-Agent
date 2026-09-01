@@ -118,12 +118,14 @@ class SafetyPolicy(ValidationPolicy):
 class HarnessContext:
     """校验时需要的只读上下文。
 
-    evidence_values: dict[str, dict] —— 从 Evidence Packet 的 grounded_values
-        索引而来 {参数名(规范化): {value, value_type, source_doc_id, unit}}。
-        None 表示本任务还没有任何 packet。
-    user_context_values: dict[str, Any] —— 用户在对话中明确提供过的值
-        （来自 Decision memory 的 verified/user_constraints 提取），
-        这些参数不做 KB 证据比对（not_applicable）。
+    evidence_values: dict[str, dict] —— V2.1 新索引：以
+        "tool_name/parameter_name"（规范化）为键 →
+        {value, value_type, source_doc_id, unit}。兼容 V2 旧格式
+        （裸参数名键）——匹配时先试精确键再退回裸名。
+    user_context_values: dict[str, dict] —— 用户明确提供过的参数值：
+        键 "tool_name/parameter_name"（规范化）→ {value}。
+        这些参数不做 KB 证据比对（not_applicable）；不可靠的来源
+        不猜（不构造键）——缺 provenance 保持 not_grounded 放行。
     """
 
     def __init__(self,
@@ -131,6 +133,20 @@ class HarnessContext:
                  user_context_values: Optional[dict] = None):
         self.evidence_values = evidence_values or {}
         self.user_context_values = user_context_values or {}
+
+    def evidence_for(self, tool_name: str, param_name: str) -> Optional[dict]:
+        """取某工具某参数的证据（V2.1 双键匹配：tool/param 精确 → 裸参数名回退）。"""
+        key = f"{norm_param_name(tool_name)}/{norm_param_name(param_name)}"
+        if key in self.evidence_values:
+            return self.evidence_values[key]
+        return self.evidence_values.get(norm_param_name(param_name))
+
+    def user_value_for(self, tool_name: str, param_name: str) -> Optional[dict]:
+        """取用户提供的参数值（同双键匹配）。"""
+        key = f"{norm_param_name(tool_name)}/{norm_param_name(param_name)}"
+        if key in self.user_context_values:
+            return self.user_context_values[key]
+        return self.user_context_values.get(norm_param_name(param_name))
 
 
 def norm_param_name(name: str) -> str:

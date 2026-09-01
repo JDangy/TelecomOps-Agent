@@ -10,6 +10,7 @@ from agents.harness.base import (
     ValidationVerdict,
     norm_param_name,
 )
+from agents.harness.resolver import ActionResolver, ResolvedAction
 from agents.harness.action_harness import ActionHarness, context_from_packets
 from agents.harness.validators import (
     EvidenceParameterValidation,
@@ -18,6 +19,8 @@ from agents.harness.validators import (
 
 __all__ = [
     "ActionHarness",
+    "ActionResolver",
+    "ResolvedAction",
     "context_from_packets",
     "HarnessContext",
     "ValidationPolicy",
