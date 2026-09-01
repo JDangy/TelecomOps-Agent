@@ -1,0 +1,38 @@
+{
+  "domain": "banking_knowledge",
+  "description": "V2 parameter-failure targeted set: 5 个动作完成但参数错任务 + 1 个对照组（验证不误伤）",
+  "task_ids": [
+    "task_054",
+    "task_053",
+    "task_095",
+    "task_070",
+    "task_080",
+    "task_037"
+  ],
+  "tasks_meta": [
+    {
+      "task_id": "task_054",
+      "num_required_documents": 9
+    },
+    {
+      "task_id": "task_053",
+      "num_required_documents": 9
+    },
+    {
+      "task_id": "task_095",
+      "num_required_documents": 15
+    },
+    {
+      "task_id": "task_070",
+      "num_required_documents": 16
+    },
+    {
+      "task_id": "task_080",
+      "num_required_documents": 19
+    },
+    {
+      "task_id": "task_037",
+      "num_required_documents": 4
+    }
+  ]
+}

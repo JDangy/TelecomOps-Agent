@@ -108,6 +108,16 @@ class EvidencePacket(BaseModel):
             "individual facts) and status (sufficiency for the task) are different things."
         )
     )
+    grounded_values: List[dict] = Field(
+        default_factory=list,
+        description=(
+            "Precise machine-usable values extracted verbatim from the knowledge base: "
+            "enum codes, exact amounts, thresholds, type/class names, reason codes. "
+            "Each: {name, value, value_type(enum|number|string|boolean), source_doc_id, unit?}. "
+            "Values MUST be preserved EXACTLY as they appear in source documents "
+            "(no paraphrasing, no translation, no humanized rewriting)."
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -151,11 +161,22 @@ The evidence packet schema:
 {
   "answer": "<concise synthesized answer>",
   "facts": [{"claim": "<factual claim>", "source_doc_id": "<doc id from search results>"}],
+  "grounded_values": [{"name": "<parameter-like name>", "value": "<exact value>", "value_type": "enum|number|string|boolean", "source_doc_id": "<doc id>"}],
   "relevant_document_ids": ["<doc ids consulted>"],
   "missing_information": ["<aspects you could not answer>"],
   "confidence": "high|medium|low",
   "status": "sufficient|partial|insufficient"
 }
+
+grounded_values — CRITICAL FOR DOWNSTREAM TOOL USE:
+- Extract every machine-usable value the decision agent might need to fill tool
+  parameters: enum codes, exact amounts/fees/limits/thresholds, type/class names,
+  reason codes, option names.
+- Preserve values EXACTLY as written in the source document. If the document says
+  "account_closure", write "account_closure" — NOT "closure", "account closing",
+  or any paraphrase. Numbers keep their exact digits and units.
+- Give each a short parameter-like name (e.g. "transfer_reason", "max_amount").
+- If no precise tool-usable value is needed, an empty list is fine.
 
 - confidence: how certain you are about the individual facts.
 - status: whether this evidence is SUFFICIENT for the requesting agent to act on, only PARTIAL, or clearly INSUFFICIENT. These are different: you can be highly confident in a fact yet the packet may be insufficient for the task.
@@ -492,6 +513,19 @@ class KnowledgeAgent:
                     status = str(obj.get("status", "partial"))
                     if status not in ("sufficient", "partial", "insufficient"):
                         status = "partial"
+                    # grounded_values：结构化精确值（保留 LLM 原样输出；
+                    # 缺 name/value 的条目丢弃，不伪造）
+                    grounded = []
+                    for gv in obj.get("grounded_values") or []:
+                        if isinstance(gv, dict) and gv.get("name") is not None \
+                                and "value" in gv:
+                            grounded.append({
+                                "name": str(gv["name"]),
+                                "value": gv["value"],
+                                "value_type": str(gv.get("value_type", "string")),
+                                "source_doc_id": gv.get("source_doc_id"),
+                                **({"unit": gv["unit"]} if gv.get("unit") else {}),
+                            })
                     packet = EvidencePacket(
                         answer=str(obj.get("answer", "")),
                         facts=[EvidenceFact(**f) for f in obj.get("facts", []) if isinstance(f, dict) and "claim" in f],
@@ -499,6 +533,7 @@ class KnowledgeAgent:
                         missing_information=[str(m) for m in obj.get("missing_information", [])],
                         confidence=str(obj.get("confidence", "medium")),
                         status=status,
+                        grounded_values=grounded,
                     )
                     return packet.model_dump()
             except Exception:
@@ -609,11 +644,21 @@ Try to be helpful and always follow the policy. Always make sure you generate va
 """.strip()
 
 
-# instruction 变体注册表：logical agent 名 → instruction 文本。
-# two_agent = V1.2 原样；two_agent_efficient = V1.3（唯一变量：DA 执行风格提示）。
+# V2 harness 变体的增量提示：告诉 DA 校验拒绝长什么样、如何修正。
+# 轻量（第六节要求）——不是自我检查 prompt，只是对结构化错误的响应方式。
+HARNESS_INSTRUCTION_APPENDIX = """
+
+Tool calls may be validated before execution. If a tool call is rejected with a
+"Harness validation failed" message listing a field, its proposed value, and the
+allowed/evidence value — fix that field to the listed value and call the tool again.
+Do not retry with the same values.
+""".strip()
+
 INSTRUCTION_VARIANTS = {
     "two_agent": DECISION_AGENT_INSTRUCTION,
     "two_agent_efficient": DECISION_AGENT_INSTRUCTION_EFFICIENT,
+    # V2: V1.2 instruction + harness 拒绝响应方式（架构唯一变量是 harness 本身）
+    "two_agent_harness": DECISION_AGENT_INSTRUCTION + "\n" + HARNESS_INSTRUCTION_APPENDIX,
 }
 
 
@@ -636,12 +681,33 @@ class DecisionAgent(LLMAgent):
 
     def __init__(self, tools, domain_policy, knowledge_agent: KnowledgeAgent,
                  memory: Optional["DecisionWorkingMemory"] = None,
-                 instruction_variant: str = "two_agent", **kwargs):
+                 instruction_variant: str = "two_agent",
+                 harness_enabled: bool = False, **kwargs):
         super().__init__(tools=tools, domain_policy=domain_policy, **kwargs)
         self._knowledge_agent = knowledge_agent
         self.memory = memory  # None 时不启用（向后兼容 V1 行为）
         # V1.3: instruction 变体（two_agent = V1.2 原样；two_agent_efficient = 执行效率版）
         self._instruction_variant = instruction_variant
+        # V2: Action Harness（None = 关闭，V1.2 行为；registry two_agent_harness 启用）
+        from agents.harness import ActionHarness
+        self.harness = ActionHarness() if harness_enabled else None
+        self._packets: list = []  # 本任务收到的 Evidence Packets（grounded_values 来源）
+        self._tool_by_name = {t.name: t for t in tools if t.name != "ask_knowledge_agent"}
+
+    def _harness_context(self, arguments: dict):
+        """构建校验上下文：evidence 来自本任务 packets 的 grounded_values；
+        user_context 来自 Decision memory（用户明确提供过的值不要求 KB 证据）。"""
+        from agents.harness import context_from_packets
+        user_values = {}
+        if self.memory is not None:
+            mem = self.memory.read()
+            # 用户约束/已验证事实里的显式值不与 KB 比对（来源=用户/业务）
+            for i, c in enumerate(mem.get("user_constraints", [])):
+                user_values[f"_uc_{i}"] = c
+        # 把 arguments 中命中 memory 语义的字段标记为 user-context 需要更精细的
+        # 映射——V2 简化策略：amount 类参数若用户在约束中给出则放行。
+        # 保守实现：不猜测，靠 evidence 缺失（not_grounded）天然放行。
+        return context_from_packets(self._packets, user_values=None)
 
     @property
     def system_prompt(self) -> str:
@@ -680,14 +746,39 @@ class DecisionAgent(LLMAgent):
                 call_name="agent_response",
                 **self.llm_args,
             )
-            # 没有 ask 调用（纯文本或纯业务工具）→ 与官方行为一致，直接返回
-            ask_calls = [
-                tc for tc in (assistant_message.tool_calls or [])
-                if tc.name == "ask_knowledge_agent"
-            ] if assistant_message.is_tool_call() else []
-            if not ask_calls:
+            if not (assistant_message.is_tool_call()
+                    and (assistant_message.tool_calls or [])):
+                break  # 纯文本 → 与官方行为一致
+
+            calls = assistant_message.tool_calls or []
+            ask_calls = [tc for tc in calls if tc.name == "ask_knowledge_agent"]
+            biz_calls = [tc for tc in calls if tc.name != "ask_knowledge_agent"]
+
+            # ---- V2 Harness：业务工具执行前校验（只拦 rejected；通过的原样
+            # 留给 orchestrator 执行，保持消息结构与 V1.2 完全兼容）----
+            rejected = {}
+            if self.harness is not None and biz_calls:
+                ctx = self._harness_context({})
+                for tc in biz_calls:
+                    tool = self._tool_by_name.get(tc.name)
+                    if tool is None:
+                        continue
+                    # 临时挂 tool 供 harness 读 schema
+                    tc._harness_tool = tool  # noqa: SLF001
+                    passed, content, _meta = self.harness.process(
+                        tc, execute=None, context=ctx, validate_only=True)
+                    if not passed:
+                        rejected[tc.id] = content
+                # 清理临时挂载
+                for tc in biz_calls:
+                    if hasattr(tc, "_harness_tool"):
+                        del tc._harness_tool
+
+            if not ask_calls and not rejected:
+                # 全部通过（或纯业务工具）→ 原样交给 orchestrator（V1.2 路径）
                 break
-            # 拦截：先入队 assistant 消息，再执行每个 ask 并回填 packet
+
+            # ---- 拦截处理：ask 执行 + rejected 回填错误，通过的剔除 ----
             state.messages.append(assistant_message)
             for tc in ask_calls:
                 packet_json = self._do_ask(tc)
@@ -695,22 +786,30 @@ class DecisionAgent(LLMAgent):
                     id=tc.id, role="tool", requestor="assistant",
                     content=packet_json, error=False,
                 ))
-            # 非混合调用：ask 单独出现时已处理完，循环让 LLM 看到 packet 继续
-            other_calls = [
+                try:
+                    self._packets.append(json.loads(packet_json))
+                except Exception:
+                    pass
+            for tc, err in rejected.items():
+                state.messages.append(ToolMessage(
+                    id=tc, role="tool", requestor="assistant",
+                    content=err, error=True,
+                ))
+            # 从 assistant 消息剔除已就地处理的调用；剩下的（通过的 biz 调用）
+            remaining = [
                 tc for tc in (assistant_message.tool_calls or [])
-                if tc.name != "ask_knowledge_agent"
+                if tc.name != "ask_knowledge_agent" and tc.id not in rejected
             ]
-            if other_calls:
-                # 混合调用：让 orchestrator 执行业务工具——但 assistant 消息
-                # 已含 ask 调用，orchestrator 会因未知工具报错。
-                # 处理：把 ask 的 tool_calls 从消息里剔除（结果已回填），
-                # 只把业务工具留给 orchestrator。若剔除后为空，继续循环。
-                remaining = [tc for tc in assistant_message.tool_calls if tc.name != "ask_knowledge_agent"]
-                if remaining:
-                    assistant_message.tool_calls = remaining
-                    return assistant_message, state
-                continue
-            assistant_message = None  # 纯 ask：吃掉本条，循环继续生成
+            if remaining and not ask_calls:
+                # 只剩通过的 biz 调用且无 ask → 剔除后若为空则继续循环；
+                # 这里 remaining 非空但 rejected 也在同一条消息里——把 rejected
+                # 已回填、通过的留下给 orchestrator
+                assistant_message.tool_calls = remaining
+                return assistant_message, state
+            if remaining:
+                assistant_message.tool_calls = remaining
+                return assistant_message, state
+            assistant_message = None  # 全部就地处理完 → 循环继续生成下一步
         # 兜底：不应到达（MAX 轮内必有非 ask 输出），防御性生成纯文本
         if assistant_message is None:
             full = self._messages_with_memory(state)
@@ -867,7 +966,8 @@ def make_ask_knowledge_tool() -> Tool:
 # ---------------------------------------------------------------------------
 # Factory：注册进 agents/registry.py
 # ---------------------------------------------------------------------------
-def create_two_agent(tools, domain_policy, instruction_variant="two_agent", **kwargs) -> DecisionAgent:
+def create_two_agent(tools, domain_policy, instruction_variant="two_agent",
+                     harness_enabled: bool = False, **kwargs) -> DecisionAgent:
     """V1.1+ factory：分流工具 → 双 memory → KnowledgeAgent → DecisionAgent。
 
     与 create_llm_agent 同签名（build.py 调用约定）。
@@ -877,6 +977,8 @@ def create_two_agent(tools, domain_policy, instruction_variant="two_agent", **kw
         instruction_variant: "two_agent" = V1.2 原样 instruction；
             "two_agent_efficient" = V1.3 执行效率 instruction
             （唯一变量：长流程批处理/合并/少解说——完全可回退）。
+        harness_enabled: V2 Action Harness（业务工具执行前 schema+evidence
+            校验；False = V1.2 行为原样）。
     """
     llm = kwargs.get("llm")
     llm_args = kwargs.get("llm_args") or {}
@@ -906,6 +1008,7 @@ def create_two_agent(tools, domain_policy, instruction_variant="two_agent", **kw
         llm=llm,
         llm_args=llm_args,
         instruction_variant=instruction_variant,
+        harness_enabled=harness_enabled,
     )
 
 
@@ -917,4 +1020,17 @@ def create_two_agent_efficient(tools, domain_policy, **kwargs) -> DecisionAgent:
     """
     return create_two_agent(
         tools, domain_policy, instruction_variant="two_agent_efficient", **kwargs
+    )
+
+
+def create_two_agent_harness(tools, domain_policy, **kwargs) -> DecisionAgent:
+    """V2 factory：two_agent_harness = V1.2 架构 + Action Harness。
+
+    与 V1.2 唯一差异 harness_enabled=True（业务工具执行前经过
+    schema + evidence-grounded 校验；rejection 回传结构化错误让 DA 自行修正）。
+    回退方式：--agent two_agent 即 V1.2 原样（harness 代码保留不删）。
+    """
+    return create_two_agent(
+        tools, domain_policy, instruction_variant="two_agent_harness",
+        harness_enabled=True, **kwargs,
     )

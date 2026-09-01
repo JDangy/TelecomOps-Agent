@@ -338,6 +338,55 @@ def _memory_metrics(events, ka_retr, hands, results) -> dict:
     }
 
 
+def _harness_metrics(events: list) -> dict:
+    """V2 Action Harness 指标（无 harness 事件时返回空 dict）。"""
+    proposed = [e for e in events if e["event_type"] == "action_proposed"]
+    rejected = [e for e in events if e["event_type"] == "action_rejected"]
+    if not proposed:
+        return {}
+    # verdict 分类（从 action_validation 事件聚合）
+    verdict_counts: dict = {}
+    mismatched_fields = []
+    for e in [x for x in events if x["event_type"] == "action_validation"]:
+        for v in e.get("verdicts") or []:
+            verdict_counts[v.get("verdict")] = verdict_counts.get(v.get("verdict"), 0) + 1
+            if v.get("verdict") == "evidence_mismatch":
+                mismatched_fields.append(v.get("field"))
+    schema_fails = sum(
+        1 for e in rejected
+        if any(v.get("verdict") == "schema_violation"
+               for v in e.get("verdicts_summary") or [])
+    )
+    evidence_rej = len(rejected) - schema_fails
+    # rejected 工具在后续 proposed 中再次出现 = 修正重试（近似）
+    tool_seq = [e.get("tool_name") for e in proposed]
+    rej_tools = [e.get("tool_name") for e in rejected]
+    corrected = 0
+    for i, tn in enumerate(rej_tools):
+        idx = proposed[i].get("tool_name")  # 不可靠——改用 rejected 事件在 proposed 序列中的位置
+    # 更正实现：遍历 events 顺序，rejected 后同工具再次 proposed 即计一次修正
+    ev_order = [e for e in events if e["event_type"] in ("action_proposed", "action_rejected")]
+    corrected = 0
+    last_rej_tool = None
+    for e in ev_order:
+        if e["event_type"] == "action_rejected":
+            last_rej_tool = e.get("tool_name")
+        elif e["event_type"] == "action_proposed" and last_rej_tool is not None:
+            if e.get("tool_name") == last_rej_tool:
+                corrected += 1
+            last_rej_tool = None
+    return {
+        "proposed_tool_calls": len(proposed),
+        "validated_tool_calls": len([e for e in events if e["event_type"] == "action_validation"]),
+        "rejections": len(rejected),
+        "schema_validation_failures": schema_fails,
+        "evidence_mismatches": evidence_rej,
+        "corrected_after_rejection": corrected,
+        "verdict_counts": verdict_counts,
+        "mismatched_fields": list(dict.fromkeys(mismatched_fields))[:10],
+    }
+
+
 def _register_factory_agent(name: str, factory) -> None:
     """把自定义 agent factory 注册进 tau2 registry（幂等）。
 
@@ -599,6 +648,8 @@ def run_eval(
         m["timing"] = extract_timing_metrics(v2)
         # 2-Agent 协作指标（无 handoff 时为空 dict，不影响 V0）
         m["two_agent_metrics"] = _extract_two_agent_metrics(v2)
+        # V2 harness 指标（无 harness 事件时为空 dict）
+        m["harness_metrics"] = _harness_metrics(v2.get("events") or [])
 
         status = "SUCCESS" if m["success"] else "FAIL"
         cost = (m.get("agent_cost") or 0.0) + (m.get("user_cost") or 0.0)
