@@ -158,10 +158,15 @@ class EvidenceParameterValidation:
             if isinstance(v, str) and (" " in v.strip()):
                 ev["_untrusted"] = "narrative_text"
                 continue
-            # 规则 3：说明性伪值——包含 "_or_"、"from_customer"、"_from_"
-            # 这类"取值规则描述"模式（不是具体值）
+            # 规则 3：说明性伪值——"取值规则描述"伪装成值
             if isinstance(v, str) and re.search(r"_or_|from_|_boolean|_value|_string", v):
                 ev["_untrusted"] = "descriptive_pseudo_value"
+                continue
+            # 规则 6：格式占位符——"MM/DD/YYYY"/"YYYY-MM-DD"/"HH:MM" 是格式说明
+            # 不是具体值（KA 把 docstring 的参数格式要求当值提取）
+            if isinstance(v, str) and re.search(
+                r"YYYY|MM/DD|DD/MM|HH:MM|[A-Z]{2,}/[A-Z]{2,}", v):
+                ev["_untrusted"] = "format_placeholder"
                 continue
             # 规则 2：违反该参数的 inner enum
             allowed = None
@@ -224,6 +229,18 @@ class EvidenceParameterValidation:
         """宽松等价：精确相同 / 数值等价（"500"=500）/ 字符串大小写空白不敏感。"""
         if proposed == evidence:
             return True
+        # 布尔等价：字符串 "true"/"false" 与 bool True/False 互认
+        # （KA 可能把 boolean 序列化成字符串）
+        if isinstance(proposed, bool) or isinstance(evidence, bool):
+            def _to_bool(x):
+                if isinstance(x, bool):
+                    return x
+                if isinstance(x, str) and x.strip().lower() in ("true", "false"):
+                    return x.strip().lower() == "true"
+                return None
+            pb, eb = _to_bool(proposed), _to_bool(evidence)
+            if pb is not None and eb is not None:
+                return pb == eb
         try:
             if float(proposed) == float(evidence):
                 return True
