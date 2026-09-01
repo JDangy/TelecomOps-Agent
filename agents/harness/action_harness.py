@@ -198,6 +198,27 @@ def context_from_packets(packets: list[dict],
     """
     from agents.harness.base import norm_param_name
     ev: dict = {}
+    # 冲突检测：同 tool/param 在不同 packet 出现不同值 → 标记矛盾
+    seen_values: dict = {}   # key -> set(values seen)
+    for p in packets or []:
+        for gv in p.get("grounded_values") or []:
+            if not isinstance(gv, dict):
+                continue
+            if gv.get("tool_name") and gv.get("parameter_name"):
+                key = (f"{norm_param_name(gv['tool_name'])}/"
+                       f"{norm_param_name(gv['parameter_name'])}")
+            elif gv.get("name"):
+                key = norm_param_name(gv["name"])
+            else:
+                continue
+            seen_values.setdefault(key, set())
+            try:
+                norm_v = json.dumps(gv.get("value"), sort_keys=True, default=str)
+            except Exception:
+                norm_v = str(gv.get("value"))
+            seen_values[key].add(norm_v)
+
+    conflicting = [k for k, vs in seen_values.items() if len(vs) > 1]
     for p in packets or []:
         for gv in p.get("grounded_values") or []:
             if not isinstance(gv, dict):
@@ -217,4 +238,7 @@ def context_from_packets(packets: list[dict],
     uv: dict = {}
     for k, v in (user_values or {}).items():
         uv[norm_param_name(k)] = {"value": v}
-    return HarnessContext(evidence_values=ev, user_context_values=uv)
+    ctx = HarnessContext(evidence_values=ev, user_context_values=uv)
+    # V2.1.1: 冲突键挂 context（validator 据此降级 not_grounded）
+    ctx.conflicting_keys = conflicting
+    return ctx

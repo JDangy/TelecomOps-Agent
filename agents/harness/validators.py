@@ -131,29 +131,54 @@ class EvidenceParameterValidation:
     @staticmethod
     def _filter_untrusted_evidence(action: ResolvedAction,
                                    context: HarnessContext) -> None:
-        """把不可信的 evidence 条目标记为不可用（不删数据——标记跳过）。"""
+        """把不可信的 evidence 条目标记为不可用（不删数据——标记跳过）。
+
+        037 对照组回退的完整根因链（V2.1/V2.1.1 迭代发现）：
+        1. 叙述文本当值（含空格）——"retrieved via tool(...)"
+        2. evidence 值违反该参数 inner enum——KA 改写出不存在的枚举
+        3. 说明性伪值——"true_or_false_boolean_from_customer"（语法像值，
+           实际是文档对参数取值规则的说明）
+        4. 跨 packet 矛盾——同参数在多个 packet 给出不同值
+           （doc_014 vs doc_015 对同参数给相反 boolean）
+        5. 语义错位——KB 文档描述的是"枚举集合"而非"本案例的正确值"
+           （case-specific 值来自用户情况，不是 KB）——这正是矛盾检测能
+           捕获的形态：同一参数多 packet 值不一致时不可信。
+        全部规则只降级 not_grounded（放行）——schema 校验仍兜底拦非法值。
+        """
         enums = (action.inner_schema or {}).get("enum_from_doc", {}) or {}
         for param in list(context.evidence_values.keys()):
-            # 裸名键（V2 兼容）不做工具归属判断，跳过过滤
-            if "/" in param:
-                tool_part, p_name = param.split("/", 1)
-                ev = context.evidence_values.get(param)
-                if ev is None:
-                    continue
-                v = ev.get("value")
-                # 规则 2：叙述文本当值——任何含空格的字符串都不是合法参数值
-                # （4 位卡号/枚举/代码值从不含空格；如 "retrieved via tool(...)"）
-                if isinstance(v, str) and (" " in v.strip()):
-                    ev["_untrusted"] = "narrative_text"
-                    continue
-                # 规则 1：evidence 值违反该参数的 inner enum
-                allowed = None
-                for ek, evs in enums.items():
-                    if ek.lower() == p_name:
-                        allowed = evs
-                        break
-                if allowed and isinstance(v, str) and v not in allowed:
-                    ev["_untrusted"] = "violates_inner_enum"
+            if "/" not in param:
+                continue  # 裸名键（V2 兼容）不判
+            tool_part, p_name = param.split("/", 1)
+            ev = context.evidence_values.get(param)
+            if ev is None:
+                continue
+            v = ev.get("value")
+            # 规则 1：含空格的字符串值（叙述文本/说明句）
+            if isinstance(v, str) and (" " in v.strip()):
+                ev["_untrusted"] = "narrative_text"
+                continue
+            # 规则 3：说明性伪值——包含 "_or_"、"from_customer"、"_from_"
+            # 这类"取值规则描述"模式（不是具体值）
+            if isinstance(v, str) and re.search(r"_or_|from_|_boolean|_value|_string", v):
+                ev["_untrusted"] = "descriptive_pseudo_value"
+                continue
+            # 规则 2：违反该参数的 inner enum
+            allowed = None
+            for ek, evs in enums.items():
+                if ek.lower() == p_name:
+                    allowed = evs
+                    break
+            if allowed and isinstance(v, str) and v not in allowed:
+                ev["_untrusted"] = "violates_inner_enum"
+                continue
+        # 规则 4+5：跨 packet 矛盾——同 tool/param 出现多个不同 evidence 值。
+        # 由 context_from_packets 的"最新覆盖"机制，需要原始 packets 对比——
+        # 这里用 context 上挂的冲突集（构建方计算，见 action_harness.context_from_packets）。
+        for param in getattr(context, "conflicting_keys", []) or []:
+            ev = context.evidence_values.get(param)
+            if ev is not None:
+                ev["_untrusted"] = "conflicting_evidence"
 
     def _check(self, tool_name: str, arguments: dict,
                context: HarnessContext) -> list:
