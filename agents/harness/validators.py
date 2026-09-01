@@ -121,7 +121,39 @@ class EvidenceParameterValidation:
 
     def validate_action(self, action: ResolvedAction,
                         context: HarnessContext) -> list:
+        # V2.1.1 健康过滤（防止 KA 的坏 evidence 造成 false rejection）：
+        # 1) evidence 值本身违反 inner schema 的 docstring enum → 证据不可信，
+        #    该字段降级为 not_grounded 放行（schema 校验仍会拦真正非法的 proposed）
+        # 2) string 型 evidence 值含空格且 >6 词 → 是叙述文本不是参数值，同样降级
+        self._filter_untrusted_evidence(action, context)
         return self._check(action.tool_name, action.arguments, context)
+
+    @staticmethod
+    def _filter_untrusted_evidence(action: ResolvedAction,
+                                   context: HarnessContext) -> None:
+        """把不可信的 evidence 条目标记为不可用（不删数据——标记跳过）。"""
+        enums = (action.inner_schema or {}).get("enum_from_doc", {}) or {}
+        for param in list(context.evidence_values.keys()):
+            # 裸名键（V2 兼容）不做工具归属判断，跳过过滤
+            if "/" in param:
+                tool_part, p_name = param.split("/", 1)
+                ev = context.evidence_values.get(param)
+                if ev is None:
+                    continue
+                v = ev.get("value")
+                # 规则 2：叙述文本当值——任何含空格的字符串都不是合法参数值
+                # （4 位卡号/枚举/代码值从不含空格；如 "retrieved via tool(...)"）
+                if isinstance(v, str) and (" " in v.strip()):
+                    ev["_untrusted"] = "narrative_text"
+                    continue
+                # 规则 1：evidence 值违反该参数的 inner enum
+                allowed = None
+                for ek, evs in enums.items():
+                    if ek.lower() == p_name:
+                        allowed = evs
+                        break
+                if allowed and isinstance(v, str) and v not in allowed:
+                    ev["_untrusted"] = "violates_inner_enum"
 
     def _check(self, tool_name: str, arguments: dict,
                context: HarnessContext) -> list:
@@ -135,9 +167,9 @@ class EvidenceParameterValidation:
                     detail={"source": "user_context"},
                 ))
                 continue
-            # 2) evidence
+            # 2) evidence（含健康过滤：不可信条目按 not_grounded 处理）
             ev = context.evidence_for(tool_name, f)
-            if ev is None:
+            if ev is None or ev.get("_untrusted"):
                 verdicts.append(ValidationVerdict(
                     field=f, verdict=ValidationVerdict.NOT_GROUNDED, detail={},
                 ))
