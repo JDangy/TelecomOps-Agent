@@ -156,7 +156,16 @@ class KnowledgeConstraintValidator:
 
             if ctype == "format":
                 fmt = c.get("format") or ""
-                if fmt and not self._matches_format(proposed, fmt):
+                # 格式约束只在占位符模板时可用（MM/DD/YYYY、YYYY-MM-DD…）。
+                # KA 可能输出描述句当 format（"string (account-level...)"）——
+                # 无占位符 token → 不是模板 → no_kb_constraint 放行（不猜）。
+                if not fmt or not re.search(r"MM|DD|YYYY|HH|mm", fmt):
+                    verdicts.append(ValidationVerdict(
+                        field=f, verdict="no_kb_constraint",
+                        detail={"reason": "format_not_placeholder_template"},
+                    ))
+                    continue
+                if not self._matches_format(proposed, fmt):
                     verdicts.append(ValidationVerdict(
                         field=f, verdict="kb_format_violation",
                         detail={"proposed": proposed, "kb_format": fmt,
