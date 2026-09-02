@@ -33,18 +33,44 @@ from agents.harness.resolver import ResolvedAction
 
 
 class KnowledgeConstraintValidator:
-    """KB 明确约束校验（enum 集合 / 阈值 / 格式——不决定案例值选择）。"""
+    """KB 明确约束校验（enum 集合 / 阈值 / 格式——不决定案例值选择）。
+
+    V3 统一：约束唯一事实源是 TaskStateV3 的 knowledge 命名空间条目
+    （object="tool名"，field="param.allowed_values/.max/.min/.format"）。
+    旧 constraints 列表仅作后备（V2.2 兼容，正常路径不再单独维护）。
+    """
 
     name = "knowledge_constraints"
 
-    def __init__(self, constraints: list):
-        """constraints: packets 中收集的 KB 约束条目列表。"""
+    def __init__(self, constraints: list = None, task_state=None):
+        """task_state: TaskStateV3（V3 主路径——统一事实源）。
+        constraints: 旧列表（V2.2 兼容后备，wire() 不传时才用）。
+        """
         self.constraints = constraints or []
+        self.task_state = task_state
 
     def _find(self, tool: str, param: str):
-        """找该 tool/param 的约束（精确 → 裸参数名回退）。"""
+        """找该 tool/param 的约束（TaskState knowledge 条目 → 旧列表后备）。"""
         tkey = norm_param_name(tool)
         pkey = norm_param_name(param)
+        # V3 主路径：TaskStateV3 knowledge 命名空间
+        if self.task_state is not None:
+            av = self._state_entry(tkey, f"{pkey}.allowed_values")
+            if av is not None:
+                return {"constraint_type": "enum",
+                        "allowed_values": av,
+                        "source_doc_id": self._state_ref(tkey, f"{pkey}.allowed_values")}
+            mx = self._state_entry(tkey, f"{pkey}.max")
+            mn = self._state_entry(tkey, f"{pkey}.min")
+            if mx is not None or mn is not None:
+                return {"constraint_type": "threshold", "max": mx, "min": mn,
+                        "source_doc_id": self._state_ref(tkey, f"{pkey}.max")}
+            fmt = self._state_entry(tkey, f"{pkey}.format")
+            if fmt is not None:
+                return {"constraint_type": "format", "format": fmt,
+                        "source_doc_id": self._state_ref(tkey, f"{pkey}.format")}
+            return None  # 状态里没有 → 无约束（不再看旧列表——单一事实源）
+        # V2.2 兼容后备（未接状态时）
         fallback = None
         for c in self.constraints:
             if not isinstance(c, dict):
@@ -52,10 +78,31 @@ class KnowledgeConstraintValidator:
             ct = norm_param_name(c.get("tool_name") or "")
             cp = norm_param_name(c.get("parameter_name") or "")
             if ct == tkey and cp == pkey:
-                return c  # 精确匹配优先
+                return c
             if cp == pkey and not ct:
-                fallback = c  # 无工具归属的裸约束兜底
+                fallback = c
         return fallback
+
+    # -- TaskStateV3 knowledge 条目读取 --------------------------------
+    def _state_entry(self, obj: str, field: str):
+        try:
+            entries = getattr(self.task_state, "_entries", {})
+            chain = entries.get(f"{obj}.{field}")
+            if chain and chain[-1].is_current and chain[-1].source == "knowledge":
+                return chain[-1].value
+        except Exception:
+            pass
+        return None
+
+    def _state_ref(self, obj: str, field: str) -> Optional[str]:
+        try:
+            entries = getattr(self.task_state, "_entries", {})
+            chain = entries.get(f"{obj}.{field}")
+            if chain and chain[-1].is_current:
+                return chain[-1].source_ref
+        except Exception:
+            pass
+        return None
 
     def validate_action(self, action: ResolvedAction,
                         context: HarnessContext) -> list:

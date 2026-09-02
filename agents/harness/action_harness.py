@@ -98,15 +98,18 @@ class ActionHarness:
         """把 Decision Agent 维护的 TaskState / KB 约束接进 validators。
 
         task_state: 参数级 provenance registry（DecisionAgent 每
-        user 消息/工具结果喂入）。
-        kb_constraints: packets 中收集的明确 KB 约束列表（DecisionAgent
-        从 Evidence Packet 的 constraints 字段累积）。
+        user 消息/工具结果喂入）——V3 统一事实源：TaskStateValidator
+        与 KnowledgeConstraintValidator 都从它读。
+        kb_constraints: （V2.2 兼容）旧约束列表，仅状态未接线时后备。
         """
         for p in self.policies:
             if isinstance(p, TaskStateValidator):
                 p.task_state = task_state
             if isinstance(p, KnowledgeConstraintValidator):
-                p.constraints = kb_constraints or []
+                # V3: 约束唯一事实源 = TaskState（旧列表仅未接线时后备）
+                p.task_state = task_state
+                if kb_constraints and p.task_state is None:
+                    p.constraints = kb_constraints
 
     # ------------------------------------------------------------------
     # 主入口

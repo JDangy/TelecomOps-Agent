@@ -819,15 +819,14 @@ class DecisionAgent(LLMAgent):
             pass  # 状态喂入失败不影响对话流
 
     def _update_kb_constraints(self) -> None:
-        """把累积 packets 中的明确 KB 约束刷新进 harness + TaskStateV3。"""
+        """KB 约束 → TaskStateV3（V3 统一事实源）。
+
+        规则只进 Task State 一份；kb_validator 从状态读（wire 已接），
+        不再单独维护约束列表。
+        """
         try:
             from agents.harness import constraints_from_packets
             cons = constraints_from_packets(self._packets)
-            if self.harness is not None:
-                for p in self.policies_of_harness():
-                    if hasattr(p, "constraints"):
-                        p.constraints = cons
-            # V3: 知识规则也进对象级状态（transfer.reason.allowed_values 等）
             if self.task_state is not None and cons:
                 from agents.harness.task_state_v3 import KnowledgeStateExtractor
                 KnowledgeStateExtractor.feed_constraints(self.task_state, cons)
@@ -1004,7 +1003,8 @@ class DecisionAgent(LLMAgent):
         if mem_block:
             blocks.append(mem_block)
         # V3: 对象级任务状态切片（当前有效，非全量）
-        state_block = self._task_state_block()
+        state_block = self._task_state_block(
+            tool_name=self._recent_biz_tool(state))
         if state_block:
             blocks.append(state_block)
         if not blocks or not state.system_messages:
@@ -1013,24 +1013,88 @@ class DecisionAgent(LLMAgent):
         sys_msg.content = (sys_msg.content or "") + "\n\n" + "\n\n".join(blocks)
         return [sys_msg] + list(state.system_messages[1:]) + state.messages
 
-    def _task_state_block(self, max_chars: int = 900) -> str:
-        """渲染 TaskStateV3 的当前有效状态（紧凑行式，控制预算）。
+    def _recent_biz_tool(self, state) -> str:
+        """最近一次业务工具名（动作相关状态选择的提示，确定性）。
 
-        只包含当前有效条目（superseded 排除）；DA 据此避免混淆对象。
+        取 state.messages 里最后一条 assistant 消息的最后一个非-ask
+        工具调用——DA 上一个动作即当前意图锚点（转账中 → transfer 工具
+        命名空间的规则/实体优先展示）。
+        """
+        try:
+            from tau2.data_model.message import AssistantMessage
+            for m in reversed(state.messages):
+                if isinstance(m, AssistantMessage) and m.tool_calls:
+                    for tc in reversed(m.tool_calls):
+                        if tc.name != "ask_knowledge_agent":
+                            # wrapper 调用 → 解 inner 工具名（与动作相关的
+                            # 真正业务工具）
+                            args = getattr(tc, "arguments", None) or {}
+                            inner = args.get("agent_tool_name") if isinstance(args, dict) else None
+                            return inner or tc.name
+            return ""
+        except Exception:
+            return ""
+
+    def _task_state_block(self, max_chars: int = 900,
+                          tool_name: str = "") -> str:
+        """渲染 TaskStateV3 的当前有效状态——V3 收口：动作相关优先。
+
+        选择逻辑（确定性，无 LLM）：
+        P0 该工具命名空间的 knowledge 规则（tool.param.allowed_values…）
+           + 该工具直接涉及的实体（proposed 值命中 entity 索引）
+        P1 user 的请求对象（活跃意图：transfer_request.* 等——DA 正在
+           执行用户意愿）
+        P2 其他 user/tool 实体状态（背景）
+        每层内按写入时间（seq）排序；预算内放不下则截断 P2（保 P0/P1）。
+        tool_name: DA 即将调用的工具（generate 循环里最近一次 biz 调用；
+        为空时退化为全量当前状态（无动作上下文）。
         """
         if self.task_state is None:
             return ""
         try:
-            entries = []
+            p0, p1, p2 = [], [], []
+            t = (tool_name or "").strip().lower()
             for key, chain in getattr(self.task_state, "_entries", {}).items():
                 cur = chain[-1]
                 if not cur.is_current:
                     continue
-                src = cur.source
+                item = (key, cur)
+                if t and (cur.object == t):
+                    p0.append(item)            # 该工具的 knowledge 规则
+                elif cur.source == "user":
+                    p1.append(item)            # 用户请求对象（活跃意图）
+                elif cur.source == "tool":
+                    p2.append(item)            # 实体背景
+                else:
+                    p2.append(item)            # knowledge 其他工具规则（背景）
+            def _fmt(key, cur):
                 ref = f" (from {cur.source_ref})" if cur.source_ref else ""
-                entries.append(f"- {key} = {cur.value} [source: {src}{ref}]")
-            if not entries:
+                return f"- {key} = {cur.value} [source: {cur.source}{ref}]"
+            lines = []
+            for layer in (p0, p1, p2):
+                for key, cur in sorted(layer, key=lambda x: x[1].seq):
+                    lines.append(_fmt(key, cur))
+            if not lines:
                 return ""
+            text = ("[Confirmed task state — use these exact values for matching fields; "
+                    "do not confuse similar fields of different objects:]\n" + "\n".join(lines))
+            if len(text) > max_chars:
+                # 预算溢出：先保 P0/P1，P2 逐条舍（不机械中间截断）
+                keep = []
+                used = 200  # 头部说明占位
+                for layer in (p0, p1, p2):
+                    for key, cur in sorted(layer, key=lambda x: x[1].seq):
+                        ln = _fmt(key, cur)
+                        if used + len(ln) <= max_chars or layer is p0:
+                            keep.append(ln)
+                            used += len(ln) + 1
+                text = ("[Confirmed task state — use these exact values for matching fields; "
+                        "do not confuse similar fields of different objects:]\n" + "\n".join(keep))
+                if len(text) > max_chars:
+                    text = text[:max_chars] + "\n... (state truncated)"
+            return text
+        except Exception:
+            return ""
             text = "[Confirmed task state — use these exact values for matching fields; do not confuse similar fields of different objects:]\n" + "\n".join(entries)
             if len(text) > max_chars:
                 text = text[:max_chars] + "\n... (state truncated)"
