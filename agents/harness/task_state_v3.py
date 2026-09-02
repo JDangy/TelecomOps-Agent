@@ -97,6 +97,14 @@ class TaskStateV3:
         """
         if field_name in (None, "") or value in (None, ""):
             return None
+        # 类型标记防御（构造层——任何来源都不可写入占位值）：
+        # "string"/"number"/… 是文档/说明的占位，不是数据。
+        # 修复：残块单处类型标记漏网导致 account_string.id='string'
+        # 污染 → 后续真实 account_id 全部误拦（095/080 实测）。
+        if isinstance(value, str) and value.strip().lower() in (
+                "string", "number", "integer", "boolean", "float",
+                "array", "object", "list", "dict", "null", "none", "n/a"):
+            return None
         obj = (obj or "").strip().lower()
         field_name = (field_name or "").strip().lower()
         self._seq += 1
