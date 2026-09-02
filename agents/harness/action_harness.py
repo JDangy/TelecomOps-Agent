@@ -203,7 +203,8 @@ class ActionHarness:
     @staticmethod
     def _rejection_message(tool_name: str, blocking: list) -> str:
         lines = [f"Harness validation failed for {tool_name}. "
-                 "Do NOT retry with the same values."]
+                 "Do NOT retry with the same values. "
+                 "Fix the corrections below and call the SAME tool again."]
         for v in blocking:
             d = v.detail
             src = d.get("value_source") or VERDICT_SOURCE.get(v.verdict) or ""
@@ -221,8 +222,12 @@ class ActionHarness:
                     lines.append(f"{label}: {json.dumps(d[k])}")
             if d.get("source_ref"):
                 lines.append(f"from: {d['source_ref']}")
-        lines.append("\nFix the listed fields and call the tool again "
-                     "with corrected arguments.")
+            # V2.3: 单字段修正指令（确认值/合法集 → 明确告诉你改成什么）
+            if "confirmed_value" in d:
+                lines.append(f"correction: set {v.field} to {json.dumps(d['confirmed_value'])}")
+            elif "allowed_values" in d or "kb_allowed_values" in d:
+                allowed = d.get("allowed_values") or d.get("kb_allowed_values")
+                lines.append(f"correction: set {v.field} to one of {json.dumps(allowed)}")
         return "\n".join(lines)
 
     def _emit(self, event_type: str, tool_name: str, **fields) -> None:

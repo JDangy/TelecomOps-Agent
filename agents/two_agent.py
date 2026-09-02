@@ -724,9 +724,16 @@ Try to be helpful and always follow the policy. Always make sure you generate va
 HARNESS_INSTRUCTION_APPENDIX = """
 
 Tool calls may be validated before execution. If a tool call is rejected with a
-"Harness validation failed" message listing a field, its proposed value, and the
-allowed/evidence value — fix that field to the listed value and call the tool again.
-Do not retry with the same values.
+"Harness validation failed" message, recover like this:
+- The message lists the exact field, your proposed value, the constraint source,
+  and the confirmed or allowed value. Change ONLY the listed field(s) to the
+  listed value and immediately call the SAME tool again with the corrected
+  arguments.
+- Do not retry with the same values. Do not re-plan the task or switch tools —
+  the rest of your arguments were fine; only the listed field was wrong.
+- If the source is "user" (user_message), the confirmed_value is what the
+  customer explicitly asked for — use it exactly.
+- If allowed_values is listed, pick from it; if confirmed_value is listed, use it.
 """.strip()
 
 INSTRUCTION_VARIANTS = {
@@ -773,6 +780,10 @@ class DecisionAgent(LLMAgent):
             self.harness.wire(task_state=self.task_state, kb_constraints=[])
         self._packets: list = []  # 本任务收到的 Evidence Packets
         self._tool_by_name = {t.name: t for t in tools if t.name != "ask_knowledge_agent"}
+        # V2.3 recovery 预算：同一 (inner_tool, field) 最多被 harness 拒 N 次
+        # ——超过后该字段不再拦（防死循环；运行时工具自身报错兜底）。
+        self._rejection_counts: dict = {}
+        self.MAX_SAME_FIELD_REJECTIONS = 2
 
     # -- V2.2: TaskState 三源喂入 ------------------------------------------------
     def _feed_task_state(self, message) -> None:
@@ -893,9 +904,30 @@ class DecisionAgent(LLMAgent):
                         continue
                     # 临时挂 tool 供 harness 读 schema
                     tc._harness_tool = tool  # noqa: SLF001
-                    passed, content, _meta = self.harness.process(
+                    passed, content, meta = self.harness.process(
                         tc, execute=None, context=ctx, validate_only=True)
                     if not passed:
+                        # V2.3 recovery 预算：超限的 (tool, field) 不再拦
+                        # ——放行原始调用让运行时工具报错兜底（不烧循环 token）
+                        res = (meta or {}).get("resolved")
+                        inner_name = getattr(res, "tool_name", tc.name)
+                        blocking_fields = [
+                            v.field for v in (meta.get("verdicts") or [])
+                            if getattr(v, "verdict", "") in (
+                                "schema_violation", "evidence_mismatch",
+                                "task_state_conflict", "kb_enum_violation",
+                                "kb_threshold_violation", "kb_format_violation")
+                        ]
+                        over_budget = [
+                            f for f in blocking_fields
+                            if self._rejection_counts.get((inner_name, f), 0) >= self.MAX_SAME_FIELD_REJECTIONS
+                        ]
+                        if over_budget:
+                            # 该调用已有过 N 次同类拒绝——本次放行（自然失败兜底）
+                            continue
+                        for f in blocking_fields:
+                            self._rejection_counts[(inner_name, f)] = \
+                                self._rejection_counts.get((inner_name, f), 0) + 1
                         rejected[tc.id] = content
                 # 清理临时挂载
                 for tc in biz_calls:

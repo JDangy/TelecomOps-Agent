@@ -1,0 +1,18 @@
+{
+  "domain": "banking_knowledge",
+  "description": "V2.3 recovery smoke: 095（真 catch 场景）+ 037（对照）",
+  "task_ids": [
+    "task_095",
+    "task_037"
+  ],
+  "tasks_meta": [
+    {
+      "task_id": "task_095",
+      "num_required_documents": 15
+    },
+    {
+      "task_id": "task_037",
+      "num_required_documents": 4
+    }
+  ]
+}

@@ -123,29 +123,48 @@ _USER_NUM_RE = re.compile(
 
 
 class UserValueExtractor:
-    """从用户消息提取显式值（保守——只提数字金额，不猜语义字段名）。
+    """从用户消息提取显式金额值（V2.3 收紧：只提"动作金额"，不提"状态金额"）。
 
-    用户说 "transfer $500" → amount=500 (source=user)。
-    为什么保守：把 "platinum" 之类裸词映射到具体工具参数需要语义判断
-    （属于哪个工具的哪个 param），不可靠的映射宁可不记（缺依据放行原则）。
-    只在用户消息**确实给出数字金额**时记录为 amount——金额是最常见的
-    "用户明确说了 Agent 却填错"参数。
+    V2.2 教训（095 误拦）：用户说 "savings of $96,000"（账户余额）被绑到
+    裸 amount——后续 interest_correction amount=100（正确值）被误拦。
+    歧义原则（V2.3 第 5 条）：只有明确知道两个值指同一业务含义才强约束。
+
+    收紧规则：金额必须出现在**动作语境**（transfer/pay/deposit/withdraw/
+    send/credit/charge/refund/wire…）——余额/描述（have/has/of/with/
+    balance/savings of/about）不提取。
     """
 
-    # 金额类参数名（工具常见参数；只在这些被使用时可对照）
-    AMOUNT_PARAMS = ("amount", "transfer_amount", "payment_amount")
+    # 动作动词窗口（金额前 40 字内出现才算动作金额）
+    ACTION_VERBS = re.compile(
+        r"(transfer|send|pay|deposit|withdraw|wire|charge|credit|refund|"
+        r"move|apply|submit|request|increase|decrease|close.*with|pay.*off)",
+        re.IGNORECASE)
+    # 状态语境（金额前 20 字内出现则视为描述，跳过）
+    STATE_MARKERS = re.compile(
+        r"(balance|savings of|of about|have of|has about|worth|currently)",
+        re.IGNORECASE)
 
     @classmethod
     def feed(cls, state: TaskState, user_text: str, turn_ref: str = "") -> None:
-        m = _USER_NUM_RE.search(user_text or "")
-        if not m:
+        if not user_text:
             return
-        try:
-            value = float(m.group(1).replace(",", ""))
-        except ValueError:
-            return
-        # 记录为裸 amount（工具未定）；也补全金额类参数名
-        state.record("amount", value, SOURCE_USER, source_ref=turn_ref)
+        for m in _USER_NUM_RE.finditer(user_text):
+            start = m.start()
+            window = user_text[max(0, start - 40):start]
+            verb = cls.ACTION_VERBS.search(window)
+            if not verb:
+                continue  # 无动作语境——不绑（宁可少记，不误绑）
+            # 状态标记只当它出现在"动词与金额之间"（动词修饰的是这个金额）
+            # 才算描述："balance ... $12k" 无动词 → 上面已跳过；
+            # "balance $12k and pay $200"：对 $200 而言 balance 在动词前 → 是动作金额
+            between = window[verb.end():]
+            if cls.STATE_MARKERS.search(between):
+                continue  # "of about" 紧贴金额（如 "savings of about $96,000"）→ 描述
+            try:
+                value = float(m.group(1).replace(",", ""))
+            except ValueError:
+                continue
+            state.record("amount", value, SOURCE_USER, source_ref=turn_ref)
 
 
 class ToolResultExtractor:
