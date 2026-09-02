@@ -771,8 +771,9 @@ class DecisionAgent(LLMAgent):
         # V1.3: instruction 变体（two_agent = V1.2 原样；two_agent_efficient = 执行效率版）
         self._instruction_variant = instruction_variant
         # V2: Action Harness（None = 关闭，V1.2 行为；registry two_agent_harness 启用）
-        from agents.harness import ActionHarness, TaskState
-        self.task_state = TaskState()  # V2.2: 参数级 provenance registry
+        from agents.harness import ActionHarness
+        from agents.harness.task_state_v3 import TaskStateV3
+        self.task_state = TaskStateV3()  # V3: 对象级任务状态（主状态）
         self.harness = ActionHarness() if harness_enabled else None
         if self.harness is not None:
             # 三源接线：TaskState 由本 agent 喂（user/tool result），
@@ -787,37 +788,42 @@ class DecisionAgent(LLMAgent):
 
     # -- V2.2: TaskState 三源喂入 ------------------------------------------------
     def _feed_task_state(self, message) -> None:
-        """把进入 agent 的消息中的明确值灌入 TaskState（确定性，无 LLM）。
+        """把进入 agent 的消息中的明确值灌入 TaskStateV3（确定性，无 LLM）。
 
-        user 消息 → UserValueExtractor（显式金额）
-        tool 结果（MultiToolMessage）→ ToolResultExtractor（返回的 ID 字段）
-        ask packet → KnowledgeConstraints（在 _do_ask 里累积）
+        V3：user → 对象命名空间（transfer_request.amount）；
+        tool result → 实体绑定（card_dbc_123.status）；
+        knowledge → 规则命名空间（_do_ask 后 constraints 刷新）。
         """
-        if self.harness is None or self.task_state is None:
+        if self.task_state is None:
             return
         try:
+            from agents.harness.task_state_v3 import (
+                UserStateExtractor, ToolResultStateExtractor,
+            )
             if isinstance(message, UserMessage):
-                from agents.harness import UserValueExtractor
-                UserValueExtractor.feed(
+                UserStateExtractor.feed(
                     self.task_state, message.content or "",
                     turn_ref="user_message")
             elif hasattr(message, "tool_messages"):
-                from agents.harness import ToolResultExtractor
                 for tm in message.tool_messages:
-                    ToolResultExtractor.feed(
+                    ToolResultStateExtractor.feed(
                         self.task_state, tm.name or "", tm.content or "")
         except Exception:
             pass  # 状态喂入失败不影响对话流
 
     def _update_kb_constraints(self) -> None:
-        """把累积 packets 中的明确 KB 约束刷新进 harness（_do_ask 后调用）。"""
-        if self.harness is None:
-            return
+        """把累积 packets 中的明确 KB 约束刷新进 harness + TaskStateV3。"""
         try:
             from agents.harness import constraints_from_packets
-            for p in self.policies_of_harness():
-                if hasattr(p, "constraints"):
-                    p.constraints = constraints_from_packets(self._packets)
+            cons = constraints_from_packets(self._packets)
+            if self.harness is not None:
+                for p in self.policies_of_harness():
+                    if hasattr(p, "constraints"):
+                        p.constraints = cons
+            # V3: 知识规则也进对象级状态（transfer.reason.allowed_values 等）
+            if self.task_state is not None and cons:
+                from agents.harness.task_state_v3 import KnowledgeStateExtractor
+                KnowledgeStateExtractor.feed_constraints(self.task_state, cons)
         except Exception:
             pass
 
@@ -985,14 +991,45 @@ class DecisionAgent(LLMAgent):
         return assistant_message, state
 
     def _messages_with_memory(self, state):
-        """返回 system(含最新 memory block) + 历史消息。不修改 state 本身。"""
+        """返回 system(含 memory block + V3 task-state slice) + 历史消息。"""
+        blocks = []
         mem_block = self.memory.context_block() if self.memory is not None else ""
-        if not mem_block or not state.system_messages:
+        if mem_block:
+            blocks.append(mem_block)
+        # V3: 对象级任务状态切片（当前有效，非全量）
+        state_block = self._task_state_block()
+        if state_block:
+            blocks.append(state_block)
+        if not blocks or not state.system_messages:
             return state.system_messages + state.messages
-        # 复制 system 消息并追加 memory block（原 state 不动）
         sys_msg = state.system_messages[0].model_copy(deep=True)
-        sys_msg.content = (sys_msg.content or "") + "\n\n" + mem_block
+        sys_msg.content = (sys_msg.content or "") + "\n\n" + "\n\n".join(blocks)
         return [sys_msg] + list(state.system_messages[1:]) + state.messages
+
+    def _task_state_block(self, max_chars: int = 900) -> str:
+        """渲染 TaskStateV3 的当前有效状态（紧凑行式，控制预算）。
+
+        只包含当前有效条目（superseded 排除）；DA 据此避免混淆对象。
+        """
+        if self.task_state is None:
+            return ""
+        try:
+            entries = []
+            for key, chain in getattr(self.task_state, "_entries", {}).items():
+                cur = chain[-1]
+                if not cur.is_current:
+                    continue
+                src = cur.source
+                ref = f" (from {cur.source_ref})" if cur.source_ref else ""
+                entries.append(f"- {key} = {cur.value} [source: {src}{ref}]")
+            if not entries:
+                return ""
+            text = "[Confirmed task state — use these exact values for matching fields; do not confuse similar fields of different objects:]\n" + "\n".join(entries)
+            if len(text) > max_chars:
+                text = text[:max_chars] + "\n... (state truncated)"
+            return text
+        except Exception:
+            return ""
 
     def _do_ask(self, tool_call) -> str:
         """执行 ask_knowledge_agent：handoff 到 Knowledge Agent，返回 packet JSON。

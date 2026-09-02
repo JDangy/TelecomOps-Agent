@@ -1,0 +1,23 @@
+{
+  "domain": "banking_knowledge",
+  "description": "V3 smoke: 037 对照 / 095 多金额歧义 / 080 多实体长序列",
+  "task_ids": [
+    "task_037",
+    "task_095",
+    "task_080"
+  ],
+  "tasks_meta": [
+    {
+      "task_id": "task_037",
+      "num_required_documents": 4
+    },
+    {
+      "task_id": "task_095",
+      "num_required_documents": 15
+    },
+    {
+      "task_id": "task_080",
+      "num_required_documents": 19
+    }
+  ]
+}

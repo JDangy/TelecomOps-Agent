@@ -150,6 +150,17 @@ def _end_memories(orchestrator, recorder) -> None:
                          snapshot=snap)
         except Exception as exc:
             print(f"    (memory end_task 失败: {exc})")
+    # V3: TaskStateV3 的 state_update/write 事件 flush 进 v2 trace
+    agent = getattr(orchestrator, "agent", None)
+    ts = getattr(agent, "task_state", None)
+    if ts is not None and recorder is not None and hasattr(ts, "drain_trace"):
+        try:
+            for ev in ts.drain_trace():
+                recorder.emit(ev.get("event", "state_write"), "decision_agent",
+                              parent_span_id=getattr(recorder, "task_span_id", None),
+                              **{k: v for k, v in ev.items() if k != "event"})
+        except Exception:
+            pass
 
 
 def is_rate_limit_error(exc: Exception) -> bool:

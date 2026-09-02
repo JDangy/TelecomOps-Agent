@@ -20,6 +20,13 @@ from agents.harness.task_state import (
     UserValueExtractor,
     ToolResultExtractor,
 )
+from agents.harness.task_state_v3 import (
+    TaskStateV3,
+    StateEntry,
+    UserStateExtractor,
+    ToolResultStateExtractor,
+    KnowledgeStateExtractor,
+)
 from agents.harness.task_state_validator import TaskStateValidator
 from agents.harness.kb_validator import KnowledgeConstraintValidator
 from agents.harness.action_harness import (

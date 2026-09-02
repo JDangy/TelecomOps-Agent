@@ -57,7 +57,10 @@ class TaskStateValidator:
                         context: HarnessContext) -> list:
         verdicts = []
         for f, proposed in action.arguments.items():
-            entry = self.task_state.latest(action.tool_name, f)
+            # V3: 传入 proposed 值——支持实体解析（ID 错引检测）与
+            # 多对象歧义保护（同名 amount 多对象 → 不命中 → 放行）
+            entry = self.task_state.latest(action.tool_name, f,
+                                            proposed_value=proposed)
             if entry is None:
                 verdicts.append(ValidationVerdict(
                     field=f, verdict="not_in_task_state", detail={},
@@ -79,7 +82,8 @@ class TaskStateValidator:
                         "confirmed_value": entry.value,
                         "value_source": entry.source,
                         "source_ref": entry.source_ref,
-                        "seq": entry.seq,
+                        "confirmed_key": getattr(entry, "key", f),
+                        "seq": getattr(entry, "seq", 0),
                     },
                 ))
         return verdicts
