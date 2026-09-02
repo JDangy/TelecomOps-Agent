@@ -336,12 +336,27 @@ class ToolResultStateExtractor:
         "issue_reason": re.compile(r"\bissue_reason\s*[:=]\s*(\S+)"),
     }
 
+    # 类型标记词——schema 文档说明里的占位（"account_id: string"），
+    # 出现在 ID 字段值位 = 文档不是数据，直接跳过该字段
+    TYPE_MARKERS = {"string", "number", "integer", "boolean", "float",
+                    "array", "object", "list", "dict"}
+
     @classmethod
     def feed(cls, state: TaskStateV3, tool_name: str,
              result_text: str) -> None:
         if not result_text:
             return
         text = result_text[:4000]
+        # 防文档说明混入：文本是 schema 文档（含 "id: string" 式说明）
+        # 的典型特征——两个以上 ID 字段的值是类型标记 → 整块跳过
+        type_marker_hits = 0
+        for f, pat in cls.FIELD_RES.items():
+            if (f.endswith("_id") or f == "card_id"):
+                m = pat.search(text)
+                if m and m.group(1).strip("',.;)").lower() in cls.TYPE_MARKERS:
+                    type_marker_hits += 1
+        if type_marker_hits >= 2:
+            return  # schema 文档（参数说明）——不是工具数据记录
         # 按 "N. Record ID:" 分块——每块一个实体记录
         blocks = re.split(r"\n\s*\d+\.\s+record", text, flags=re.I)
         for block in blocks:
@@ -364,6 +379,8 @@ class ToolResultStateExtractor:
                 if not m:
                     continue
                 raw = m.group(1).strip("',.;)")
+                if raw.lower() in cls.TYPE_MARKERS:
+                    continue  # 类型标记占位（文档说明）——跳过
                 if f.endswith("_id") and raw != anchor_id and f != "user_id":
                     continue  # 块内其他实体的 ID 不挂到本对象
                 value: Any = raw
