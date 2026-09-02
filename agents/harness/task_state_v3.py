@@ -107,9 +107,17 @@ class TaskStateV3:
             return None
         obj = (obj or "").strip().lower()
         field_name = (field_name or "").strip().lower()
-        self._seq += 1
         key = f"{obj}.{field_name}" if obj else field_name
         chain = self._entries.setdefault(key, [])
+        # 幂等写入：同 key 当前值未变（宽松等价）→ no-op。
+        # 修复 029 实测 602 次重复 constraints 重喂（每次 _do_ask 后
+        # _update_kb_constraints 全量 packets 重放）——状态事件爆炸
+        # （18 工具消息 → 3106 state 事件）。真值变化仍正常 supersede。
+        if chain:
+            cur = chain[-1]
+            if cur.is_current and cur.source == source and _loose_eq(cur.value, value):
+                return cur
+        self._seq += 1
         entry = StateEntry(object=obj, field=field_name, value=value,
                            source=source, source_ref=source_ref, seq=self._seq)
         # supersede：当前条目链上最后一条标记被取代
@@ -243,6 +251,19 @@ class TaskStateV3:
         return sum(1 for chain in self._entries.values()
                    if chain and chain[-1].is_current)
 
+
+
+def _loose_eq(a, b) -> bool:
+    """宽松等价（幂等写入判断用——与 validator 同口径）。"""
+    if a == b:
+        return True
+    try:
+        return float(a) == float(b)
+    except (TypeError, ValueError):
+        pass
+    if isinstance(a, str) and isinstance(b, str):
+        return a.strip().lower() == b.strip().lower()
+    return False
 
 # ---------------------------------------------------------------------------
 # V3 提取器：user / tool / knowledge → 对象级状态
