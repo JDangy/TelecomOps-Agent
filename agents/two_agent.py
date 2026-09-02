@@ -791,7 +791,8 @@ class DecisionAgent(LLMAgent):
         """把进入 agent 的消息中的明确值灌入 TaskStateV3（确定性，无 LLM）。
 
         V3：user → 对象命名空间（transfer_request.amount）；
-        tool result → 实体绑定（card_dbc_123.status）；
+        tool result → 实体绑定（card_dbc_123.status）——注意 tau2 单结果
+        是裸 ToolMessage、多结果才包 MultiToolMessage（两种都处理）；
         knowledge → 规则命名空间（_do_ask 后 constraints 刷新）。
         """
         if self.task_state is None:
@@ -800,14 +801,20 @@ class DecisionAgent(LLMAgent):
             from agents.harness.task_state_v3 import (
                 UserStateExtractor, ToolResultStateExtractor,
             )
+            from tau2.data_model.message import MultiToolMessage, ToolMessage
             if isinstance(message, UserMessage):
                 UserStateExtractor.feed(
                     self.task_state, message.content or "",
                     turn_ref="user_message")
-            elif hasattr(message, "tool_messages"):
+            elif isinstance(message, MultiToolMessage):
                 for tm in message.tool_messages:
                     ToolResultStateExtractor.feed(
-                        self.task_state, tm.name or "", tm.content or "")
+                        self.task_state, "", tm.content or "")
+            elif isinstance(message, ToolMessage):
+                # tau2 _wrap_tool_results：单结果是裸 ToolMessage
+                # （ToolMessage 无 name 字段——source_ref 用通用标记）
+                ToolResultStateExtractor.feed(
+                    self.task_state, "tool_result", message.content or "")
         except Exception:
             pass  # 状态喂入失败不影响对话流
 
