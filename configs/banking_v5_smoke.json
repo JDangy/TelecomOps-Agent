@@ -1,0 +1,38 @@
+{
+  "domain": "banking_knowledge",
+  "description": "V5 targeted: 顽固长任务（planning 价值）+ 简单对照（零开销验证）",
+  "task_ids": [
+    "task_001",
+    "task_004",
+    "task_029",
+    "task_080",
+    "task_088",
+    "task_020"
+  ],
+  "tasks_meta": [
+    {
+      "task_id": "task_001",
+      "num_required_documents": 4
+    },
+    {
+      "task_id": "task_004",
+      "num_required_documents": 1
+    },
+    {
+      "task_id": "task_029",
+      "num_required_documents": 10
+    },
+    {
+      "task_id": "task_080",
+      "num_required_documents": 19
+    },
+    {
+      "task_id": "task_088",
+      "num_required_documents": 14
+    },
+    {
+      "task_id": "task_020",
+      "num_required_documents": 8
+    }
+  ]
+}

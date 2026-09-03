@@ -27,6 +27,7 @@ from agents.harness.task_state_v3 import (
     ToolResultStateExtractor,
     KnowledgeStateExtractor,
 )
+from agents.harness.plan_store import PlanStore, PlanStep
 from agents.harness.task_state_validator import TaskStateValidator
 from agents.harness.kb_validator import KnowledgeConstraintValidator
 from agents.harness.action_harness import (
@@ -54,6 +55,8 @@ __all__ = [
     "SOURCE_KNOWLEDGE",
     "UserValueExtractor",
     "ToolResultExtractor",
+    "PlanStore",
+    "PlanStep",
     "TaskStateValidator",
     "KnowledgeConstraintValidator",
     "SchemaValidation",

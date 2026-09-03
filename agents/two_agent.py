@@ -736,13 +736,23 @@ Tool calls may be validated before execution. If a tool call is rejected with a
   customer explicitly asked for — use it exactly.
 - If allowed_values is listed, pick from it; if confirmed_value is listed, use it.
 
-Long tasks (many tool calls): once an "Execution plan" block appears in your
-context, list each remaining step as a line in your replies like
-[PLAN] close account_B | tool: <the_matching_tool_name>
-(one line per step, before or alongside your tool calls). Marking a step with
-[PLAN-DONE] <description> only starts it — the system records it as done solely
-when the step's tool call actually succeeds. Do not tell the user the task is
-finished while pending steps remain.
+Planning for complex tasks:
+- If the user's request clearly involves multiple business objectives, multiple
+  objects (several accounts/cards), or ordered dependencies (A then B then C),
+  call write_plan FIRST with a short structured plan (3-7 business-level steps
+  describing what still needs to be done). Each step is a business action, not
+  a tool history; include explicit inspect/resolve steps for prerequisites you
+  cannot know yet (balances, linked cards, fees), rather than guessing actions.
+- While executing: update_plan(op="set_current", ...) when you start a step;
+  update_plan(op="add_step"/"remove_step"/"block_step", ...) when reality
+  changes (new blocker found, prerequisite revealed, user changed the goal);
+  update_plan(op="unblock_step", ...) when a blocker clears.
+- A step counts as completed only when its tool call actually succeeds — the
+  system tracks this from real results; do not tell the user the task is
+  finished while your plan still has unresolved steps (remove them with
+  update_plan first if they are truly no longer needed).
+- Simple requests (a single query or one straightforward action) need no plan
+  — just execute them directly.
 """.strip()
 
 INSTRUCTION_VARIANTS = {
@@ -798,7 +808,13 @@ class DecisionAgent(LLMAgent):
         from agents.harness.execution_plan import PlanTracker
         self.plan_tracker = PlanTracker()
         self._toolcall_inner_by_id: dict = {}      # tc.id → inner 工具名
+        self._toolcall_args_by_id: dict = {}       # tc.id → inner args（实体绑定用）
         self._state_messages_cache: list = []       # _recent_user_text 用
+        # V5: Structured Planning（runtime PlanStore + planning tools）
+        from agents.harness.plan_store import PlanStore
+        self.plan_store = PlanStore()
+        self._planning_prompted = False             # runtime fallback 只提示一次
+        self._planning_fallback_pending = False     # 下一轮注入提示
 
     # -- V2.2: TaskState 三源喂入 ------------------------------------------------
     def _feed_task_state(self, message) -> None:
@@ -834,10 +850,12 @@ class DecisionAgent(LLMAgent):
 
     # -- V4: Plan 进度由真实 Tool Result 驱动 ------------------------------
     def _plan_progress_from_tool(self, tm) -> None:
-        """一次工具执行结束 → plan 升级判定 + 步骤完成/失败推进。
+        """一次工具执行结束 → V4 观察升级 + V5 PlanStore 步骤推进。
 
         内层工具名解析：tau2 ToolMessage 无 name——用 id 关联本 agent
         拦截循环记录的 tool_call（id → inner name 映射，确定性）。
+        V5：同时把 (inner, args) 交给 plan_store.on_tool_result——
+        完成推进带实体绑定（多对象同工具不误批量 completed）。
         """
         try:
             if self.plan_tracker is None:
@@ -863,6 +881,88 @@ class DecisionAgent(LLMAgent):
                                  trigger_calls=len(self.plan_tracker._inner_tool_calls))
                 except Exception:
                     pass
+                # V5 入口 B（runtime fallback）：长流程信号已触发而 DA
+                # 尚未建立结构化计划 → 下一轮提示 write_plan（只提示一次）
+                if not self.plan_store.active and not self._planning_prompted:
+                    self._planning_prompted = True
+                    self._planning_fallback_pending = True
+            # V5: PlanStore 步骤推进（真实 Tool Result + 实体绑定）
+            if self.plan_store.active:
+                args = self._toolcall_args_by_id.get(tm.id) or {}
+                step = self.plan_store.on_tool_result(
+                    inner, ok, args, task_state=self.task_state)
+                if step is not None:
+                    try:
+                        from eval.instrumentation import get_active_recorder
+                        rec = get_active_recorder()
+                        if rec is not None:
+                            rec.emit("plan_step_progressed" if step.status == "completed"
+                                     else "plan_step_failed", "decision_agent",
+                                     parent_span_id=getattr(rec, "task_span_id", None),
+                                     step_id=step.step_id,
+                                     description=step.description,
+                                     tool=inner, ok=ok)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # -- V5: Planning tool 执行（拦截 → PlanStore，零 LLM）-----------------
+    def _execute_plan_tool(self, tc) -> str:
+        """write_plan/update_plan/read_plan → PlanStore 确定性执行。"""
+        try:
+            args = dict(getattr(tc, "arguments", None) or {})
+            name = tc.name
+            before = self._plan_snapshot_for_trace()
+            if name == "write_plan":
+                steps = args.get("steps") or []
+                if isinstance(steps, str):
+                    try:
+                        steps = json.loads(steps)
+                    except Exception:
+                        steps = []
+                result = self.plan_store.write_plan(
+                    goal=args.get("goal") or "", steps=steps)
+                self._emit_plan_event("plan_written", result, before)
+            elif name == "update_plan":
+                result = self.plan_store.update_plan(
+                    op=args.get("op") or "",
+                    step_id=args.get("step_id"),
+                    description=args.get("description"),
+                    entities=args.get("entities"),
+                    note=args.get("note"),
+                    tool_hint=args.get("tool_hint"))
+                self._emit_plan_event("plan_updated", result, before, op=args.get("op"))
+            elif name == "read_plan":
+                result = {"goal": self.plan_store.goal,
+                          "steps": [s.to_dict() for s in self.plan_store.steps],
+                          "current_step": (self.plan_store.current_step().step_id
+                                           if self.plan_store.current_step() else None)}
+            else:
+                result = {"ok": False, "error": f"unknown plan tool {name}"}
+            return json.dumps(result, default=str)
+        except Exception as exc:
+            return json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+    def _plan_snapshot_for_trace(self) -> dict:
+        try:
+            return {"goal": self.plan_store.goal,
+                    "n_steps": len(self.plan_store.steps),
+                    "statuses": [s.status for s in self.plan_store.steps]}
+        except Exception:
+            return {}
+
+    def _emit_plan_event(self, event_type: str, result: dict,
+                         before: dict, op: str = None) -> None:
+        try:
+            from eval.instrumentation import get_active_recorder
+            rec = get_active_recorder()
+            if rec is None:
+                return
+            rec.emit(event_type, "decision_agent",
+                     parent_span_id=getattr(rec, "task_span_id", None),
+                     result=result, before=before,
+                     after=self._plan_snapshot_for_trace(), op=op)
         except Exception:
             pass
 
@@ -950,6 +1050,19 @@ class DecisionAgent(LLMAgent):
             # base_prompt 缓存无 memory 版本，memory block 追加其上（不改 state）。
             # V4: Context Builder——非 Plan Mode 走 V3 原路径；
             # Plan Mode 追加 Goal/Progress 并轻量化已外部化的旧 ToolResult。
+            # V5 入口 B：fallback 提示注入（一次性）
+            if getattr(self, "_planning_fallback_pending", False):
+                self._planning_fallback_pending = False
+                from tau2.data_model.message import SystemMessage as _SM2
+                state.messages.append(_SM2(
+                    role="system",
+                    content=(
+                        "This task has grown into a long multi-step process. "
+                        "Before continuing, call write_plan to create a short "
+                        "structured execution plan (3-7 business-level steps "
+                        "describing what still needs to be done, with the first "
+                        "step as the current focus). Then work through it step "
+                        "by step, using update_plan when circumstances change.")))
             full = self._build_llm_context(state)
             assistant_message = generate(
                 model=self.llm,
@@ -960,23 +1073,42 @@ class DecisionAgent(LLMAgent):
             )
             if not (assistant_message.is_tool_call()
                     and (assistant_message.tool_calls or [])):
-                # V4: completion check——准备结束但 plan 还有未完成步骤
-                # → 注入提醒继续（有界 REMIND_LIMIT 次，防死循环）
-                if (self.plan_tracker is not None
-                        and self.plan_tracker.should_remind_continue()):
-                    self.plan_tracker.mark_reminded()
-                    pending = self.plan_tracker.pending_summary()
-                    state.messages.append(assistant_message)
-                    from tau2.data_model.message import SystemMessage as _SM
-                    reminder = _SM(
-                        content=(
-                            "The task may not be complete. Unfinished plan steps: "
-                            f"{pending}. If they are still required by the user, "
-                            "continue executing them now (a step only counts as done "
-                            "after its tool call succeeds). If the user's request has "
-                            "changed or these steps are no longer needed, you may "
-                            "end the task with a final reply."))
-                    state.messages.append(reminder)
+                # V5: completion guard——结构化 Plan 的真实 pending
+                # （优先于 V4 行为观察 guard；有界，允许 update_plan 后正常结束）
+                guarded = False
+                try:
+                    if self.plan_store.active and self.plan_store.guard_should_remind():
+                        self.plan_store.guard_reminders += 1
+                        pend = "; ".join(
+                            f"{s.status}: {s.description}" +
+                            (f" (objects: {', '.join(s.entities)})" if s.entities else "")
+                            for s in self.plan_store.pending_steps())
+                        state.messages.append(assistant_message)
+                        from tau2.data_model.message import SystemMessage as _SM
+                        reminder = _SM(
+                            role="system",
+                            content=(
+                                "Your execution plan still has unresolved steps: "
+                                f"[{pend}]. Before finishing: either continue executing "
+                                "the remaining steps now, or call update_plan to "
+                                "remove/mark steps that are no longer required "
+                                "(e.g. if the user changed the request), then end "
+                                "with your final reply."))
+                        state.messages.append(reminder)
+                        guarded = True
+                        try:
+                            from eval.instrumentation import get_active_recorder
+                            rec = get_active_recorder()
+                            if rec is not None:
+                                rec.emit("plan_completion_guard", "decision_agent",
+                                         parent_span_id=getattr(rec, "task_span_id", None),
+                                         pending=pend[:300],
+                                         reminder_no=self.plan_store.guard_reminders)
+                        except Exception:
+                            pass
+                except Exception:
+                    guarded = False
+                if guarded:
                     continue
                 break  # 纯文本 → 与官方行为一致
 
@@ -986,8 +1118,25 @@ class DecisionAgent(LLMAgent):
                     assistant_message.content or "")
 
             calls = assistant_message.tool_calls or []
+            PLAN_TOOL_NAMES = {"write_plan", "update_plan", "read_plan"}
             ask_calls = [tc for tc in calls if tc.name == "ask_knowledge_agent"]
-            biz_calls = [tc for tc in calls if tc.name != "ask_knowledge_agent"]
+            plan_calls = [tc for tc in calls if tc.name in PLAN_TOOL_NAMES]
+            biz_calls = [tc for tc in calls
+                         if tc.name != "ask_knowledge_agent"
+                         and tc.name not in PLAN_TOOL_NAMES]
+
+            # ---- V5: planning tool 拦截（落 runtime PlanStore，不进
+            # orchestrator/harness——非业务工具，只改 agent 计划状态）----
+            if plan_calls:
+                state.messages.append(assistant_message)
+                for tc in plan_calls:
+                    result = self._execute_plan_tool(tc)
+                    state.messages.append(ToolMessage(
+                        id=tc.id, role="tool", requestor="assistant",
+                        content=result, error=False,
+                    ))
+                # plan 变更后继续循环（可能接着发起业务调用）
+                continue
 
             # ---- V2 Harness：业务工具执行前校验（只拦 rejected；通过的原样
             # 留给 orchestrator 执行，保持消息结构与 V1.2 完全兼容）----
@@ -1003,6 +1152,7 @@ class DecisionAgent(LLMAgent):
                     try:
                         res = self.harness.resolver.resolve(tc)
                         self._toolcall_inner_by_id[tc.id] = res.tool_name or tc.name
+                        self._toolcall_args_by_id[tc.id] = dict(res.arguments or {})
                     except Exception:
                         self._toolcall_inner_by_id[tc.id] = tc.name
                     # 临时挂 tool 供 harness 读 schema
@@ -1088,15 +1238,25 @@ class DecisionAgent(LLMAgent):
         return assistant_message, state
 
     def _build_llm_context(self, state):
-        """V4 Context Builder 入口：简单任务 V3 原路径，Plan Mode 升级视图。"""
+        """V4/V5 Context Builder 入口：简单任务 V3 原路径，Plan 升级视图。
+
+        V5: plan_store 有计划时注入结构化 plan block（围绕 current step），
+        置于各 block 最前（计划是 DA 每轮第一优先信息）。
+        """
         from agents.harness.context_builder import build_context
         mem_block = self.memory.context_block() if self.memory is not None else ""
         state_block = self._task_state_block(
             tool_name=self._recent_biz_tool(state))
+        v5_plan_block = ""
+        try:
+            v5_plan_block = self.plan_store.plan_block() if self.plan_store.active else ""
+        except Exception:
+            v5_plan_block = ""
+        combined_mem = v5_plan_block + ("\n\n" + mem_block if (v5_plan_block and mem_block) else mem_block)
         return build_context(
             state, task_state=self.task_state,
             plan_tracker=getattr(self, "plan_tracker", None),
-            memory_block=mem_block, state_block=state_block,
+            memory_block=combined_mem, state_block=state_block,
         )
 
     def _messages_with_memory(self, state):
@@ -1336,6 +1496,69 @@ def make_ask_knowledge_tool() -> Tool:
 
 
 # ---------------------------------------------------------------------------
+# V5 Planning Tools — DA 的结构化计划能力（runtime state，非业务工具）
+# ---------------------------------------------------------------------------
+def make_planning_tools() -> list:
+    """构造 write_plan / update_plan / read_plan 三个 planning tool。
+
+    与 ask_knowledge_agent 同注入模式（as_tool schema 让 LLM 知道能力，
+    实际执行被 DecisionAgent 拦截，落到 runtime PlanStore）。
+    这三个工具不触碰 tau2 environment——只改本 agent 的计划状态
+    （benchmark integrity 边界内）。
+    """
+    from tau2.environment.tool import as_tool
+
+    def write_plan(goal: str, steps: List[dict]) -> str:
+        """Create or fully rewrite the execution plan for this task. Call this
+        when the user's request clearly involves multiple business objectives,
+        multiple objects, or ordered multi-step dependencies (A then B then C).
+        Each step is a business-level action describing what still needs to be
+        done (not a history of past calls). Keep plans lean (3-7 steps);
+        unknown prerequisites should be explicit inspect/resolve steps, not
+        guessed actions.
+
+        Args:
+            goal: The user's overall objective in one sentence.
+            steps: Ordered steps, each {"description": "business-level action,
+                e.g. inspect account_A state", "tool_hint": "inner tool name
+                if known, else omit", "entities": ["account_A"] if the step
+                targets specific objects}.
+        """
+        return json.dumps({"ok": True, "note": "executed via agent-side interception"})
+
+    def update_plan(op: str, step_id: int = None, description: str = None,
+                    entities: List[str] = None, note: str = None,
+                    tool_hint: str = None) -> str:
+        """Incrementally update the existing plan (no full rewrite).
+        Use when circumstances change: a step failed and revealed a new
+        prerequisite; a tool result exposed a new blocker; the user changed
+        the goal; an assumption was invalidated; or a step is no longer
+        needed.
+
+        Args:
+            op: One of: "set_current" (focus a step now), "add_step"
+                (append a newly needed step), "remove_step" (no longer
+                required), "block_step" (blocked by external condition —
+                explain in note), "unblock_step" (blocker resolved).
+            step_id: Target step id for set_current/remove_step/block_step/
+                unblock_step.
+            description: For add_step.
+            entities: For add_step (target objects).
+            note: Reason for block_step / context.
+            tool_hint: For add_step.
+        """
+        return json.dumps({"ok": True, "note": "executed via agent-side interception"})
+
+    def read_plan() -> str:
+        """Read the current structured execution plan (goal, steps, current
+        step, pending/blocked/failed statuses). Use to review where you are
+        before deciding the next action."""
+        return json.dumps({"ok": True, "note": "executed via agent-side interception"})
+
+    return [as_tool(write_plan), as_tool(update_plan), as_tool(read_plan)]
+
+
+# ---------------------------------------------------------------------------
 # Factory：注册进 agents/registry.py
 # ---------------------------------------------------------------------------
 def create_two_agent(tools, domain_policy, instruction_variant="two_agent",
@@ -1372,8 +1595,9 @@ def create_two_agent(tools, domain_policy, instruction_variant="two_agent",
         memory=ka_memory,
     )
     ask_tool = make_ask_knowledge_tool()
+    plan_tools = make_planning_tools()
     return DecisionAgent(
-        tools=business_tools + [ask_tool],
+        tools=business_tools + [ask_tool] + plan_tools,
         domain_policy=domain_policy,
         knowledge_agent=knowledge_agent,
         memory=da_memory,
