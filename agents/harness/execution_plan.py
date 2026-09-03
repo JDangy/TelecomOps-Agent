@@ -78,11 +78,19 @@ class PlanTracker:
       Task State  = 现在是什么（事实）
       Plan/Progress = 还要做什么（进度）
     两者都在 Context Builder 汇成 DA 每轮视图。
+
+    V4.1 行为观察修正（diag 实测）：LLM 对 [PLAN] 行记法遵守率低
+    （080 激活后 0 行输出）。因此进度主信号改为**工具行为自观察**：
+      - 每个首次出现的内层工具 = 自动派生一步（已完成=它成功过）
+      - 重复调用计数显式呈现（顽固任务最大特征：同工具反复 5-20 次
+        ——'你已经调用了 X 五次' 直接反重复）
+      - [PLAN] 行保留为可选（模型愿意用则步骤化更细）
     """
 
     def __init__(self):
         self.plan: Optional[ExecutionPlan] = None
         self._inner_tool_calls: list = []   # [(inner_name, ok)]
+        self._tool_stats: dict = {}          # inner_name -> {"ok": n, "fail": n}
         self._last_messages_len = 0
 
     # ------------------------------------------------------------------
@@ -90,6 +98,8 @@ class PlanTracker:
     # ------------------------------------------------------------------
     def maybe_upgrade(self, inner_tool_name: str, ok: bool) -> bool:
         self._inner_tool_calls.append((inner_tool_name, ok))
+        st = self._tool_stats.setdefault(inner_tool_name, {"ok": 0, "fail": 0})
+        st["ok" if ok else "fail"] += 1
         if self.plan is not None:
             return False  # 已激活
         total = len(self._inner_tool_calls)
@@ -98,10 +108,19 @@ class PlanTracker:
         if (total >= PLAN_TRIGGER_TOTAL_CALLS
                 or distinct >= PLAN_TRIGGER_DISTINCT_TOOLS
                 or repeats >= PLAN_TRIGGER_REPEATS):
-            self.plan = ExecutionPlan(goal="(goal pending — state it in your [PLAN] lines)")
+            self.plan = ExecutionPlan(goal="(goal pending)")
             self.plan.active = True
             return True
         return False
+
+    def _auto_steps(self) -> list:
+        """从工具行为自观察派生的隐式步骤（V4.1 主信号）。"""
+        out = []
+        for name, st in self._tool_stats.items():
+            state = "completed" if st["ok"] > 0 else "failed"
+            n = st["ok"] + st["fail"]
+            out.append((name, state, n, st["ok"], st["fail"]))
+        return out
 
     # ------------------------------------------------------------------
     # agent 文本里的 PLAN 行解析（正常推理输出的一部分，零额外调用）
@@ -149,7 +168,11 @@ class PlanTracker:
     # completion check（结束前）
     # ------------------------------------------------------------------
     def should_remind_continue(self) -> bool:
-        """agent 要结束时：有未完成步骤且提醒未超限 → True（提醒继续）。"""
+        """agent 要结束时：有未完成 [PLAN] 步骤且提醒未超限 → True。
+
+        V4.1: 只对显式 [PLAN] 步骤提醒（自动步骤是行为观察，无明确
+        '还该做什么'语义——不替 agent 决定任务完整性）。
+        """
         if not self.plan or not self.plan.active:
             return False
         if self.plan.reminders_used >= REMIND_LIMIT:
@@ -164,14 +187,28 @@ class PlanTracker:
     # 渲染（Context Builder 用）
     # ------------------------------------------------------------------
     def progress_block(self) -> str:
-        """渲染 Goal + 步骤状态（DA 每轮视图的 Plan 部分）。"""
+        """渲染 Goal + 进度（DA 每轮视图的 Plan 部分）。
+
+        V4.1: 主信号 = 工具行为自观察（每个工具的调用次数/成败）——
+        重复调用直接可见（'called 5 times'），完成状态由真实执行判定。
+        [PLAN] 行（若模型输出）叠加显示为细化步骤。
+        """
         if not self.plan or not self.plan.active:
             return ""
+        lines = ["Execution progress — steps complete only when their tool call "
+                 "succeeds. Avoid repeating an action you have already completed:"]
+        lines.append(f"goal: {self.plan.goal}")
+        # 自动派生（行为观察）——按首次出现顺序
+        for name, state, n, ok_n, fail_n in self._auto_steps():
+            if n <= 1 and fail_n == 0:
+                continue  # 单次成功调用不占篇幅；失败的必现
+            mark = "done" if state == "completed" else "FAILED"
+            lines.append(f"- {name}: called {n} times ({ok_n} ok"
+                         + (f", {fail_n} failed" if fail_n else "")
+                         + f") -> {mark}")
+        # [PLAN] 显式步骤（可选，模型愿意用时更细）
         icons = {"completed": "[done]", "in_progress": "[current]",
                  "pending": "[ ]", "failed": "[failed]"}
-        lines = ["Execution plan — track your progress with [PLAN] lines; a step only "
-                 "counts as done after its tool call succeeds:"]
-        lines.append(f"goal: {self.plan.goal}")
         for s in self.plan.steps:
             icon = icons.get(s.status, "[ ]")
             tool = f" (tool: {s.tool_hint})" if s.tool_hint else ""
