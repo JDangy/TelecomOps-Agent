@@ -124,5 +124,8 @@
       "task_id": "task_100",
       "num_required_documents": 12
     }
-  ]
+  ],
+  "set_role": "DEVELOPMENT SET（Dev）",
+  "usage": "failure/trace analysis、版本迭代、参数选择、threshold 调整、smoke/regression 对比——反复使用，负责开发。不是独立测试集：已被多次 trace 分析。",
+  "complement": "configs/banking_holdout_sealed.json（sealed holdout，仅 freeze 后运行）"
 }

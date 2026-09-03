@@ -10,7 +10,7 @@ V3 核心改变：状态有"属于谁"的概念——
     refund_request.amount = 100       (source=tool)
     account_sav_lm83.balance = 96000  (source=tool)
     card_dbc_12345.status = ACTIVE    (source=tool)
-    transfer.reason.allowed_values = [fraud, customer_request, account_closure]
+    transfer.reason.allowed_values = [<option_a>, <option_b>, <option_c>]
                                       (source=knowledge)
 
 数据模型（每条）：

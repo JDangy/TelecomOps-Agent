@@ -131,6 +131,14 @@ class ActionHarness:
             except Exception:
                 pass
         resolved = self.resolver.resolve(tool_call)
+        # 公开工具的官方 schema 是合法信息（Agent 初始可见）——挂给
+        # SchemaValidation 作非 wrapper 回退（integrity: 仅公开工具，
+        # 不含任何 hidden discoverable 内部实现）
+        if wrapper_tool is not None and not resolved.is_wrapper:
+            try:
+                object.__setattr__(resolved, "_public_tool", wrapper_tool)
+            except Exception:
+                pass
         self._emit("action_resolved", outer_name,
                    inner_tool_name=resolved.tool_name,
                    inner_arguments=resolved.arguments,

@@ -186,20 +186,21 @@ grounded_values — CRITICAL FOR DOWNSTREAM TOOL USE:
   parameters: enum codes, exact amounts/fees/limits/thresholds, type/class names,
   reason codes, option names.
 - Each grounded value MUST name the TOOL it belongs to (tool_name) and the exact
-  PARAMETER of that tool (parameter_name) — e.g. tool_name="close_bank_account_7392",
-  parameter_name="reason", value="early_closure". Only do this when the document
+  PARAMETER of that tool (parameter_name) — e.g. tool_name="<a_tool_from_the_environment>",
+  parameter_name="<a_parameter_of_that_tool>",
+  value="<the_exact_value_from_the_document>". Only do this when the document
   clearly indicates which tool and parameter the value is for.
 - If you CANNOT reliably tell which tool/parameter a value belongs to, do NOT guess —
   put it in facts as a plain claim instead.
 - Preserve values EXACTLY as written in the source document. If the document says
-  "account_closure", write "account_closure" — NOT "closure", "account closing",
-  or any paraphrase. Numbers keep their exact digits and units.
+  "value_x", write "value_x" — NOT "value x", "x", or any paraphrase.
+  Numbers keep their exact digits and units.
 - If no precise tool-usable value is needed, an empty list is fine.
 
 constraints — DEFINITE RULES ONLY (never case answers):
 - Include a constraint ONLY when the knowledge base explicitly states it:
   - "enum": the complete set of legal values a parameter accepts
-    (e.g. allowed_values: ["fraud", "customer_request", "account_closure"]).
+    (e.g. allowed_values: ["<option_a>", "<option_b>", "<option_c>"]).
   - "threshold": a documented numeric bound (max transfer amount, min balance).
   - "format": a required value format (e.g. MM/DD/YYYY for dates).
 - Do NOT use constraints to say which legal value fits THIS case — deciding that
@@ -737,7 +738,7 @@ Tool calls may be validated before execution. If a tool call is rejected with a
 
 Long tasks (many tool calls): once an "Execution plan" block appears in your
 context, list each remaining step as a line in your replies like
-[PLAN] close account_B | tool: close_bank_account_7392
+[PLAN] close account_B | tool: <the_matching_tool_name>
 (one line per step, before or alongside your tool calls). Marking a step with
 [PLAN-DONE] <description> only starts it — the system records it as done solely
 when the step's tool call actually succeeds. Do not tell the user the task is

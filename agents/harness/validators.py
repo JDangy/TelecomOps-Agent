@@ -43,6 +43,12 @@ class SchemaValidation:
     def validate_action(self, action: ResolvedAction,
                         context: HarnessContext) -> list:
         schema = action.inner_schema or {}
+        if not action.is_wrapper and not schema:
+            # 普通公开工具：官方 openai_schema 是 Agent 初始可见的合法信息
+            # （integrity 边界内——公开工具无 unlock 机制，定义始终暴露）。
+            tool = getattr(action, "_public_tool", None)
+            if tool is not None:
+                schema = (tool.openai_schema or {}).get("function", {}).get("parameters", {}) or {}
         # 内层 discoverable 工具的 required 不做 blocking：
         # schema 来自 toolkit 方法 signature/docstring 的静态推导，
         # 真实约束在运行时（method(**args) 自己抛 TypeError——错误信息

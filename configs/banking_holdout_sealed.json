@@ -1,0 +1,128 @@
+{
+  "domain": "banking_knowledge",
+  "description": "SEALED HOLDOUT — 只在大版本 freeze 后运行（V4 freeze / V5 等）。禁止日常评测/调参/看 trace 后改代码再跑。抽样: 官方 97 任务排除 dev 24，seed=20260903 随机 22 个，未读取 gold/难度信息。一经创建不再变更。",
+  "task_ids": [
+    "task_006",
+    "task_018",
+    "task_031",
+    "task_032",
+    "task_035",
+    "task_038",
+    "task_047",
+    "task_050",
+    "task_052",
+    "task_055",
+    "task_057",
+    "task_063",
+    "task_065",
+    "task_066",
+    "task_067",
+    "task_069",
+    "task_081",
+    "task_082",
+    "task_085",
+    "task_087",
+    "task_089",
+    "task_091"
+  ],
+  "tasks_meta": [
+    {
+      "task_id": "task_006",
+      "num_required_documents": 6
+    },
+    {
+      "task_id": "task_018",
+      "num_required_documents": 10
+    },
+    {
+      "task_id": "task_031",
+      "num_required_documents": 3
+    },
+    {
+      "task_id": "task_032",
+      "num_required_documents": 1
+    },
+    {
+      "task_id": "task_035",
+      "num_required_documents": 1
+    },
+    {
+      "task_id": "task_038",
+      "num_required_documents": 4
+    },
+    {
+      "task_id": "task_047",
+      "num_required_documents": 12
+    },
+    {
+      "task_id": "task_050",
+      "num_required_documents": 6
+    },
+    {
+      "task_id": "task_052",
+      "num_required_documents": 7
+    },
+    {
+      "task_id": "task_055",
+      "num_required_documents": 8
+    },
+    {
+      "task_id": "task_057",
+      "num_required_documents": 5
+    },
+    {
+      "task_id": "task_063",
+      "num_required_documents": 13
+    },
+    {
+      "task_id": "task_065",
+      "num_required_documents": 23
+    },
+    {
+      "task_id": "task_066",
+      "num_required_documents": 15
+    },
+    {
+      "task_id": "task_067",
+      "num_required_documents": 17
+    },
+    {
+      "task_id": "task_069",
+      "num_required_documents": 19
+    },
+    {
+      "task_id": "task_081",
+      "num_required_documents": 12
+    },
+    {
+      "task_id": "task_082",
+      "num_required_documents": 12
+    },
+    {
+      "task_id": "task_085",
+      "num_required_documents": 7
+    },
+    {
+      "task_id": "task_087",
+      "num_required_documents": 10
+    },
+    {
+      "task_id": "task_089",
+      "num_required_documents": 10
+    },
+    {
+      "task_id": "task_091",
+      "num_required_documents": 13
+    }
+  ],
+  "holdout_protocol": {
+    "created": "2026-09-03",
+    "sampling_seed": 20260903,
+    "source": "third_party/tau2-bench/data/tau2/domains/banking_knowledge/tasks.json (97 tasks)",
+    "excluded": "configs/banking_dev_tasks.json (24 dev tasks)",
+    "sample_size": 22,
+    "selection_rule": "sorted(task_id) → random.Random(seed).sample() — 不读任务内容",
+    "usage_rule": "仅在版本 freeze 后做正式泛化验证；结果用于汇报不用于调参",
+    "tau2_commit_sha": "a2c024725189473d2d7cea3a5cfdbcc67478e41f"
+  }
+}
