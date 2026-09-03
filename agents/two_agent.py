@@ -734,6 +734,14 @@ Tool calls may be validated before execution. If a tool call is rejected with a
 - If the source is "user" (user_message), the confirmed_value is what the
   customer explicitly asked for — use it exactly.
 - If allowed_values is listed, pick from it; if confirmed_value is listed, use it.
+
+Long tasks (many tool calls): once an "Execution plan" block appears in your
+context, list each remaining step as a line in your replies like
+[PLAN] close account_B | tool: close_bank_account_7392
+(one line per step, before or alongside your tool calls). Marking a step with
+[PLAN-DONE] <description> only starts it — the system records it as done solely
+when the step's tool call actually succeeds. Do not tell the user the task is
+finished while pending steps remain.
 """.strip()
 
 INSTRUCTION_VARIANTS = {
@@ -785,16 +793,15 @@ class DecisionAgent(LLMAgent):
         # ——超过后该字段不再拦（防死循环；运行时工具自身报错兜底）。
         self._rejection_counts: dict = {}
         self.MAX_SAME_FIELD_REJECTIONS = 2
+        # V4: Adaptive Long-Horizon Execution
+        from agents.harness.execution_plan import PlanTracker
+        self.plan_tracker = PlanTracker()
+        self._toolcall_inner_by_id: dict = {}      # tc.id → inner 工具名
+        self._state_messages_cache: list = []       # _recent_user_text 用
 
     # -- V2.2: TaskState 三源喂入 ------------------------------------------------
     def _feed_task_state(self, message) -> None:
-        """把进入 agent 的消息中的明确值灌入 TaskStateV3（确定性，无 LLM）。
-
-        V3：user → 对象命名空间（transfer_request.amount）；
-        tool result → 实体绑定（card_dbc_123.status）——注意 tau2 单结果
-        是裸 ToolMessage、多结果才包 MultiToolMessage（两种都处理）；
-        knowledge → 规则命名空间（_do_ask 后 constraints 刷新）。
-        """
+        """把进入 agent 的消息中的明确值灌入 TaskStateV3 + 驱动 Plan 进度。"""
         if self.task_state is None:
             return
         try:
@@ -806,17 +813,56 @@ class DecisionAgent(LLMAgent):
                 UserStateExtractor.feed(
                     self.task_state, message.content or "",
                     turn_ref="user_message")
+                # V4: Plan Mode 后首个 user 消息补 goal
+                if self.plan_tracker.plan is not None:
+                    txt = (message.content or "").strip()
+                    if txt and self.plan_tracker.plan.goal.startswith("(goal pending"):
+                        self.plan_tracker.plan.goal = txt[:200]
             elif isinstance(message, MultiToolMessage):
                 for tm in message.tool_messages:
                     ToolResultStateExtractor.feed(
                         self.task_state, "", tm.content or "")
+                    self._plan_progress_from_tool(tm)
             elif isinstance(message, ToolMessage):
                 # tau2 _wrap_tool_results：单结果是裸 ToolMessage
-                # （ToolMessage 无 name 字段——source_ref 用通用标记）
                 ToolResultStateExtractor.feed(
                     self.task_state, "tool_result", message.content or "")
+                self._plan_progress_from_tool(message)
         except Exception:
             pass  # 状态喂入失败不影响对话流
+
+    # -- V4: Plan 进度由真实 Tool Result 驱动 ------------------------------
+    def _plan_progress_from_tool(self, tm) -> None:
+        """一次工具执行结束 → plan 升级判定 + 步骤完成/失败推进。
+
+        内层工具名解析：tau2 ToolMessage 无 name——用 id 关联本 agent
+        拦截循环记录的 tool_call（id → inner name 映射，确定性）。
+        """
+        try:
+            if self.plan_tracker is None:
+                return
+            inner = self._toolcall_inner_by_id.get(tm.id)
+            if inner is None:
+                return
+            ok = not tm.error
+            upgraded = self.plan_tracker.maybe_upgrade(inner, ok)
+            self.plan_tracker.on_tool_result(inner, ok)
+            if upgraded:
+                goal = self._recent_user_text()
+                if goal:
+                    self.plan_tracker.plan.goal = goal[:200]
+        except Exception:
+            pass
+
+    def _recent_user_text(self) -> str:
+        try:
+            from tau2.data_model.message import UserMessage
+            for m in reversed(getattr(self, "_state_messages_cache", []) or []):
+                if isinstance(m, UserMessage) and m.content:
+                    return m.content
+        except Exception:
+            pass
+        return ""
 
     def _update_kb_constraints(self) -> None:
         """KB 约束 → TaskStateV3（V3 统一事实源）。
@@ -883,13 +929,16 @@ class DecisionAgent(LLMAgent):
             state.messages.extend(message.tool_messages)
         else:
             state.messages.append(message)
+        self._state_messages_cache = list(state.messages)  # V4: goal 回溯用
 
         assistant_message = None
         for _ in range(self.MAX_INTERCEPT_ROUNDS):
             # V1.1: 每次生成前注入最新 memory block——system_prompt property
             # 只在 init 时渲染一次，动态 memory 必须在这里按需拼装。
             # base_prompt 缓存无 memory 版本，memory block 追加其上（不改 state）。
-            full = self._messages_with_memory(state)
+            # V4: Context Builder——非 Plan Mode 走 V3 原路径；
+            # Plan Mode 追加 Goal/Progress 并轻量化已外部化的旧 ToolResult。
+            full = self._build_llm_context(state)
             assistant_message = generate(
                 model=self.llm,
                 tools=self.tools,
@@ -899,7 +948,30 @@ class DecisionAgent(LLMAgent):
             )
             if not (assistant_message.is_tool_call()
                     and (assistant_message.tool_calls or [])):
+                # V4: completion check——准备结束但 plan 还有未完成步骤
+                # → 注入提醒继续（有界 REMIND_LIMIT 次，防死循环）
+                if (self.plan_tracker is not None
+                        and self.plan_tracker.should_remind_continue()):
+                    self.plan_tracker.mark_reminded()
+                    pending = self.plan_tracker.pending_summary()
+                    state.messages.append(assistant_message)
+                    from tau2.data_model.message import SystemMessage as _SM
+                    reminder = _SM(
+                        content=(
+                            "The task may not be complete. Unfinished plan steps: "
+                            f"{pending}. If they are still required by the user, "
+                            "continue executing them now (a step only counts as done "
+                            "after its tool call succeeds). If the user's request has "
+                            "changed or these steps are no longer needed, you may "
+                            "end the task with a final reply."))
+                    state.messages.append(reminder)
+                    continue
                 break  # 纯文本 → 与官方行为一致
+
+            # V4: 解析 assistant 文本中的 [PLAN] 行（Plan Mode 时）
+            if self.plan_tracker is not None:
+                self.plan_tracker.ingest_agent_text(
+                    assistant_message.content or "")
 
             calls = assistant_message.tool_calls or []
             ask_calls = [tc for tc in calls if tc.name == "ask_knowledge_agent"]
@@ -914,6 +986,13 @@ class DecisionAgent(LLMAgent):
                     tool = self._tool_by_name.get(tc.name)
                     if tool is None:
                         continue
+                    # V4: 记录 id → inner 工具名（plan 进度关联用）——
+                    # 先走 resolver 的 inner 名，失败回退外层名
+                    try:
+                        res = self.harness.resolver.resolve(tc)
+                        self._toolcall_inner_by_id[tc.id] = res.tool_name or tc.name
+                    except Exception:
+                        self._toolcall_inner_by_id[tc.id] = tc.name
                     # 临时挂 tool 供 harness 读 schema
                     tc._harness_tool = tool  # noqa: SLF001
                     passed, content, meta = self.harness.process(
@@ -995,6 +1074,18 @@ class DecisionAgent(LLMAgent):
             )
         state.messages.append(assistant_message)
         return assistant_message, state
+
+    def _build_llm_context(self, state):
+        """V4 Context Builder 入口：简单任务 V3 原路径，Plan Mode 升级视图。"""
+        from agents.harness.context_builder import build_context
+        mem_block = self.memory.context_block() if self.memory is not None else ""
+        state_block = self._task_state_block(
+            tool_name=self._recent_biz_tool(state))
+        return build_context(
+            state, task_state=self.task_state,
+            plan_tracker=getattr(self, "plan_tracker", None),
+            memory_block=mem_block, state_block=state_block,
+        )
 
     def _messages_with_memory(self, state):
         """返回 system(含 memory block + V3 task-state slice) + 历史消息。"""

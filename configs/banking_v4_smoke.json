@@ -1,0 +1,58 @@
+{
+  "domain": "banking_knowledge",
+  "description": "V4 smoke: 顽固长任务(Plan Mode 目标) + 简单对照(轻量路径不变差)",
+  "task_ids": [
+    "task_001",
+    "task_004",
+    "task_010",
+    "task_037",
+    "task_020",
+    "task_029",
+    "task_080",
+    "task_088",
+    "task_008",
+    "task_021"
+  ],
+  "tasks_meta": [
+    {
+      "task_id": "task_001",
+      "num_required_documents": 4
+    },
+    {
+      "task_id": "task_004",
+      "num_required_documents": 1
+    },
+    {
+      "task_id": "task_010",
+      "num_required_documents": 2
+    },
+    {
+      "task_id": "task_037",
+      "num_required_documents": 4
+    },
+    {
+      "task_id": "task_020",
+      "num_required_documents": 8
+    },
+    {
+      "task_id": "task_029",
+      "num_required_documents": 10
+    },
+    {
+      "task_id": "task_080",
+      "num_required_documents": 19
+    },
+    {
+      "task_id": "task_088",
+      "num_required_documents": 14
+    },
+    {
+      "task_id": "task_008",
+      "num_required_documents": 6
+    },
+    {
+      "task_id": "task_021",
+      "num_required_documents": 8
+    }
+  ]
+}
