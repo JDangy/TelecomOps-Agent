@@ -1,0 +1,13 @@
+{
+  "domain": "banking_knowledge",
+  "description": "V4 diag: 080 单任务 plan 激活诊断",
+  "task_ids": [
+    "task_080"
+  ],
+  "tasks_meta": [
+    {
+      "task_id": "task_080",
+      "num_required_documents": 19
+    }
+  ]
+}

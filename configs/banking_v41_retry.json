@@ -1,0 +1,28 @@
+{
+  "domain": "banking_knowledge",
+  "description": "V4.1 retry: API 错误打断的 4 任务",
+  "task_ids": [
+    "task_029",
+    "task_037",
+    "task_080",
+    "task_088"
+  ],
+  "tasks_meta": [
+    {
+      "task_id": "task_029",
+      "num_required_documents": 10
+    },
+    {
+      "task_id": "task_037",
+      "num_required_documents": 4
+    },
+    {
+      "task_id": "task_080",
+      "num_required_documents": 19
+    },
+    {
+      "task_id": "task_088",
+      "num_required_documents": 14
+    }
+  ]
+}

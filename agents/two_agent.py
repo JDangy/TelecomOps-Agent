@@ -843,9 +843,6 @@ class DecisionAgent(LLMAgent):
                 return
             inner = self._toolcall_inner_by_id.get(tm.id)
             if inner is None:
-                import sys as _sys
-                print(f"[v4-debug] tool result id={tm.id!r} 未命中映射 "
-                      f"(记录数={len(self._toolcall_inner_by_id)})", file=_sys.stderr)
                 return
             ok = not tm.error
             upgraded = self.plan_tracker.maybe_upgrade(inner, ok)
@@ -854,11 +851,19 @@ class DecisionAgent(LLMAgent):
                 goal = self._recent_user_text()
                 if goal:
                     self.plan_tracker.plan.goal = goal[:200]
-                import sys as _sys
-                print(f"[v4-debug] PLAN MODE 激活 goal={goal[:60]!r}", file=_sys.stderr)
-        except Exception as _exc:
-            import sys as _sys
-            print(f"[v4-debug] _plan_progress_from_tool 异常: {_exc!r}", file=_sys.stderr)
+                # 激活可观测: 进 trace
+                try:
+                    from eval.instrumentation import get_active_recorder
+                    rec = get_active_recorder()
+                    if rec is not None:
+                        rec.emit("plan_mode_activated", "decision_agent",
+                                 parent_span_id=getattr(rec, "task_span_id", None),
+                                 goal=goal[:200] if goal else None,
+                                 trigger_calls=len(self.plan_tracker._inner_tool_calls))
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _recent_user_text(self) -> str:
         try:
