@@ -23,7 +23,7 @@ unset ANTHROPIC_BASE_URL
 import os, sys
 import litellm
 try:
-    r = litellm.completion(model=os.environ.get("HOLDOUT_MODEL", "openai/deepseek-v4-flash"),
+    r = litellm.completion(model="openai/qwen3.8-flash",
         messages=[{"role": "user", "content": "ok"}], max_tokens=3)
     print("API OK")
 except Exception as e:
@@ -39,7 +39,7 @@ fi
 setsid nohup .venv/bin/python run_eval.py \
   --tasks configs/banking_holdout_sealed.json \
   --agent two_agent_harness \
-  --model openai/deepseek-v4-flash \
+  --model openai/qwen3.8-flash \
   --retrieval-config bm25 \
   --tag ${TAG} \
   --seed 42 --max-steps 60 \
