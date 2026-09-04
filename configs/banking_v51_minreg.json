@@ -1,0 +1,28 @@
+{
+  "domain": "banking_knowledge",
+  "description": "V5.1 tool_hint binding 修复最小回归（080 验证 + 020 防退化 + 简单对照）",
+  "task_ids": [
+    "task_001",
+    "task_004",
+    "task_020",
+    "task_080"
+  ],
+  "tasks_meta": [
+    {
+      "task_id": "task_001",
+      "num_required_documents": 4
+    },
+    {
+      "task_id": "task_004",
+      "num_required_documents": 1
+    },
+    {
+      "task_id": "task_020",
+      "num_required_documents": 8
+    },
+    {
+      "task_id": "task_080",
+      "num_required_documents": 19
+    }
+  ]
+}

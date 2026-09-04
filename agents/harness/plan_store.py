@@ -185,6 +185,22 @@ class PlanStore:
                    if s.tool_hint == inner_tool
                    and s.status in (IN_PROGRESS, PENDING)]
         if not matches:
+            # V5.1 无 hint/错 hint 的克制回退（080 实测：DA 写面向对象
+            # 描述无 tool_hint → 计划无法推进）：
+            #   仅【current step 且 in_progress】+ 实体作用域绑定成立
+            #   才推进——满足全部三条才允许，任何歧义保持 pending。
+            #   不回写 hint（中间查询/辅助工具不误绑——见 _scope_bound）
+            cur = self._current_in_progress_step()
+            if cur is not None and cur.tool_hint in (None, "", inner_tool):
+                if self._scope_bound(cur, arguments, task_state):
+                    if ok:
+                        cur.status = COMPLETED
+                        cur.note = None
+                        cur._bound_tool = inner_tool  # 观察记录（不改 hint）
+                    else:
+                        cur.status = FAILED
+                        cur.note = f"tool failed: {inner_tool}"
+                    return cur
             return None
         # 实体绑定过滤
         candidates = []
@@ -208,6 +224,79 @@ class PlanStore:
                     st.note = f"tool failed: {inner_tool}"
                 return st
         return None
+
+    def _current_in_progress_step(self) -> Optional[PlanStep]:
+        """当前聚焦且 in_progress 的步骤（明确焦点——无 hint 回退的前提1）。"""
+        if self._current_step_id is None:
+            return None
+        st = next((s for s in self.steps
+                   if s.step_id == self._current_step_id
+                   and s.status == IN_PROGRESS), None)
+        return st
+
+    def _scope_bound(self, step: PlanStep, arguments: dict,
+                     task_state) -> bool:
+        """实体作用域绑定（无 hint 回退的前提2——不猜原则）。
+
+        规则（全部确定性）：
+        A. step.entities 为空或全是通用对象（customer/user/client）：
+           调用参数须引用 Task State 已确认的用户侧实体（account/card/
+           user ID 之一命中状态库）——"针对已知实体做了一次业务操作"
+           才算该步骤的动作证据。无实体参数的调用（时间查询等辅助
+           工具）不绑定。
+        B. step.entities 含具体对象名：与 Task State 对象做唯一解析
+           （实体名 ↔ 对象后缀，大小写/下划线不敏感；如 "Blue Account"
+           ↔ chk_..._blue），解析恰好 1 个且调用参数命中该对象 ID
+           → 绑定；0 个或 >1 个 → 不绑（不猜）。
+        """
+        if task_state is None:
+            return False
+        ents = [e for e in step.entities if e] or []
+        generic = {"customer", "user", "client", "the customer", "the user"}
+        specific = [e for e in ents if e.strip().lower() not in generic]
+        vals = [str(v) for v in (arguments or {}).values()
+                if v is not None and not isinstance(v, (dict, list))]
+        if not specific:
+            # A: 通用/无实体 → 参数须命中已确认实体 ID
+            try:
+                known = set()
+                for key, chain in getattr(task_state, "_entries", {}).items():
+                    cur = chain[-1]
+                    if cur and cur.is_current and cur.field in (
+                            "id", "account_id", "card_id", "user_id",
+                            "credit_card_account_id"):
+                        known.add(str(cur.value))
+                return any(v in known for v in vals)
+            except Exception:
+                return False
+        # B: 具体实体名 → Task State 对象唯一解析
+        try:
+            entries = getattr(task_state, "_entries", {})
+            for ent in specific:
+                    ent_l = ent.lower().replace(" ", "_")
+                    toks = [t for t in re.split(r"[_]", ent_l) if t]
+                    # 类型词约束: 实体名含 account/card 时只匹配同类型对象
+                    # ("Blue Account" 不匹配 card_dbc_blue——类型消歧)
+                    type_toks = {t for t in toks if t in ("account", "card")}
+                    name_toks = {t for t in toks if len(t) > 2 and t not in type_toks}
+                    target_ids = set()
+                    for key, chain in entries.items():
+                        cur = chain[-1]
+                        if not cur or not cur.is_current:
+                            continue
+                        if cur.field in ("id", "account_id", "card_id"):
+                            obj_toks = set(re.split(r"[_]", cur.object.lower()))
+                            if type_toks and not any(t in obj_toks for t in type_toks):
+                                continue
+                            if name_toks and not any(t in obj_toks for t in name_toks):
+                                continue
+                            if type_toks or name_toks:
+                                target_ids.add(str(cur.value))
+                    if len(target_ids) == 1 and any(v in target_ids for v in vals):
+                        return True
+        except Exception:
+            return False
+        return False
 
     @staticmethod
     def _args_reference_entity(arguments: dict, entities: list,

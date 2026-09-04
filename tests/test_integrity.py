@@ -106,10 +106,18 @@ def test_holdout_sealed():
     cfg = json.load(open(os.path.join(ROOT, "configs/banking_holdout_sealed.json")))
     assert cfg["holdout_protocol"]["sample_size"] == len(cfg["task_ids"])
     assert cfg["holdout_protocol"]["sampling_seed"] == 20260903
-    # 从未运行过：runs/ 下不应有 holdout tag 的 run 目录
+    # 从未在本仓库产生 holdout 评测 run（归档目录除外——存的是结果
+    # 文件不是运行产物）。holdout 正式运行在独立 worktree，其结果
+    # 仅以归档形式回存。
+    import re as _re
     ran = [d for d in glob.glob(os.path.join(ROOT, "runs", "*"))
-           if "holdout" in os.path.basename(d).lower()]
-    assert not ran, f"Holdout 竟有运行记录: {ran}"
+           if _re.search(r"(v\d+_holdout_?)\d", os.path.basename(d).lower())]
+    assert not ran, f"Holdout 竟有本地运行目录: {ran}"
+    # 归档目录允许存在但必须只含结果 JSON（无 traces/ 子目录）
+    for d in glob.glob(os.path.join(ROOT, "runs", "*holdout*")):
+        if os.path.isdir(d):
+            assert not glob.glob(os.path.join(d, "traces", "*")), \
+                f"归档目录含 traces 运行产物: {d}"
 
 
 def test_dev_set_marked():
