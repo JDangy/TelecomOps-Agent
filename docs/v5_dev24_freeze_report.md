@@ -52,6 +52,12 @@ V0/V1.2/V3/V4 全败）。
 - 026/077 等深顽任务仍败（业务判断层，非执行结构层）
 - 3 个 max_steps（020/029 某些轮次在 plan 下依然规划不足）
 
+## 评测口径（2026-09-04 起固定）
+
+- **评测模型固定: openai/qwen3.8-flash**（winterapi）——所有 Dev / Holdout /
+  smoke / diag 评测统一使用，不再切换其他模型（V4/V5 Dev 与 Holdout
+  均为 qwen3.8-flash，跨版本直接可比）。
+
 ## Freeze 快照
 
 - commit: 3aa2918（V5.1 修复后）
