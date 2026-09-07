@@ -1112,11 +1112,8 @@ class DecisionAgent(LLMAgent):
                     continue
                 break  # 纯文本 → 与官方行为一致
 
-            # V4: 解析 assistant 文本中的 [PLAN] 行（Plan Mode 时）
-            if self.plan_tracker is not None:
-                self.plan_tracker.ingest_agent_text(
-                    assistant_message.content or "")
-
+            # Step 0 清理：V5 不再解析 [PLAN] 文本（plan_tracker 为 telemetry，
+            # Plan 只由 write_plan/update_plan 工具落 PlanStore）
             calls = assistant_message.tool_calls or []
             PLAN_TOOL_NAMES = {"write_plan", "update_plan", "read_plan"}
             ask_calls = [tc for tc in calls if tc.name == "ask_knowledge_agent"]
@@ -1253,9 +1250,11 @@ class DecisionAgent(LLMAgent):
         except Exception:
             v5_plan_block = ""
         combined_mem = v5_plan_block + ("\n\n" + mem_block if (v5_plan_block and mem_block) else mem_block)
+        # Step 0 清理：plan_active 仅表示"存在 V5 结构化 Plan"（决定历史
+        # 轻量化）；plan_tracker 已从 context 移除（纯 telemetry）
         return build_context(
             state, task_state=self.task_state,
-            plan_tracker=getattr(self, "plan_tracker", None),
+            plan_active=bool(v5_plan_block),
             memory_block=combined_mem, state_block=state_block,
         )
 

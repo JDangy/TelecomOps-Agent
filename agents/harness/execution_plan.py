@@ -1,6 +1,15 @@
-"""Execution Plan（V4）—— Adaptive Long-Horizon Execution 的持久计划。
+"""Execution Observation / Telemetry（V4 遗留；Step 0 清理后职责降级）。
 
-设计（对照验收 13 问的 2/3/4/5）：
+**职责（2026 Step 0 定稿）**：V4 的 PlanTracker 不再是"Plan"——V5 的
+PlanStore（plan_store.py）是唯一真正表示"未来还要做什么"的 Plan。
+PlanTracker 仅保留两类 execution observation / telemetry 用途：
+  1. 长任务升级信号（确定性计数 → 触发 V5 入口 B 的 fallback 提示）
+  2. 工具行为统计（_tool_stats / _inner_tool_calls，供 trace/诊断）
+其 progress_block() / pending_summary() 不再注入 DA context
+（context_builder 已移除注入；Plan 只由 PlanStore.plan_block() 提供）。
+[PLAN] 文本解析（ingest_agent_text）在 V5 已停用（遵守率 0 的实验结论）。
+
+设计（历史）：
 
 升级信号（确定性，零 LLM——从 v3_official24 实测分布标定）：
   成功任务 0-12 inner calls / 0-4 repeats；顽固任务 15-27 calls / 7-9
