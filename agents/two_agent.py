@@ -218,6 +218,10 @@ STRICT RULES:
 """
 
 KNOWLEDGE_AGENT_MAX_ROUNDS = 6  # 防失控：一次 handoff 内最多 6 轮（检索+推理）
+KNOWLEDGE_AGENT_MAX_RETRIEVALS = 8  # Step 2B：单次 handoff 内 KB_search 调用预算——
+                                     # 宽泛问题每轮可发起多个检索（063 曾 12 次/handoff），
+                                     # 超预算强制收尾（有足够事实就出 packet，缺的进
+                                     # missing_information）
 
 
 class KnowledgeAgent:
@@ -313,6 +317,7 @@ class KnowledgeAgent:
         messages: List[Message] = [system, user_msg]
 
         forced_stop = False
+        self._retrieval_budget_used = 0  # Step 2B: 本次 handoff 检索预算
         for _round in range(KNOWLEDGE_AGENT_MAX_ROUNDS):
             # 停止条件：连续 LOW_PROGRESS_LIMIT 次检索无新信息 → 强制收尾
             if (self.memory is not None and not forced_stop
@@ -339,6 +344,19 @@ class KnowledgeAgent:
                 break  # 最终 packet 已产出
             # 执行它调用的每个知识工具（BM25 本地检索，微秒级）
             for tc in assistant.tool_calls:
+                # Step 2B: 检索预算——宽泛问题一轮可多个检索，超限强制收尾
+                if str(getattr(tc, "name", "")).startswith("KB_search"):
+                    self._retrieval_budget_used += 1
+                    if self._retrieval_budget_used > KNOWLEDGE_AGENT_MAX_RETRIEVALS:
+                        messages.append(UserMessage(
+                            role="user",
+                            content=("Search budget for this question is exhausted. "
+                                     "Stop searching and return your evidence packet "
+                                     "JSON now with what you have; put unanswered parts "
+                                     "in missing_information."),
+                        ))
+                        forced_stop = True
+                        break
                 result = self._run_tool(tc)
                 messages.append(result)
                 # memory 记录 query + docs；progress 检测（确定性，无 LLM）
@@ -966,6 +984,58 @@ class DecisionAgent(LLMAgent):
         except Exception:
             pass
 
+    def _query_reuse_hint(self, biz_calls, rejected) -> str:
+        """检测"查询类调用引用了 Task State 已有实体"→ 轻量复用提示。
+
+        规则（能确认已有→提示；不能确认→不打扰）：
+        1. 只对 get_/list_/check_ 查询工具
+        2. 参数中的 ID 值（account_id/card_id/user_id）在 Task State 的
+           实体对象中存在（即之前查询/操作已把该实体信息入状态）
+        3. 返回提示文本（注入一次），否则返回 ""
+        """
+        if self.task_state is None or not biz_calls:
+            return ""
+        try:
+            from agents.harness.task_state_v3 import TaskStateV3
+            known_ids = set()
+            for key, chain in getattr(self.task_state, "_entries", {}).items():
+                cur = chain[-1]
+                if cur and cur.is_current and cur.field in (
+                        "id", "account_id", "card_id", "user_id",
+                        "credit_card_account_id"):
+                    known_ids.add(str(cur.value))
+            if not known_ids:
+                return ""
+            hint_fields = []
+            for tc in biz_calls:
+                if tc.id in rejected:
+                    continue
+                name = tc.name
+                if not (name.startswith("get_") or name.startswith("list_")
+                        or name.startswith("check_")):
+                    continue
+                args = self._toolcall_args_by_id.get(tc.id) or {}
+                for k, v in args.items():
+                    if isinstance(v, str) and v in known_ids and len(v) >= 4:
+                        # 查该实体在状态里有哪些字段
+                        fields = [key.split(".")[-1] for key, chain in
+                                  getattr(self.task_state, "_entries", {}).items()
+                                  if chain and chain[-1].is_current
+                                  and str(chain[-1].value) == v
+                                  and key.split(".")[-1] not in ("id",)]
+                        if fields:
+                            hint_fields.append(f"{k}={v} (state has: {', '.join(fields[:4])})")
+                            break  # 每条 call 只提示一次
+            if not hint_fields:
+                return ""
+            return (
+                "Note: the following entity info is already in your task state — "
+                "reuse it instead of re-querying unless you need fresh values: "
+                + "; ".join(hint_fields[:3])
+                + ". (You may still call the tool if the values may have changed.)")
+        except Exception:
+            return ""
+
     def _recent_user_text(self) -> str:
         try:
             from tau2.data_model.message import UserMessage
@@ -1210,6 +1280,18 @@ class DecisionAgent(LLMAgent):
                     content=consistency_note + " Do not change your business logic "
                     "based on this note alone; it only asks you to keep the plan "
                     "reflecting reality."))
+                continue
+
+            # ---- V5 Step 2A: 查询复用提示（有状态不用 → 提醒复用）----
+            # 查询类 biz call（get_*）若参数引用的实体信息已在 Task State，
+            # 注入轻量提示（非硬拦——仍执行，但让 DA 知道可复用）。
+            # 能确认已有→提示复用；不能确认→正常查询不打扰。
+            reuse_note = self._query_reuse_hint(biz_calls, rejected)
+            if reuse_note:
+                state.messages.append(assistant_message)
+                from tau2.data_model.message import SystemMessage as _SM4
+                state.messages.append(_SM4(
+                    role="system", content=reuse_note))
                 continue
 
             if not ask_calls and not rejected:
