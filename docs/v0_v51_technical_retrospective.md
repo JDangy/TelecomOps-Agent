@@ -69,15 +69,16 @@
 - **假设**：给 DA 三个 planning tool（write_plan/update_plan/read_plan）落 runtime state；步骤完成由**真实 tool result + 实体绑定**驱动（多对象同工具不误完成）；条件 replanning（blocker/add_step/remove_step）；completion guard 用真 pending。
 - **实际**：
   - **Dev24（qwen3.8）：9/24 = 37.5%**，V3→V5 +4 翻转（002/007 恢复 + 021/024 顽固首次攻克），零回退。
-  - **Holdout（qwen3.8）：8/22 = 36.4%** vs V4 4/22——+5 翻上/1 回落，**Dev 与 Holdout 同量级（9/24≈8/22），提升泛化而非 Dev 过拟合**。
+  - **Holdout（qwen3.8）：8/22 = 36.4%** vs **Frozen V4 4/22（同样 qwen3.8）**——+5 翻上/1 回落，**同模型公平对比（V4/V5 holdout 均 qwen3.8-flash），+4 全部归因于 V5 机制，无模型红利**。Dev 与 Holdout 同量级（9/24≈8/22），提升泛化而非 Dev 过拟合。
   - V5.1 修复 080 的 tool_hint 绑定（steps_done 0→4）。
 - **已证明**：结构化计划 + 真实执行推进 + guard，确实让长任务执行更有结构（021/024/031/047/052/063/089 首次成功）。
-- **未证明（诚实）**：reward 提升**部分来自 planning，部分来自 LLM 路径选择**（024/063 无 plan 也成功；038 V5 回落是 transfer_to_human 路径差异）。Dev24 9/24 有 +2 是 qwen3.8 相对 deepseek 的模型红利（002/007 在 V3-deepseek 败、V5-qwen 成）。
+- **未证明（诚实）**：①Dev24 的 V3→V5 对比混模型（V3=deepseek → V5=qwen3.8），其中 +2（002/007）是 qwen3.8 相对 deepseek 的模型红利，不能计入 V5 机制；②但 **Holdout 的 V4→V5 对比同模型（均 qwen3.8），+4 为纯机制红利**——这是 V5 机制提升的最干净证据；③仍有个别任务的成功路径是 LLM 随机选择（024/063 无 plan 也成功；038 V5 回落是 transfer_to_human 路径差异）。
 
 ### 模型口径（重要归因前提）
 - V0/V1.2/V3 official = **deepseek-v4-flash**；V4.1 后 = **qwen3.8-flash**。
 - **V0 8/24（deepseek）vs V3 5/24（deepseek）是模型同的公平对比**——V3 架构在 success 上**不如 V0**，但在质量指标（0 误拦/loop、tools 600→251）占优。2-agent + harness + state 的收益在 success 上为负/中性。
-- V5 9/24（qwen）vs V3 5/24（deepseek）**混入了模型变化**，不能完全归因于 V5 机制。
+- V5 Dev 9/24（qwen）vs V3 Dev 5/24（deepseek）**混入了模型变化**，不能完全归因于 V5 机制。
+- **V4/V5 Holdout 均为 qwen3.8-flash（同模型）**——4/22 → 8/22 的对比完全干净，+4 全部归因于 V5 机制；这是 V5 价值的最强证据。
 
 ---
 
@@ -142,10 +143,10 @@ _build_llm_context (two_agent.py:1240)
 - 计划被真实保存并可被工具结果推进（V5.1 实体绑定后 080 steps_done 0→4；021/031/047/052/089 均有 plan+steps_done+remove_step 证据）。
 - 条件 replanning 真实发生且带业务原因（088: block→add→unblock→remove；089: add+remove）。
 - completion guard 有界不产生死循环，且正确响应（DA 收到提醒后 set_current 继续或 remove_step 收敛）。
-- Dev 与 Holdout 同量级提升 → **非 Dev 过拟合**（但含模型红利，见一）。
+- Holdout 上 V4→V5 同模型（均 qwen3.8）提升 +4/22 → **纯机制红利，V5 最干净证据**；Dev 上 V3→V5 混模型（deepseek→qwen），其同量级提升不能全部归因机制（见一）。
 
 **未证明（证据不足）**：
-- **Planning 本身对 success 的因果贡献**：024/063 无 plan 也成功（LLM 路径 lucky）；V5 的 +4 中有 2 个（002/007）可能是模型红利。缺乏"同模型下 plan vs 无 plan"的 A/B。
+- **Planning 本身对 success 的因果贡献**（Dev 侧）：024/063 无 plan 也成功（LLM 路径 lucky）；Dev24 的 +2（002/007）可能是模型红利。**注意：Holdout 的 V4→V5 对比同模型、+4 纯机制，是 planning 有效性的强证据；但"同模型下 plan vs 无 plan"的细分 A/B 仍缺。**
 - **Plan 能显著降低重复**：080/077 在 plan 激活下仍 10+ 次 unlock/8 次 query——plan 没减少重复。
 - **Plan 对策略漂移的韧性**：080 证明 plan 在策略变化时**没有**被可靠维护。
 - **完成判定的可靠性**：092 证明"tool 证据完成"与"evaluator 完成"仍可能不一致。
