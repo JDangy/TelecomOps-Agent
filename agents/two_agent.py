@@ -1184,6 +1184,34 @@ class DecisionAgent(LLMAgent):
                     if hasattr(tc, "_harness_tool"):
                         del tc._harness_tool
 
+            # ---- V5 Step 1: Plan–Execution Consistency 检查 ----
+            # 只对"通过校验、将真实执行"的 mutation 业务调用检查；查询工具
+            # 不计入偏离。触发提醒 → 注入 system 消息并重新生成（DA 自选
+            # 继续当前计划或 update_plan 写回新路线——不替 DA 决策）。
+            consistency_note = None
+            if (self.plan_store is not None and self.plan_store.active
+                    and biz_calls and not rejected):
+                for tc in biz_calls:
+                    if tc.id in rejected:
+                        continue
+                    inner = self._toolcall_inner_by_id.get(tc.id)
+                    args = self._toolcall_args_by_id.get(tc.id) or {}
+                    if inner:
+                        note = self.plan_store.consistency_check(
+                            inner, args, task_state=self.task_state)
+                        if note:
+                            consistency_note = note
+                            break
+            if consistency_note:
+                state.messages.append(assistant_message)
+                from tau2.data_model.message import SystemMessage as _SM3
+                state.messages.append(_SM3(
+                    role="system",
+                    content=consistency_note + " Do not change your business logic "
+                    "based on this note alone; it only asks you to keep the plan "
+                    "reflecting reality."))
+                continue
+
             if not ask_calls and not rejected:
                 # 全部通过（或纯业务工具）→ 原样交给 orchestrator（V1.2 路径）
                 break
