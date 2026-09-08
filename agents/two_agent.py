@@ -1011,7 +1011,9 @@ class DecisionAgent(LLMAgent):
             for tc in biz_calls:
                 if tc.id in rejected:
                     continue
-                name = tc.name
+                # wrapper 穿透：用 inner 工具名判断查询类（外层是
+                # call_discoverable_agent_tool）
+                name = self._toolcall_inner_by_id.get(tc.id) or tc.name
                 if not (name.startswith("get_") or name.startswith("list_")
                         or name.startswith("check_")):
                     continue
