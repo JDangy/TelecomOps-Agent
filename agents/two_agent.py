@@ -1024,7 +1024,7 @@ class DecisionAgent(LLMAgent):
                                   if chain and chain[-1].is_current
                                   and str(chain[-1].value) == v
                                   and key.split(".")[-1] not in ("id",)]
-                        if fields and not name.endswith(("_history", "_transactions")):
+                        if fields and not any(s in name for s in ("_history", "_transactions")):
                             hint_fields.append(f"{k}={v} (state has: {', '.join(fields[:4])})")
                             break
                 # 信号2: 同一查询工具+同一参数组合已执行 >=3 次（077 的 history/
