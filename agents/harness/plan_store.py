@@ -97,6 +97,7 @@ class PlanStore:
         self._off_plan_streak = 0
         self._off_plan_stall_mutations = 0
         self._off_plan_reminded = False
+        self.coverage_reminded = False  # Step 3: goal coverage 只提醒一次
 
     # ------------------------------------------------------------------
     # planning tool 的后端（DA 调用 → 这里确定性执行）
@@ -112,6 +113,7 @@ class PlanStore:
         self.steps = []
         self._current_step_id = None
         self.reset_consistency()
+        self.coverage_reminded = False
         for s in steps or []:
             if not isinstance(s, dict) or not s.get("description"):
                 continue
@@ -428,6 +430,46 @@ class PlanStore:
         self._off_plan_streak = 0
         self._off_plan_stall_mutations = 0
         self._off_plan_reminded = False
+
+    # ------------------------------------------------------------------
+    # Goal Coverage（Step 3）：用户目标中的实体覆盖检查
+    # ------------------------------------------------------------------
+    def coverage_check(self, declared_targets: dict,
+                       task_state=None) -> Optional[str]:
+        """DA 准备结束时：用户明确声明了 N 个实体，但只处理了部分。
+
+        仅依据 User Goal（数量词提取）+ Plan/Task State（已处理实体），
+        不读 evaluator/gold。返回提醒文本或 None。
+
+        declared_targets: {"entity_word": "cards", "count": 4, "source": "user msg"}
+        """
+        if not declared_targets or declared_targets.get("count", 0) < 2:
+            return None
+        if self.coverage_reminded:
+            return None
+        count = int(declared_targets["count"])
+        entity = declared_targets.get("entity_word", "items")
+        # 已处理实体数：Task State 里被操作过的实体对象数（保守——
+        # 只看 plan 里 completed 步骤涉及的实体数）
+        handled = 0
+        try:
+            completed_entities = set()
+            for s in self.steps:
+                if s.status == COMPLETED:
+                    for e in s.entities:
+                        completed_entities.add(e)
+            handled = len(completed_entities)
+        except Exception:
+            handled = 0
+        if handled >= count:
+            return None
+        missing = count - handled
+        self.coverage_reminded = True
+        return (f"Goal coverage check: you stated there are {count} {entity} to "
+                f"handle, but only {handled} appear covered by completed plan steps. "
+                f"{missing} may still be unhandled. If they are still required, "
+                "continue; otherwise call update_plan to mark/remove them explicitly "
+                "before finishing.")
 
     def plan_block(self, max_chars: int = 800) -> str:
         """渲染注入 DA context 的计划块（围绕 current step——第 11 节）。"""

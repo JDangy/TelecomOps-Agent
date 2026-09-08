@@ -1050,6 +1050,43 @@ class DecisionAgent(LLMAgent):
         except Exception:
             return ""
 
+    def _extract_goal_targets(self) -> dict:
+        """从用户目标消息提取"明确数量词+实体"（确定性，无 LLM）。
+
+        匹配模式："N cards" / "two accounts" / "four debit cards" 等。
+        只在明确数量词（>=2）时返回；否则空（不猜）。
+        """
+        import re as _re
+        try:
+            txt = self._recent_user_text() or ""
+            m = _re.search(
+                r"\b(two|three|four|five|six|seven|eight|nine|ten|\d+)\s+"
+                r"((?:[a-z]+\s?){1,4}?[a-z]+s)\b", txt, _re.IGNORECASE)
+            if not m:
+                return {}
+            num_map = {"two": 2, "three": 3, "four": 4, "five": 5,
+                       "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+            num_txt = m.group(1).lower()
+            count = int(num_txt) if num_txt.isdigit() else num_map.get(num_txt, 0)
+            if count < 2:
+                return {}
+            # 实体词取匹配串的最后一个名词（"four debit cards" → cards），
+            # 支持 "debit card"/"credit card" 复合
+            phrase = m.group(2).strip().lower()
+            phrase_s = phrase.rstrip("s") if phrase.endswith("s") else phrase
+            if phrase_s.endswith(("debit card", "credit card", "checking account",
+                                  "savings account")):
+                entity = "card" if "card" in phrase else "account"
+            else:
+                words = phrase.split()
+                entity = words[-1].rstrip("s") if words else ""
+            if entity not in ("card", "account", "transaction"):
+                return {}
+            return {"entity_word": entity, "count": count,
+                    "source": "user message"}
+        except Exception:
+            return {}
+
     def _recent_user_text(self) -> str:
         try:
             from tau2.data_model.message import UserMessage
@@ -1194,6 +1231,35 @@ class DecisionAgent(LLMAgent):
                     guarded = False
                 if guarded:
                     continue
+                # ---- V5 Step 3: Goal Coverage（guard 不触发时的第二道检查）----
+                # 用户目标明确声明了 N 个实体（"four cards"），但 completed
+                # plan 步骤覆盖不足 → 提醒一次。仅依据 User Goal + Plan/Task
+                # State，不读 evaluator/gold。
+                try:
+                    if (self.plan_store.active
+                            and not self.plan_store.guard_should_remind()):
+                        declared = self._extract_goal_targets()
+                        if declared:
+                            cov_note = self.plan_store.coverage_check(
+                                declared, task_state=self.task_state)
+                            if cov_note:
+                                state.messages.append(assistant_message)
+                                from tau2.data_model.message import SystemMessage as _SM5
+                                state.messages.append(_SM5(
+                                    role="system", content=cov_note))
+                                try:
+                                    from eval.instrumentation import get_active_recorder
+                                    rec = get_active_recorder()
+                                    if rec is not None:
+                                        rec.emit("plan_goal_coverage", "decision_agent",
+                                                 parent_span_id=getattr(rec, "task_span_id", None),
+                                                 declared=str(declared)[:200],
+                                                 note=cov_note[:200])
+                                except Exception:
+                                    pass
+                                continue
+                except Exception:
+                    pass
                 break  # 纯文本 → 与官方行为一致
 
             # Step 0 清理：V5 不再解析 [PLAN] 文本（plan_tracker 为 telemetry，
