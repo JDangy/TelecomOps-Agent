@@ -1306,6 +1306,16 @@ class DecisionAgent(LLMAgent):
                 from tau2.data_model.message import SystemMessage as _SM4
                 state.messages.append(_SM4(
                     role="system", content=reuse_note))
+                # trace 事件（与 plan 事件同风格——观测触发）
+                try:
+                    from eval.instrumentation import get_active_recorder
+                    rec = get_active_recorder()
+                    if rec is not None:
+                        rec.emit("state_reuse_hint", "decision_agent",
+                                 parent_span_id=getattr(rec, "task_span_id", None),
+                                 note=reuse_note[:200])
+                except Exception:
+                    pass
                 continue
 
             if not ask_calls and not rejected:
