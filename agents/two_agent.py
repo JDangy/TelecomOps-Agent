@@ -832,6 +832,7 @@ class DecisionAgent(LLMAgent):
         from agents.harness.plan_store import PlanStore
         self.plan_store = PlanStore()
         self._planning_prompted = False             # runtime fallback 只提示一次
+        self._query_history: dict = {}              # Step 2A: (tool,args) → 次数
         self._planning_fallback_pending = False     # 下一轮注入提示
 
     # -- V2.2: TaskState 三源喂入 ------------------------------------------------
@@ -1015,17 +1016,28 @@ class DecisionAgent(LLMAgent):
                         or name.startswith("check_")):
                     continue
                 args = self._toolcall_args_by_id.get(tc.id) or {}
+                # 信号1: 参数引用已知实体且该实体状态有非 id 字段（结果可复用）
                 for k, v in args.items():
                     if isinstance(v, str) and v in known_ids and len(v) >= 4:
-                        # 查该实体在状态里有哪些字段
                         fields = [key.split(".")[-1] for key, chain in
                                   getattr(self.task_state, "_entries", {}).items()
                                   if chain and chain[-1].is_current
                                   and str(chain[-1].value) == v
                                   and key.split(".")[-1] not in ("id",)]
-                        if fields:
+                        if fields and not name.endswith(("_history", "_transactions")):
                             hint_fields.append(f"{k}={v} (state has: {', '.join(fields[:4])})")
-                            break  # 每条 call 只提示一次
+                            break
+                # 信号2: 同一查询工具+同一参数组合已执行 >=3 次（077 的 history/
+                # transactions 重复——无字段级结果可复用，但重复执行是浪费）
+                sig = (name, tuple(sorted((str(x) for x in args.values() if x))))
+                if sig in self._query_history:
+                    self._query_history[sig] += 1
+                else:
+                    self._query_history[sig] = 1
+                if self._query_history[sig] >= 3 and not hint_fields:
+                    hint_fields.append(
+                        f"repeated query: {name} with same args "
+                        f"({self._query_history[sig]}x this turn-cycle) — reuse prior result")
             if not hint_fields:
                 return ""
             return (
