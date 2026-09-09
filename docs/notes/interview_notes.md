@@ -1,256 +1,315 @@
-# TelecomOps-Agent 项目笔记（面经版）
+# TelecomOps-Agent 项目笔记（面经版，V5 收口定稿）
 
 > 给自己看的：项目怎么一步步建起来、踩了什么坑、怎么解决的。
 > 面试时按这套问答讲。所有数字都是真实测出来的，不是编的。
+> **当前状态：Frozen V5（commit 3aa2918）是最终 Runtime，项目已收口。**
 
 ---
 
 ## 一、30 秒介绍这个项目（先背熟）
 
-> 我做了一个**评估驱动的客服 Agent 基准测试框架**，基于 tau2-bench（τ³-bench），
-> 支持 telecom（电信）和 banking（银行 RAG）两个领域。核心思路是"先固定评测尺
-> 度，再做 Agent 改进"：冻结 24 个任务的分层抽样 dev set、固定 seed/检索配置/
-> 模型，先测出 V0 基线，然后每次改进都在同一把尺子上量。V1 阶段我把它升级成
-> 了 2-Agent 架构（决策 Agent + 知识 Agent，上下文隔离），用 24 任务对比实验验
-> 证了"上下文隔离能省 13% token 但不自动提升成功率"这个结论。
+> 我做了一个**评估驱动的 Agent Runtime 项目**，基于 tau2-bench（τ³-bench）的
+> banking 域——银行客服场景，97 个任务、698 篇政策文档、44 个工具，Agent 要
+> 同时做知识检索、身份核验、多步业务操作。我的方法论是"**先造尺子再造
+> Agent**"：冻结分层抽样的 24-task dev set + 独立 sealed 22-task holdout set、
+> 固定 seed/检索/模型协议，然后每一版只加一个机制假设，用事件级 trace
+> （Trace v2）归因每次变化。
+> Runtime 从 V0 单 Agent 逐步演进：2-Agent 上下文隔离 → selective memory →
+> **deterministic action harness**（三源校验、有明确依据才拦）→ **structured
+> task state**（对象级、supersede、provenance）→ context management →
+> **structured planning & replanning**（runtime PlanStore、tool-result 实体绑定
+> 推进）。最终 V5 在同模型 holdout 上把 V4 的 4/22 提到 8/22（+4，纯机制红利），
+> Dev 9/24 历史新高。过程中一堆负结果——全量 memory 注入、evidence 值信任、
+> 文本 plan 协议、post-V5 的复用提示——每一个都被诚实记录、归因并回退。
 
-**一句话版**：先造尺子，再造 Agent；每次改动都量着来。
+**一句话版**：先造尺子，再造 Agent；每步改动量着来；证伪和成功一样认真。
 
----
-
-## 二、项目时间线（怎么长出来的）
-
-```
-V0: 跑通评测        ──> 固定尺子        ──> 修 bug
-    telecom 90%         24-task 分层集      5 个 bug 修复
-    banking 5-task      两次 run 取平均     指标语义修正
-                        (27.1%)
-
-Phase 1: 装仪表        ──> 三层插桩 + Trace v2
-    只观察不干预           LLM/检索/任务生命周期
-    5-task 对比验证        全事件溯源
-    行为不变 ✅
-
-V1: 2-Agent 架构       ──> 24-task 对比实验
-    Decision + Knowledge    token -13.3%
-    Evidence Packet         recall 84.2%
-    context 隔离            success 33.3%→20.8%
-```
-
-16 个 commit，2700+ 行 Python，全部推进 GitHub。
+**两个必须能脱口而出的数字**：
+- Frozen V5：**Dev 9/24（37.5%）、Holdout 8/22（36.4%）**；
+- **同模型 holdout 对比：V4 4/22 → V5 8/22（+4）**——最干净的机制证据。
 
 ---
 
-## 三、面经问答
+## 二、2 分钟完整介绍（演进逻辑：评测 → context → harness → state → planning → holdout）
+
+**先讲为什么这么做**（30 秒）：tau2-bench 的 banking 域同时考知识检索和长程
+工具编排，单 Agent 基线 8/24，失败集中在长序列和参数错误。但 LLM 有 ±8pp 的
+run-to-run 波动，所以我第一件事不是优化 Agent，而是把尺子做硬：分层抽样
+24-task dev（按 required_documents 难度 3/7/14）+ seed=42 + BM25 + 固定模型，
+另抽 22-task sealed holdout，开发期间零接触。
+
+**然后按层讲演进**（60 秒）：
+1. **Context 层（V1）**：2-Agent（Decision + Knowledge）物理隔离，KA 只回
+   Evidence Packet。全量 memory 注入是负结果（KA tokens +72%），改成按需
+   selective 检索后 KA tokens -74%。
+2. **执行层（V2）**：参数值错误在执行前可确定性拦截——Action Harness 三源
+   校验（tool schema / task state / KB 约束），原则"有明确依据才拦"。中间
+   走过弯路：想用 KA 的 grounded values 校验每个参数，被证伪——KB 只有
+   合法域没有 case-specific 正确值。
+3. **状态层（V3）**：金额误绑的根因是参数级裸键——改成对象级
+   `object.field=value[source]`，supersede 保留历史，实体解析。095 类多对象
+   任务首次成功。
+4. **上下文管理（V4）**：长任务旧 ToolResult 存根化。V4 也证明了文本
+   `[PLAN]` 协议遵守率为 0——计划不能靠 prompt 约定。
+5. **规划层（V5）**：planning tools 落 runtime PlanStore；步骤完成由真实
+   tool result + 实体绑定驱动（多对象同工具不误完成）；条件 replanning；
+   bounded completion guard。
+6. **Holdout 验证（收口）**：V4 和 V5 在同一 holdout 上同模型对比——
+   4/22 → 8/22，5 个 V4 全败任务首次翻上，Dev/Holdout 同量级证明不是过拟合。
+
+**最后收尾**（30 秒）：freeze 之后我又做了一轮 post-V5 实验（一致性提醒/
+状态复用提示/检索预算/覆盖检查），targeted smoke 看着都不错（tools -41%），
+但全量 Dev 9/24→5/24，逐 trace 归因发现 4 个回退有明确机制因果链——
+整体 rollback，保守冻结 V5。这个"最后一课"也进文档。
+
+---
+
+## 三、面经问答（V5 完整版）
 
 ### Q1：为什么先做评测框架，不先做 Agent？
 
-**答**：因为我一开始就发现，不固定评测尺度，任何"改进"都无法证明。
-我实测过同一个 seed 跑两次 24 任务，成功率 25% 和 29.2%——LLM 随机性天然
-就有 ±8 个百分点的波动。如果不固定任务集、不取平均，"我从 80% 优化到
-85%"这种话就是自欺欺人。
+**答**：因为不固定评测尺度，任何"改进"都无法证明。我实测同一 seed 跑两次
+24 任务，成功率 25% 和 29.2%——LLM 天然有 ±8pp 波动。所以我反过来：
+1. **冻结 dev set**：按 required_documents 分层抽样 24 个（3 简单/7 中等/
+   14 困难），写进配置永不改动；另抽 22-task sealed holdout，开发期间零接触
+2. **固定协议**：seed=42、BM25、固定模型、max_steps=60
+3. **事件级 trace（Trace v2）**：每个动作一条事件（seq/span/event_type/
+   actor），能重建执行树、做 token 成本核算——后来所有失败归因都靠它
 
-所以我反过来做：
-1. **冻结 dev set**：从 97 个任务里按 required_documents 数量分层抽样出 24
-   个（简单 3 / 中等 7 / 困难 14），写进配置文件永不改动
-2. **固定协议**：seed=42、BM25、同一模型、同一 user simulator
-3. **取平均**：正式基线跑两次完整 run 取平均（27.1%）
-
-做完这一步，后面每次改动都有可比性。这是整个项目最重要的决定。
+做完这一步，每次改动都有可比性。**后来 post-V5 实验 9/24→5/24 的逐 task
+归因（哪些是机制回退、哪些是 variance）也是直接翻 trace 翻出来的。**
 
 ---
 
 ### Q2：分层抽样怎么做的？为什么不随机抽？
 
-**答**：banking 任务有个天然难度维度——每个任务标注了 `required_documents`
-（完成任务需要参考的文档数，1~30 篇不等）。我先按这个数量分层（1-4 篇简单、
-5-9 中等、10+ 困难），再按比例抽样。随机抽的问题：我实测旧 5-task 集（随机
-抽的）成功率 80%，24-task 分层集只有 25~33%——**随机集偏简单，测出来的基线
-严重虚高**。分层后按难度分桶看成功率：1-4 篇 67%、5-9 篇 21%、10-14 篇
-10%、15+ 篇 0%——难度曲线清晰，改进方向明确。
+**答**：banking 任务天然有难度维度——required_documents（完成任务要参考的
+文档数，1~30 篇）。按它分层（1-4 简单、5-9 中等、10+ 困难）再按比例抽样。
+随机抽的问题：旧 5-task 集成功率 80%，24-task 分层集只有 25~33%——随机集
+偏简单，基线严重虚高。分层后难度曲线清晰：1-4 篇 67%、10-14 篇 10%、15+ 篇 0%。
 
 ---
 
-### Q3：遇到过最坑的 bug 是什么？
+### Q3：为什么用了 2-Agent？后来为什么没加第三个（Planner Agent）？
 
-**答**：三个印象最深：
+**答**：2-Agent 的动机是 V0 实测痛点——单 Agent 每次检索把 10 篇文档全文
+塞进 context，42 次检索后从 3.7K 涨到 63K token。Knowledge Agent 物理隔离
+（DA 的工具列表里根本没有 KB_search——结构性给不了，不是 prompt 说"别用"），
+只回结构化 Evidence Packet（claim + source_doc_id，不许编文档 ID）。
 
-**① 429 限流把评测数据污染了。** 24 个任务连续跑，9 个因 API 限流报错，
-reward 变成 None。这些是环境错误不是 Agent 失败，混在数据里把成功率拉低了
-8 个百分点。解决：runner 里加任务级自动重试（检测限流异常→冷却递增等待→
-重跑该任务，最多 5 次）。后来发现检测函数里裸匹配 `"429" in msg` 会误判
-"4290 tokens" 这种消息，收紧成 `code: 429` 上下文匹配，8 个用例全过。
-
-**② timeout 把两次 6 小时的评测白跑了。** 我在启动脚本里加了
-`timeout 7200`（2 小时），但 24 任务实际要 2.5 小时——两次 run 都在 21/24
-处被强杀，summary 都没写出来。教训：对耗时不确定的任务别设紧的 timeout。
-后来用 `setsid` + `disown` 完全脱离会话跑，不用 timeout。
-
-**③ as_tool 的 name 参数不生效。** tau2 的 `as_tool(func, name="xxx")` 传了
-name 但工具名还是函数名——读了源码才发现 Tool 的 name 是派生属性，构造参
-数无效。解决：直接把内层函数命名为目标名。**遇到框架行为诡异，读源码比猜快。**
+**为什么没有 Planner Agent**：planning 我做成了 **runtime state + 结构化
+tool call**（write_plan/update_plan/read_plan 落 PlanStore），而不是独立
+Agent。三个理由：①计划更新是确定性操作，不需要另一个 LLM 的判断和不确定性；
+②每次 handoff 有固定开销（V4 038 里 KA 占一半 LLM 调用）——再加一个 Agent
+就是再加一份 context、再加一倍协调成本；③V4 已经证明**让 LLM 生成计划
+文本没意义**（[PLAN] 遵守率 0），V5 的答案是让计划变成可编程状态，
+执行层（实体绑定推进）自己做确定性计算。Planner Agent 解决不了
+V4 暴露的真问题——"知道下一步做什么"不缺推理，缺的是**可持久化、可被
+工具结果驱动推进的状态**。
 
 ---
 
-### Q4：为什么 git submodule 引 tau2-bench？
+### Q4：Task State 和 Memory 有什么区别？
 
-**答**：tau2-bench 完整仓库 853MB（含数据），直接 fork 进来会把项目撑爆。
-用 submodule 指向上游 commit，克隆时按需拉取。代价是用户要执行
-`git submodule update --init`，换来仓库干净 + 能锁定在验证过的版本
-（v1.0.1, commit a2c0247）。另一个关键决定：**submodule 保持只读，我所有
-定制都在自己代码里做 monkey-patch 或包装**——升级 tau2 时不会产生冲突。
+**答**：这是项目里最容易混的一对概念，我用三次迭代才分清：
 
----
-
-### Q5：BM25 是什么？为什么 V0 用它不用向量检索？
-
-**答**：BM25 是稀疏检索（TF-IDF 家族）：词频越高越相关、罕见词权重更大、
-短文档有长度加成。选它三个原因：
-1. **纯本地计算**（毫秒级、零成本），dense embedding 要调 API——我用的 API
-   代理连 embeddings 端点都不通（403），被迫也是最优选择
-2. 可解释——trace 里能看到每次 query 返回哪些文档、什么分数
-3. tau2 内置支持，换 `--retrieval-config` 一个参数就能对比不同检索方案
-
-局限也清楚：词面匹配，语义召回弱（"车"搜不到"汽车"）。但 V0 阶段要的是
-可控基线，不是最强检索。
-
----
-
-### Q6：你观察到 Agent 的核心失败模式是什么？
-
-**答**：V0 基线 24 任务里，我对比两次完整 run 的逐任务结果，**15 个任务稳定
-失败**。分两类：
-- **10 个检索没找全**（recall < 90%）：Agent 换词重搜同一件事——task_070 的
-  26 个 query 之间词重叠率 93%，就是在原地打转
-- **4 个文档找全了但决策错**（recall=100% 仍失败）：最典型 task_002——用户
-  预算年费 $100，Agent 推荐了 $200 年费的卡，用户直接流失。检索是对的
-  （确实返现最高），但没做约束满足推理
-
-还有一个反直觉发现：**检索次数和成功率负相关**——成功任务平均 10 次检索，
-失败的有 30+ 次的。搜得多说明搜不到。
-
----
-
-### Q7：Trace v2 是什么？为什么要事件溯源格式？
-
-**答**：V0 的 trace 是对话快照（谁说了什么），但回答不了"时间花在哪、token
-花在哪、哪次调用慢"。Trace v2 改成事件流：每个动作一条事件，带
-`seq/timestamp/event_type/actor/span_id/parent_span_id`。
-
-好处三个：
-1. **耗时归因**：LLM 调用 / 检索 / 限流等待各占多少毫秒，一算就知道——第
-   一次跑出来就发现"任务耗时 ≈ 100% 是 LLM，检索只占 0.2%"
-2. **span 树重建 execution tree**：start/end 共享 span_id，父 span 指向任务，
-   多 Agent 后每个 Agent 的调用都能挂到正确的子树
-3. **token 成本核算**：每次调用的 prompt/completion tokens 都有，2-Agent
-   对比的"总 token 省 13.3%"就是这么精确算出来的
-
----
-
-### Q8：插桩怎么做到不干预 Agent 行为？
-
-**答**：原则是"只观察不干预"，具体三招：
-1. **LLM 层**：monkey-patch 调用方模块的 `generate` 符号。关键发现：各模块
-   用 `from x import generate`，import 时符号已绑定进各自命名空间，patch
-   源头没用，必须 patch 7 个调用方模块
-2. **工具层**：包装 `environment.get_response` 的轻量代理（`__getattr__`
-   全透传），只拦计时不改结果
-3. **验证**：插桩前后各跑一次 5-task，逐任务对比 reward——4/5 vs 4/5，同
-   一个任务失败，证明零影响
-
----
-
-### Q9：2-Agent 架构怎么设计的？
-
-**答**：动机是 V0 的实测痛点：Agent 每次检索把 10 篇文档全文塞进上下文，
-42 次检索后上下文从 3.7K 涨到 63K tokens——**上下文膨胀**。
-
-```
-User → Decision Agent（业务工具 + ask_knowledge_agent）
-         └─→ Knowledge Agent（独立上下文，BM25）
-                自主 query → 检索 → 判断证据够不够 → 多轮 → Evidence Packet
-         ←── 只返回压缩证据包（answer + facts + 源文档ID + 置信度）
-```
-
-三个关键设计：
-- **物理隔离**：Decision Agent 的工具列表里根本没有 KB_search——不是靠
-  prompt 说"别用"，是结构性给不了
-- **Evidence Packet**：结构化证据（claim + source_doc_id），不许编造文档
-  ID，证据不足就明说 missing_information
-- **拦截式 handoff**：orchestrator 只认环境注册的工具，ask_knowledge_agent
-  是我注入的，必须在 DecisionAgent.generate_next_message 里拦截就地执行，
-  packet 以 ToolMessage 回填——语义与普通工具完全一致
-
----
-
-### Q10：2-Agent 实验结果如何？（最重要的一个问题）
-
-**答**：诚实说，**一半成功一半失败**——这恰恰是最有价值的结论：
-
-| 指标 | V0 单Agent | V1 2-Agent |
+| | Working Memory（V1） | Task State（V3） |
 |---|---|---|
-| Decision Agent max context | 63K+ | **37.6K**（隔离生效✅）|
-| 总 prompt tokens | 20.16M | **17.48M**（省 13.3%✅）|
-| required-doc recall | 80.4% | **84.2%**（略升✅）|
-| 成功率 | 33.3% | **20.8%**（下降❌）|
-| wall time | 2.13h | 2.49h（慢 16.8%❌）|
+| 形态 | 叙事级文本（facts/constraints/goals） | 对象级三元组 `object.field=value[source]` |
+| 回答 | "用户想要什么"（摘要） | "世界现在是什么"（事实） |
+| 结构 | 无 schema，靠检索相关性 | 有 supersede 链、实体索引、来源 provenance |
+| 用途 | 给 LLM 的 context 块 | **给 Harness 做确定性校验的约束源** |
 
-结论：**上下文隔离机制完全有效（token 省、context 缩、recall 升），但可靠性
-没有随之提升——瓶颈从"context 膨胀"转移到了"coordination 低效"**。新发现三
-类协调失败：handoff 循环（每任务 5.2 次）、宽泛首问返回空 packet、Decision
-Agent 收到中低置信包后过早收尾。
-
-**这说明"职责隔离"本身不自动产生可靠性，需要配合协调层优化（KA 跨 handoff
-记忆、packet 质量门槛、handoff 节流）。** 一个负结果也是好结果——它把下一步
-的优化方向定准了。
+关键转折在 V2.3→V3：参数级的 `amount=96000` 会把"savings 余额"误绑到
+"transfer 金额"上。改成 `account_sav_x.balance=96000` 和
+`transfer_request.amount=500` 之后，同类误拦根治（095 首次成功）。
+**Memory 是给 LLM 看的提示，Task State 是给确定性代码用的结构化事实**——
+后者能参与"拦/不拦"的判定，前者不能。
 
 ---
 
-### Q11：evaluator 数据泄漏怎么防的？
+### Q5：Harness 为什么是 deterministic 的？
 
-**答**：这个 benchmark 的 evaluator 需要 `required_documents`（标准答案文
-档 ID）算 recall，但绝对不能让 Agent 看到。我做了验证：扫描全部 trace，确
-认 doc ID 只出现在 KB_search 的返回里，system prompt 和用户消息里没有。
-2-Agent 架构里继续守住：Knowledge Agent 只拿检索工具的返回结果（BM25 返回
-里天然带 doc ID），Decision Agent 只拿 packet 里的 source_doc_id（同样来自
-真实检索结果）。**评测公平性是基准测试的生命线。**
+**答**：因为要拦的动作必须有**可解释的依据**。Harness 每次拒绝都带
+constraint_source（tool_schema / task_state / knowledge）和 correction 指令
+（"set amount to 500"），Agent 拿到就能修。如果是另一个 LLM 来判断拦不拦，
+那 rejection 本身就不可复现、不可调试，Agent 也不知道该信还是该辩。
 
----
-
-### Q12：API 限流怎么处理的？（架构/工程能力题）
-
-**答**：踩过完整的坑：
-1. 单 key 连续跑：~3 成功/10 调用的限流率，靠 litellm 层重试
-   （num_retries=15）+ runner 层任务重试（5 次递增冷却）扛过去
-2. 想到"多 key 并行"：6 把 key 同时跑——**全部同时 429**！实测发现这个
-   API 代理是按 IP/账户级限流的，多 key 不解决，回退串行
-3. 换了 3 账户聚合的 key：双 run（V0+V1）并行跑完 24 任务×2，0 限流
-
-教训：**限流是按什么维度（key/IP/账户）的，测一下就知道，别假设**。
+三源校验："有明确依据才拦，不确定放行"。这个原则是被教训逼出来的：
+V2.1 我曾想用 KA 的 grounded values 校验每个参数，结果 KA 输出过假枚举、
+`MM/DD/YYYY` 占位符、参数名当值——**"知识库能给出 case-specific 正确值"
+这个前提本身不成立**。所以最终的拦截依据只留三种可靠源：工具 schema（官方
+枚举/类型）、Task State（用户/工具确认的值）、KB 明确约束（enum 集合/阈值）。
 
 ---
 
-### Q13：成本显示 $0 是 bug 吗？
+### Q6："有明确依据才拦"具体是什么意思？
 
-**答**：不是。litellm 的价格表里没有 `deepseek-v4-flash`（API 代理的私有
-模型名），`completion_cost` 返回 0，tau2 捕获异常后静默记 0。这是已知限制。
-**我的做法是接受它（token 数有，成本可以按价格表自行折算），同时确保它不影
-响其他指标**——日志里虽然刷 get_response_cost 的报错，但都是非致命的。
+**答**：字面意思——**拒绝一个调用必须能指出依据在哪，指不出来就放行**。
+反例驱动设计：
+- V2.2 之前：evidence 校验拦截了"用户 savings $96,000"绑到 transfer
+  amount——依据本身是错的（把描述当指令），这是误拦
+- V3 之后：多对象同名 amount、bare 字段歧义 → latest() 直接返回 None 放行，
+  哪怕"可能有问题"——因为没有唯一明确依据
+- 好处：0 误拦（V2.2 起全程保持）+ 拒绝信息可执行（correction 行）。
+  Agent 被拒后能自修（recovery 闭环：拦→修→过→执行）。
+
+**对比 post-V5 的教训**：Step 2A 的复用提示名义上"非硬拦"，但实现走的是
+拦截-再生循环（注入提示后该轮调用不执行）——**设计意图是提示，控制流
+是阻断**。010/021/037 三个任务里 `get_referrals_by_user` 这类首次合法查询
+被反复"提示"到任务失败。所以现在我对任何"提醒"机制都会先问：它的控制流
+到底拦不拦执行？
+
+---
+
+### Q7：为什么 V3 success 比 V0 低（5/24 vs 8/24）还保留 V3？
+
+**答**：因为 V3 买到的东西不在 success 上：
+1. **质量指标全面占优**：tools 600→251、max_steps 7→2、误拦 0、死循环 0
+   （V0 时代 58 次）；095 这种多对象任务 V0/V1/V2 全败、V3 首过
+2. **它是后续所有层的地基**：没有对象级 Task State，V5 的"步骤实体绑定
+   推进"根本没法做——PlanStore 的 entities 就是对 Task State 对象的引用
+3. **同模型公平对比**：V0 和 V3 都是 deepseek，5/24 vs 8/24 是真实的架构
+   代价——2-agent 让 LLM calls 翻倍（646→1071），success 上没赚回来。
+   但 V5 证明了这笔投资是前置的：9/24 是踩在 V3 的地基上拿到的。
+
+一句话：V3 是**付出了 success 短期代价换执行结构确定性**的阶段——
+后来 V5 的全部收益都建立在这个结构上。
+
+---
+
+### Q8：为什么 V5 planning 有价值？怎么证明不是 benchmark hacking？
+
+**答（两个子问题）**：
+
+**价值**：V4 证明顽固任务不是"忘了做过什么"（Task State 已解决），是
+"不知道下一步做什么"。行为观察（"你调了 X 5 次"）也没用——重复是
+"不知道什么是对的"的结果。V5 给的是**未来的步骤**（plan steps）+
+**确定性推进**（tool result + 实体绑定 → step completed）+
+**条件 replanning**（blocker/add/remove）。021/024（Dev）和
+031/047/052/063/089（Holdout）这些之前全败的顽固任务首次通过。
+
+**怎么证明不是 hacking**：
+1. **Runtime 不接触评测内部**：不读 evaluation_criteria/required_documents/
+   gold actions——有 integrity 测试（5 项，CI 常跑）扫描代码访问模式
+2. **工具发现走官方路径**：discoverable tool schema 只能通过
+   unlock_discoverable_agent_tool 解锁后从 unlock state 读——Resolver
+   代码里明确禁止调 get_discoverable_tools()（那是上帝视角），integrity
+   测试守着这条边界
+3. **Prompt 零泄漏**：扫描 agents/ 全部字符串常量，真实工具名 0 出现
+4. **Dev/Holdout 分离**：22-task holdout 是 seed 程序化抽样、开发期间
+   零接触，只在 freeze 后各跑一次；仓库里没有 holdout 的运行产物
+   （integrity 测试验证）
+5. **最干净的证据形态**：V4→V5 holdout 同模型（均 qwen3.8-flash）对比
+   4/22→8/22——没有模型红利、没有 holdout 调参空间，+4 只能是机制
+
+---
+
+### Q9：Dev 和 Holdout 怎么设计的？
+
+**答**：Dev 24-task：分层抽样、开发期间反复用，所有失败分析/调参都在它
+上面做。Holdout 22-task：从剩余任务里 seed=20260903 程序化抽样、配置文件
+sealed、开发期间**一次都没跑过、一个 trace 都没看过**。Freeze 后 V4/V5 各在
+独立 worktree（代码快照不可变）跑一次。结果：V5 Dev 9/24 与 Holdout 8/22
+同量级——说明 Dev 提升泛化，不是在 Dev 上过拟合。协议上"V5 不在 holdout
+结果出来后做任何修改"，包括那次 038 回落（LLM 路径波动）也没有据此调参。
+
+---
+
+### Q10：为什么 Step 0-3 targeted 有效但最后还是回退了？
+
+**答**：这是收口阶段最重要的一课。四个机制（plan-execution 一致性提醒、
+状态复用提示、KA 检索预算、goal coverage）在 targeted smoke（3-4 task）
+上全都触发、tools 显著下降（077: 47→12）。但全量 24-task Dev 从 9/24 掉到
+5/24。逐 trace 归因（不跑任何新 LLM，只翻 results.json + trace v2 + diff）：
+
+- **4 个回退有明确机制因果链**：010/021/037 是复用提示的拦截循环——
+  判定条件"实体在 Task State"错了，**实体已知 ≠ 查询结果已知**（accounts
+  记录没查过，但 user_id 查过 → 提示触发 → 调用不执行 → DA 再提 → 再拦）；
+  024 是检索预算在第 8 次截断，bronze_001（$500 bonus 事实）检索到了但
+  没进 evidence packet，DA 推荐了错误的卡
+- **2 个更像 variance**：007 是 DA 忘查时间、幻觉了个日期（零机制介入）；
+  003 证据链不闭合
+- **tools -41% 的去向**：89% 的节省来自 13 个两边都失败的任务（省的是
+  死循环 token，不产生 reward）——效率收益和 success 回退发生在不同任务群
+
+**元教训**：targeted smoke 的机制触发率不能预测全量 success——037 在
+targeted 视角只是"重复查询减少"，全量里是灾难。**全量 Dev 是唯一可信的
+freeze 门槛**。最终 conservative rollback，因为冻结条件（"无明显退化"）
+不满足，且修复 Step 2A 判定条件需要再跑全量验证，风险/收益不划算。
+
+---
+
+### Q11：为什么没有继续做 V6？
+
+**答**：三个理由：
+1. **核心结论已经拿到**：V5 在同模型 holdout 上 +4 是干净的机制证据，
+   Dev/Holdout 同量级证明泛化——"structured planning 有效"这个故事完整了
+2. **剩余失败不在我能确定性解决的层**：逐 task 看，剩下的 026/053/054/070
+   是业务判断错误（选错 dispute reason、算错余额）——工具序列对、plan 推进
+   对、状态对，最后一步的"判断"错。这一层（D 方向）证据不足
+3. **post-V5 实验恰好说明了继续堆机制的风险**：我试了四个"确定性提醒"
+   机制，结果证明**在执行结构层继续加干预，收益递减、扰动递增**。
+   在 9/24 的基线上，-4 的下行风险远大于 +1~2 的期望收益
+
+工程判断：项目目标（评估驱动的 Agent Runtime + 干净的机制证据 + 完整的
+正负结果记录）已达成，边际投入的期望值是负的。**知道何时停比知道怎么
+继续更难**。
+
+---
+
+### Q12：这个项目最重要的失败实验是什么？
+
+**答**：候选有四个，按时间讲（面试官要听的是"你怎么对待失败"）：
+
+1. **V1.1 全量 memory 注入**（最早）：假设"外部化记忆减少重复"，结果
+   KA tokens +72%——不加约束的记忆比没有更糟。教训：context 管理必须
+   按需不能全量
+2. **V2.1 信任 KA grounded values**（最深刻）：穿透 wrapper 校验内层参数
+   机制上成功了，但**根基假设被证伪**——"KA 能给每个业务参数一个正确值"
+   不成立（KB 记录的是合法域，case-specific 正确值来自用户/环境）。
+   错误形态还是开放集（假枚举/占位符/参数名当值/跨 packet 矛盾）——
+   修复成本随形态线性增长。教训：**校验机制的上限取决于它依据的数据
+   质量**；换了三源结构（schema/state/KB 明确约束）才到 0 误拦
+3. **V4 文本 [PLAN] 协议**（最干脆）：遵守率 0。计划必须存在于 runtime
+   state，不能靠 prompt 约定。V5 的 planning tools 直接是它的答案
+4. **Post-V5 Step 0-3**（最新、离收口最近）：机制在 targeted 上有效、
+   全量上 -4，逐 trace 归因后果断 rollback。教训：**smoke 的正结果不能
+   外推；"非硬拦"的设计意图要核对控制流；效率收益和 success 回退可能
+   发生在不同任务群**
+
+如果只能讲一个：讲 V2.1——它最完整地展示了"机制成功但假设错误"时
+怎么办（降级假设而不是硬修机制），以及这如何直接塑造了贯穿到 V5 的
+"有明确依据才拦"原则。
+
+---
+
+### Q13：遇到过最坑的工程 bug 是什么？（保留原版高频题）
+
+**答**：
+1. **429 限流污染评测数据**：runner 加任务级重试（冷却递增，最多 5 次）；
+   后来发现裸匹配 `"429" in msg` 会误判 "4290 tokens"——收紧成 code 匹配
+2. **timeout 杀掉 6 小时评测**：24 任务实际 2.5h，脚本 timeout 7200 在 21/24
+   处强杀两次——改用 setsid + disown 脱离会话跑
+3. **as_tool 的 name 不生效**：tau2 Tool name 是派生属性，构造参数无效——
+   内层函数直接命名。读源码比猜快
+4. **插桩 patch 打不到点**：各模块 `from x import generate`，import 时符号
+   已绑定——必须 patch 7 个调用方模块，patch 源头没用
 
 ---
 
 ### Q14：如果重来一遍，你会改什么？
 
 **答**：
-1. **更早做插桩**——Phase 1 应该在第一次 24-task run 之前就做，很多
-   "为什么慢"的争论（当时只能靠感觉）会直接有数据
-2. **评测 run 一开始就用 setsid 脱离会话**——两次 6 小时的 run 被会话终
-   止连带杀掉，白跑 12 小时
-3. **2-Agent 的 Knowledge Agent 应该从第一天就有跨 handoff 记忆**——V1
-   有意没做（控制变量），但空 packet 问题有一半是"每次 handoff 从零开
-   始"造成的，这个代价事先没估到
-4. 早点读 tau2 的 Tool 源码——`as_tool` 的 name 陷阱和 `from import` 的
-   patch 陷阱都是"猜了一小时，读源码五分钟"
+1. **模型口径从 V0 就固定**——V3(deepseek) vs V5(qwen) 的 Dev 对比至今
+   要带着"混模型"的脚注才能讲。Holdout 干净是因为运气好（V4/V5 都在
+   切换后的 qwen 上）+ 后来主动固定。**评测口径变更本身就是需要管理的
+   风险**
+2. **更早做 sealed holdout**——它让我最后阶段的每个结论都有"泛化"背书
+3. **对"提醒类"机制先做控制流审计**——post-V5 的教训：写机制之前先
+   回答"它的实现到底拦不拦执行"，能省一轮全量 Dev
+4. **2-agent 的 KA 从第一天就有跨 handoff memory**（V1 控制变量的代价，
+   事先没估到空 packet 问题一半来自这个）
 
 ---
 
@@ -258,34 +317,52 @@ Agent 收到中低置信包后过早收尾。
 
 | 项 | 数值 |
 |---|---|
-| 代码量 | ~2700 行 Python，16 commits |
-| dev set | telecom 20 任务 / banking 24 任务（分层：3/7/14）|
-| V0 基线 | telecom 90% / banking **27.1%**（两次平均）|
-| 难度曲线 | 1-4 篇文档 67% → 15+ 篇 0% |
-| V1 对比 | token **-13.3%**、recall 84.2%、success 20.8%、DA context 63K→37.6K |
-| 单任务耗时 | ~6 分钟（95% 是 LLM，检索 <0.2%）|
+| Dev set | banking 24 任务（分层 3/7/14）+ telecom 20 任务（V0 期）|
+| Holdout | 22 任务 sealed（seed=20260903，开发期零接触）|
+| **V5 最终** | **Dev 9/24（37.5%）/ Holdout 8/22（36.4%）** |
+| **同模型对比** | **V4 4/22 → V5 8/22（+4，均 qwen3.8-flash）** |
+| V0 基线 | 8/24（deepseek）；telecom 90%（20 任务）|
+| V3 | 5/24（deepseek，同 V0——架构代价真实）|
+| 效率 | KA tokens -74%（V1.2）；tools 600→251（V0→V3）|
+| 误拦/死循环 | 0 误拦（V2.2 起）；死循环 58→3→0 |
+| Post-V5 | tools -41% 但 Dev 9/24→5/24 → rollback |
 | 知识库 | 698 篇文档（2.9MB），BM25 毫秒级 |
-| 检索冗余率 | 61%（420 槽位仅 118 篇唯一）|
+| integrity | 5 项测试全绿（CI 常跑）|
 
 ---
 
 ## 五、可能的追问与陷阱
 
-**Q：你的 27.1% 是不是太低了？**
-A：低不代表失败——它代表任务集有区分度。分层集里 14 个困难任务（需 10+ 篇文
-档），单 Agent 在这档成功率 10%，这是真实的改进空间。虚高的 80%（简单集）
-才是没有信息量的。
+**Q：9/24 的绝对值不高，怎么讲？**
+A：任务集是按难度分层的（14 个困难任务要 10+ 篇文档），15+ 篇那档 V0 就是
+0%。重点从来不是绝对值，是**同口径下可归因的差值**：同模型 holdout +4/22
+是最干净的机制证据。而且 V5 的成功集中在"长程多步任务"上——正是
+structured planning 针对的那类。
 
-**Q：V1 成功率降了，是不是实验失败？**
-A：单次 1-trial 在 ±8pp 随机波动内，20.8% vs 33.3% 的差异有部分是噪声；但
-4 个任务转坏 vs 1 个转好的方向性 + 三类协调失败的具体形态，说明真有问题。
-下一步是修 coordination 而不是回退架构。
+**Q：V3→V5 的 Dev 提升是不是模型换的好事？**
+A：承认混模型（deepseek→qwen），其中 002/007 两个翻转是模型红利——我在
+复盘文档里明确标注不能计入机制。但两个反驳：①Holdout 的 V4→V5 是同模型，
++4 干净；②021/024 这两个 V0/V1.2/V3/V4 全败的顽固任务是 planning 机制
+拿下的（有 plan_written/step_progressed 的 trace 证据）。
+
+**Q：怎么保证 holdout 真的没泄漏？**
+A：三层：流程上（worktree 隔离、开发期零接触）、代码上（integrity 测试
+验证 resolver 不碰上帝视角、runtime 不读评测字段、无 holdout 运行产物
+目录）、结果上（V5 Dev 与 Holdout 同量级，且 holdout 上也有 038 这种
+回落——如果调过参不会留这个）。
 
 **Q：为什么不用 LangChain/LlamaIndex？**
-A：tau2-bench 提供了端到端的用户模拟 + 环境工具 + 评分（DB 断言），这是
-RAG 框架给不了的。检索本身 BM25 十几行调用，没必要为此引入重框架。
+A：tau2-bench 提供端到端的用户模拟 + 环境工具 + DB 断言评分，这是 RAG
+框架给不了的。而且这个项目的核心工作是 harness/state/plan 这些
+**框架之上的确定性层**——自己写反而透明可审计。
 
 **Q：telecom 和 banking 为什么分开维护？**
-A：telecom 是"纯工具编排"难度（数据库操作），banking 是"知识密集"难度
-（698 篇文档里找答案）。两个域覆盖 Agent 的两类核心能力，改进时能看出是
-哪类能力的问题。
+A：telecom 是纯工具编排难度（V0 期 90%），banking 是知识密集+长程难度。
+本项目的主战场是 banking（V1 之后全部演进都在它上面），telecom 是 V0 的
+对照域。
+
+**Q：你个人在这个项目里最大的成长是什么？**
+A：学会区分"机制成功"和"假设成立"——V2.1 穿透机制成功了但假设错了；
+post-V5 效率机制成功了但 success 假设错了。以及：**负结果写清楚比正结果
+写漂亮更值钱**——现在仓库里 5 个负结果都有完整归因，这是我能对着任何
+一个 trace 讲清楚每一步决策的底气。

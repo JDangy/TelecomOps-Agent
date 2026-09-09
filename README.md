@@ -1,215 +1,176 @@
 # TelecomOps-Agent
 
-Evaluation-driven Agent system 实习项目：在电信客服 domain 上构建、评估并逐步改进一个客服 Agent。
+**Evaluation-Driven Agent Runtime for Reliable Long-Horizon Tool Use** — 基于 [τ³-bench / tau2-bench](https://github.com/sierra-research/tau2-bench)（banking_knowledge 域）构建、评测驱动的多 Agent Runtime：从单 Agent baseline 逐步演进到 selective memory → deterministic action harness → recovery → structured task state → context management → structured planning & replanning，每一步都用固定的 Dev/Holdout 评测集验证。
 
-底层 benchmark 使用 [sierra-research/tau2-bench](https://github.com/sierra-research/tau2-bench)（τ³-bench）的 **telecom** domain。**本项目代码与官方 benchmark 解耦**：tau2-bench 只作为底层依赖（`third_party/tau2-bench`，editable 安装），所有 evaluation 逻辑、结果存储、指标计算都在本项目内实现。
+> **项目性质**：这不是一个 baseline demo，而是一个完整的 **Agent Engineering 实验项目**：
+> 先造尺子（冻结评测集 + 固定协议），再造 Agent（每版一个机制假设），
+> 用 trace 事件流归因每次成功/失败，包括诚实地记录和回退负结果。
+> Runtime 已冻结在 **V5**（最终版），当前仓库处于收口状态。
 
-## 当前阶段：V0 baseline
+---
 
-- **Agent**：tau2 官方 `llm_agent`（DeepSeek 驱动），作为可对比的 baseline
-- **Eval set**：固定的 dev sets，任务 ID 已冻结——V0/V1/V2 永远在同一批任务上对比
-  - telecom：20 个 task（`configs/dev_tasks.json`），来源为 tau2 telecom small split
-  - banking_knowledge（RAG）：24 个 task（`configs/banking_dev_tasks.json`），按 required_documents 分层抽样（简单 3 / 中等 7 / 困难 14），BM25 检索；旧 5-task 集保留于 `banking_dev_tasks_v1_5task.json`
-- **评测协议**：`bash run_benchmark.sh [telecom|banking] [repeats]`，模型固定 `openai/deepseek-v4-flash`（保留 thinking）、seed=42、max_steps=60；任务级 429 限流自动重试（不污染评测数据）
-- **输出**：每次 run 一个独立 `runs/<run_id>/` 目录
+## Final Results
 
-**本阶段明确不做**：query rewriter、Memory、reranker、verifier、RL、多 Agent、复杂 Planner、网页 UI。Agent 看不到 `evaluation_criteria` / `required_documents` / 标准答案。
+| Version | Dev24 | Holdout22 | Main change |
+|---|----:|--------:|---|
+| V0 | 8/24 (33.3%) | — | 单 Agent baseline（官方 LLMAgent） |
+| V1.2 / V3 | 5/24 (20.8%) | — | 2-Agent + selective memory / Structured Task State + Harness |
+| V4 | — | 4/22 (18.2%) | Adaptive long-horizon + Context Builder |
+| **V5 (final)** | **9/24 (37.5%)** | **8/22 (36.4%)** | **Structured Planning & Replanning** |
 
-### V0 实测结果（baseline，deepseek-v4-flash + thinking）
+**读这张表的正确姿势（不过度归因）：**
 
-| 场景 | success rate | 备注 |
+- **V3/V5 的 Dev 对比混过模型**：V3 官方 Dev 用 `deepseek-v4-flash`，V5 Dev 用
+  `qwen3.8-flash`——Dev 上 5/24→9/24 的提升**不能**全部归因于 V5 机制
+  （其中 002/007 两个翻转属模型红利）。
+- **V4 vs V5 的 Holdout 是同模型公平对比**（均为 `qwen3.8-flash`，
+  sealed 22-task set，V5 开发期间未接触 holdout trace）：
+  **4/22 → 8/22（+4，18.2%→36.4%）是本项目最干净的机制提升证据**。
+  5 个 V4 全败任务首次翻上（031/047/052/063/089），1 个回落（038，
+  LLM 路径波动）。
+- V5 Dev 9/24 与 Holdout 8/22 同量级 → Dev 提升泛化到未见任务，不是过拟合。
+- 剩余失败集中在业务判断层（026/053/054/070 等），不在执行结构层——见
+  [技术复盘](docs/v0_v51_technical_retrospective.md) 的 failure mode 分析。
+
+## Architecture（V5 最终形态）
+
+```mermaid
+flowchart TD
+    U[User / User Simulator] -->|message| DA[Decision Agent<br/>LLM: business + planning + execution]
+    DA -->|ask_knowledge_agent<br/>拦截式 handoff| KA[Knowledge Agent<br/>独立 context, BM25 检索]
+    KA -->|Evidence Packet<br/>answer/facts/sources/confidence| DA
+    DA <-->|plan tools: write_plan / update_plan / read_plan| PS[Plan State · PlanStore<br/>未来要做什么 goal+steps]
+    DA <-->|每轮写入 user/tool 事实| TS[Task State · TaskStateV3<br/>世界现在是什么 object.field=value]
+    DA <-->|规则/enum/阈值 入库| TS
+    CB[Context Builder] -->|memory block + task state block + plan block<br/>+ 旧 ToolResult 存根化| DA
+    DA -->|proposed action| H[Action Harness<br/>三源确定性校验: schema / task state / KB]
+    H -->|reject + correction| DA
+    H -->|放行| T[Business Tools / Environment]
+    T -->|tool result| TS
+    T -->|tool result 推进 step| PS
+    T -->|执行证据| DA
+    subgraph 四个概念严格分工
+      TS
+      PS
+      KA
+      H
+    end
+```
+
+**四个概念，严格分工（面试高频）：**
+
+| 模块 | 回答的问题 | 关键性质 |
 |---|---|---|
-| telecom（20 task）| **90%**（18/20）| 失败 2 个：loop / wrong_transfer |
-| banking + BM25（24 task 分层）| **27.1%**（6.5/24 平均）| 两次完整 run 取平均：25%（6/24）+ 29.2%（7/24）|
-| banking + BM25（旧 5 task，参考）| 80%（4/5）| 5 个任务偏简单（required_docs 1~6），不代表全库难度 |
+| **Task State**（`task_state_v3.py`） | 世界**现在是什么**（事实：`object.field=value [source]`） | 唯一事实源；supersede 历史；实体索引；来源 provenance（user/tool/knowledge） |
+| **Plan State**（`plan_store.py`） | 未来**还要做什么**（goal + steps） | 只引用 Task State 实体，不复制事实；步骤完成由真实 tool result + 实体绑定驱动 |
+| **Knowledge Agent** | 规则/文档知识（Evidence Packet） | context 物理隔离；结构化 claim + source_doc_id；不确定就报 missing_information |
+| **Harness**（`action_harness.py`） | 确定性执行边界 | 三源校验（tool schema / task state / KB 约束）；**有明确依据才拦**，其余放行 |
 
-> 注意：24-task 分层集是对 banking_knowledge 全库（97 task，required_docs 1~30）的代表性抽样。**V0 banking 基线 = 27.1%（两次运行平均）**；两次运行相差 4.2pp（25% vs 29.2%），说明 LLM 有随机性，对比时应看平均而非单次。旧的 80% 因任务集偏简单而虚高。V1 改进将以此为对比锚点。
+## Evolution / What We Learned
 
-## 版本历史
+每一版都是同一个循环：**Observation → Hypothesis → Experiment → Result**
+（含被推翻的假设）：
 
-| 版本 | 内容 | 状态 |
-|---|---|---|
-| V0 | 评估框架 + telecom baseline + banking_knowledge/BM25（24-task 分层 dev set + 429 自动重试）| ✅ 当前 |
-| V1 | 计划中：基于失败分析的 Agent 改进 | ⏳ |
+| 阶段 | 观察 | 假设 | 结果 |
+|---|---|---|---|
+| **V0** | 单 Agent 在 24-task banking dev 上 8/24；长任务重复检索、context 膨胀 | 先冻结评测尺（分层抽样 dev set、seed/retrieval/max_steps 固定） | 基线建立；失败分两类：长序列执行 + 参数值错误 |
+| **V1.1** | DA 忘已确认事实 | 给两个 Agent 各一块 memory | **负结果**：全量注入让 KA tokens +72%、handoff +53%——不加约束的记忆比没有更糟 |
+| **V1.2** | V1.1 膨胀根因是"全量注入" | 按 request 选择性检索（hit/partial/miss） | KA tokens -74%、retrieval -68%；success 不升但效率是真实收益 |
+| **V1.3** | 想用 prompt 让 DA 更高效 | procedural efficiency instruction | **自我判断回退**：证据不足时 prompt 调参是负优化 |
+| **V2/V2.1** | 参数值错误可执行前拦截 | Evidence-grounded harness（穿透 wrapper 拿内层参数） | 穿透成功；但**核心假设被推翻**——"KA 能给每个业务参数正确值"不成立（假枚举、占位符、参数名当值……错误形态开放集） |
+| **V2.2** | user/tool 的值可靠，KB 的值不可靠 | 三源约束：只拦"有明确依据"的冲突 | **0 误拦 + 死循环消除（58→3）**——"有明确依据才拦"成为贯穿到 V5 的不变原则 |
+| **V2.3** | 被拒后修正率 0 | 结构化 correction + recovery 预算 | 拦→修→过→执行闭环成立 |
+| **V3** | 误拦根因是参数级裸键（amount 无对象归属） | 对象级状态 `object.field=value[source]` + supersede + 实体解析 | 095 首次成功；跨对象混淆根治；Dev 5/24（success 不如 V0 但质量指标全面占优） |
+| **V4** | 顽固任务不是"忘了做过什么"，是"不知道下一步" | Plan Mode + Context Builder + `[PLAN]` 文本协议 | **`[PLAN]` 遵守率 0**（V1.3 教训重现）；行为观察也无 reward 收益 |
+| **V5** | 行为观察不是计划——需要**未来的步骤** | planning tools 落 runtime PlanStore；tool result + 实体绑定推进；条件 replanning；bounded completion guard | **Dev 9/24（历史新高）+ 同模型 Holdout 4/22→8/22**；5+ 顽固任务首次成功 |
 
-## 安装
+## What Did Not Work（负结果，与正结果同等重要）
+
+1. **V1.1 全量 memory 注入** — handoff +53%、KA tokens +72%；"勿重复查询"清单反向激励换说法重搜。
+2. **V1.3 prompt-only 效率优化** — 无证据支撑的 prompt 调参是负优化，主动建议回退。
+3. **V2.1 信任 KA grounded values** — "知识库能给出 case-specific 正确值"这个前提被 5 种病理形态证伪；证据校验降级为三源之一。
+4. **V4 文本 `[PLAN]` 协议** — 遵守率 0；计划必须存在于 runtime state，不能靠 prompt 约定。
+5. **Post-V5 Step 0–3**（consistency / reuse hints / KA 检索预算 / goal coverage）— targeted smoke 中 tools 显著下降，但全量 Dev **9/24 → 5/24**：逐 trace 归因确认 3 个回退来自"复用提示拦截循环"（实体已知 ≠ 查询结果已知）、1 个来自"检索预算截断证据包"；**整体 rollback**。完整分析见
+   [postmortem](docs/post_v5_experiments_postmortem.md)。
+
+## Benchmark Integrity
+
+评测公平性是本项目生命线，有专门的 integrity 测试守护（`tests/test_integrity.py`，5/5 全绿）：
+
+- **Agent runtime 不访问** `evaluation_criteria`、`required_documents`、gold actions。
+- **不读 gold**：Discoverable tool schema 只能通过官方 `unlock_discoverable_agent_tool`
+  流程获得——Resolver 只读 unlock state（`_agent_discoverable_tools_state`），
+  绝不 introspect hidden 实现。
+- **Prompt 不泄漏**：agents/ 的字符串常量扫描，真实 discoverable tool 名零出现。
+- **Dev / Holdout 分离**：24-task Dev（开发期间反复使用）与 22-task sealed
+  Holdout（seed=20260903 程序化抽样，开发期间零接触）物理隔离，
+  Holdout 只在 freeze 后各跑一次（V4/V5），integrity 测试保证本仓库无 holdout 运行产物。
+
+## Reproduction
 
 ```bash
-# Python 3.12–3.13（本项目在 3.13 验证）
+# 1) 安装（Python 3.12–3.13）
 uv venv .venv && source .venv/bin/activate
-uv pip install -r requirements.txt          # 会 editable 安装 third_party/tau2-bench
+uv pip install -r requirements.txt        # editable 安装 tau2-bench
 
-# 配置 API key
-cp env.example .env                          # 然后编辑 .env 填入 API key（见下）
-# 或: export DEEPSEEK_API_KEY=...
-```
+# 2) 初始化 submodule（tau2 数据在 submodule 里）
+git submodule update --init
 
-`.env` 支持三种 LLM 提供商（选一即可）：DeepSeek 官方 / OpenAI 兼容端点（如 api.b.ai）/ Anthropic 兼容端点。本项目实测用 api.b.ai 的 OpenAI 兼容端点 + `openai/deepseek-v4-flash`（保留 thinking）：
+# 3) 环境变量（评测需要 LLM key）
+cp env.example .env                       # 填 OPENAI_API_KEY / OPENAI_BASE_URL 等
 
-> 注意：本仓库将 `.env.example` 命名为 `env.example`（你的 Claude Code 全局权限 deny 了 `./.env.*` 的读取，无法创建标准命名）。手动 `mv env.example .env.example` 即可恢复标准命名。
-
-## 运行 baseline
-
-一条命令跑固定 20 个 task：
-
-```bash
-python run_eval.py --tasks configs/dev_tasks.json --agent baseline
-```
-
-快速 smoke test（只跑前 5 个 task）：
-
-```bash
-python run_eval.py --tasks configs/dev_tasks.json --agent baseline --num-tasks 5
-```
-
-可选参数：
-
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `--tag` | `v0` | run 前缀，run_id 形如 `v0_20260825_160700` |
-| `--model` / `--user-model` | `deepseek/deepseek-chat` | agent / user simulator 模型（LiteLLM 格式） |
-| `--max-steps` | 60 | 每个 task 最大对话轮数 |
-| `--seed` | 42 | 随机种子 |
-| `--runs-dir` | `runs` | 输出根目录 |
-| `--domain` | 取自 tasks 文件 | 覆盖 domain（如 `telecom` / `banking_knowledge`） |
-| `--retrieval-config` | 无 | retrieval 变体名（banking_knowledge 用，如 `bm25` / `bm25_grep` / `no_knowledge`） |
-| `--retrieval-config-kwargs` | 无 | retrieval 配置覆盖参数，JSON（如 `'{"top_k": 5}'`） |
-
-## 运行 banking_knowledge（RAG）
-
-banking_knowledge domain 需要指定 retrieval 配置（vanilla baseline + BM25）：
-
-```bash
+# 4) 快速 smoke（3 个任务，验证装配）
 python run_eval.py --domain banking_knowledge --retrieval-config bm25 \
-  --tasks configs/banking_dev_tasks.json --agent baseline
-```
+  --tasks configs/banking_v5_smoke.json --agent two_agent_harness \
+  --model openai/qwen3.8-flash --tag smoke --seed 42 --max-steps 60
 
-支持 retrieval 变体（见 tau2 `RETRIEVAL_VARIANTS`）：`bm25` / `bm25_grep` / `no_knowledge` / `openai_embeddings` / `qwen_embeddings` 等。embedding 类变体需要额外的 API key（OpenAI / OpenRouter）。
-
-> 说明：
-> - `openai/` 前缀模型（OpenAI 兼容端点，如 api.b.ai 的 `https://api.b.ai/v1`）会**保留 thinking**
->   （reasoning），并自动读取 `OPENAI_BASE_URL` 作为端点。推荐使用，评测置信度更高。
-> - `anthropic/` 前缀模型（Anthropic 兼容端点）会自动禁用 thinking（litellm 多轮不回传
->   reasoning_content 会触发 400 错误）。能用 OpenAI 端点时优先用 OpenAI 端点。
-> - 非标准模型的 cost 可能无法计算（litellm 无价格表），此时 cost 记为 $0.0。
-
-### api.b.ai 端点示例
-
-```bash
-export OPENAI_API_KEY="<你的 key>"
-export OPENAI_BASE_URL="https://api.b.ai/v1"
-
+# 5) 完整 Dev eval（24-task；Frozen V5 的正式口径）
 python run_eval.py --domain banking_knowledge --retrieval-config bm25 \
-  --tasks configs/banking_dev_tasks.json --agent baseline \
-  --model openai/deepseek-v4-flash
+  --tasks configs/banking_dev_tasks.json --agent two_agent_harness \
+  --model openai/qwen3.8-flash --tag v5_dev --seed 42 --max-steps 60
+
+# 6) 确定性测试（无网络 / 无 LLM / 无 API key，几秒内完成）
+python tests/test_integrity.py            # benchmark integrity 5 项
+python tests/test_unit.py                 # runtime 确定性单元测试
 ```
 
-## 查看结果
+> 评测模型口径（2026-09-04 起固定）：`openai/qwen3.8-flash`（winterapi）、
+> BM25、seed=42、max_steps=60。V4/V5 的 Dev 与 Holdout 均为此口径，跨版本直接可比。
 
-每次 run 生成：
+## Version Freeze
 
-```
-runs/
-└── v0_20260825_160700/
-    ├── summary.json     # run 级指标
-    ├── results.json     # per-task 指标
-    └── traces/          # 每任务一份完整轨迹
-        └── _mobile_data_issue_....json
-```
+- **Runtime 冻结快照：commit `3aa2918`（V5.1）**，建议 tag `v5.1-final`。
+- 当前 `main` 的 `agents/` 与该快照**逐字节一致**（Post-V5 Step 0–3 已整体
+  revert，见 commit `0aac7b6`）；`main` 上其后只有 docs/tests/CI 变更。
+- 正式结果：Dev 9/24（`docs/v5_dev24_freeze_report.md`）、
+  Holdout 8/22 vs V4 4/22（`docs/v5_holdout_final_report.md`）。
 
-`summary.json` 含：`total_tasks`、`success_count`、`success_rate`、`average_reward`、`average_turns`、`average_tool_calls`、`total_tokens`、`average_tokens`、`estimated_cost`。
-
-每个 trace 含完整 `system_prompt`、`conversation`（对话 + 工具调用 + 工具返回，按 `tool_call id` 精确配对）、`tool_calls`（有序 trajectory）。打开失败任务的 trace 即可人工定位失败原因。
-
-## 失败分类与统计
-
-12 类失败 taxonomy 定义在 `eval/taxonomy.py`（与 tau-bench 论文一致）：
-`planning / missing_information / wrong_tool / wrong_tool_args / policy_violation / observation_error / premature_stop / loop / bad_communication / wrong_transfer / environment_error / unknown`
-
-人工查看失败 trace，在 `failure_labels.json` 里标注每个失败 task 的类型，然后：
-
-```bash
-python analyze_failures.py runs/v0_20260825_160700 --labels failure_labels.json
-python analyze_failures.py runs/v0_20260825_160700 --labels failure_labels.json --csv failures.csv
-```
-
-输出失败数、每种类型的数量与百分比、failed task IDs，可选导出 CSV。未标注的失败任务会归为 `unknown`。
-
-## 版本对比
-
-```bash
-python compare_runs.py runs/v0_20260825_160700 runs/v1_20260825_180000
-```
-
-对比 success rate / average reward / average turns / average tool calls 的差值，并列出：
-- V0 fail → V1 success 的 task（转好）
-- V0 success → V1 fail 的 task（转坏）
-- reward 变化但成功状态未变的 task
-
-## 目录结构
+## Repository Layout
 
 ```
 TelecomOps-Agent/
-├── run_eval.py              # evaluation CLI 入口
-├── analyze_failures.py      # 失败分析 CLI
-├── compare_runs.py          # 版本对比 CLI（含 retrieval config 对比）
-├── configs/
-│   ├── dev_tasks.json       # 固定的 20-task telecom dev set（已冻结）
-│   └── banking_dev_tasks.json  # 固定的 24-task banking_knowledge (RAG) dev set（分层抽样）
 ├── agents/
-│   ├── __init__.py
-│   └── registry.py          # agent 注册表（baseline -> llm_agent）
-├── eval/
-│   ├── runner.py            # 核心：加载任务、跑仿真、保存 run
-│   ├── metrics.py           # per-task 指标 + run summary（含 retrieval 指标）
-│   ├── trace.py             # 轨迹提取（tool call 与返回配对，含 KB 检索记录）
-│   ├── taxonomy.py          # 12 类失败分类
-│   └── __init__.py
-├── failure_labels.json      # 人工失败标注模板
-├── runs/                    # run 输出（gitignored）
-├── third_party/tau2-bench/  # 底层 benchmark（editable install）
-├── env.example              # 环境变量模板（复制为 .env）
-├── requirements.txt
-└── .gitignore
+│   ├── two_agent.py            # Decision + Knowledge Agent（拦截式 handoff + V5 planning）
+│   ├── registry.py             # agent 注册表（baseline / two_agent / two_agent_harness）
+│   ├── memory/                 # V1.2 selective working memory
+│   └── harness/
+│       ├── action_harness.py   # 三源确定性校验执行层
+│       ├── resolver.py         # wrapper 穿透（只读 unlock state）
+│       ├── task_state_v3.py    # 对象级 Task State（supersede + 实体索引）
+│       ├── plan_store.py       # V5 PlanStore（goal + steps + 实体绑定推进）
+│       ├── context_builder.py  # 旧 ToolResult 存根化（Plan Mode）
+│       └── validators/...      # schema / task-state / KB 三源 validator
+├── eval/                       # runner / metrics / trace v2 事件流插桩
+├── configs/                    # 冻结的 Dev(24) / Holdout(22, sealed) 配置
+├── tests/                      # integrity(5) + 确定性单元测试
+├── docs/                       # V0→V5 各版报告 + 技术复盘 + postmortem
+└── run_eval.py                 # 评测 CLI
 ```
 
-## 指标口径（保证跨 run 可比）
+## Learn More
 
-- `success`：`reward >= 1.0`（tau2 的 pass^1 判定）
-- `turns`：对话中 user 消息条数
-- `tool_calls`：assistant 发出的工具调用总数
-- `tokens`：从每条消息的 `usage` 字段汇总
-- `cost`：`agent_cost + user_cost`（美元）
-
-### Retrieval 指标（banking_knowledge，RAG ablation 用）
-
-- `retrieval_calls`：该 task 里 agent 发起的 retrieval 工具调用次数
-- `documents_retrieved`：该 task 累计返回的文档条数
-- `required_document_recall`：`task.required_documents` 中被检索返回过（任意 rank）的比例
-- `recall_at_k`：对每个 required doc 取"所有调用中的最低 rank"（best rank），统计 best_rank ≤ k 的比例（k=1,3,5,10）。
-  **注意这是跨所有检索调用的 *cumulative* recall@k，不是传统单次 Hit@K**——agent 多次搜索后
-  best rank 累积提升，指标会随检索次数增加而上升。
-- `first_hit_call`：每个 required doc 第一次被命中的检索调用序号（1-based），未命中为 null。
-  **衡量检索效率**：搜得越少越好。配套 `avg_first_hit_call` / `max_first_hit_call`
-  （捞齐全部文档至少需要的检索次数）。
-- run 级聚合：`average_retrieval_calls` / `average_documents_retrieved` / `average_required_document_recall` /
-  `average_recall_at_k` / `average_avg_first_hit_call` / `average_max_first_hit_call`
-
-> 为什么需要 first_hit_call：两个 Agent 可能有相近的 recall@k，但一个搜 2 次就捞全，
-> 另一个狂搜 12 次——后者检索效率低。first_hit_call 让"检索效率"可量化，用于对比
-> Agent 的查询策略好坏（对应 agent efficiency 评估）。
-
-> 注意：`required_documents` 只用于 evaluator 侧指标统计，绝不注入 agent prompt/context。
-
-## 添加新 agent（V1 等）
-
-在 `agents/registry.py` 注册一行：
-
-```python
-AGENT_REGISTRY = {
-    "baseline": "llm_agent",
-    # "v1": my_factory,   # 或指向自定义 agent factory
-}
-```
-
-然后 `python run_eval.py --agent v1`，与 V0 用 `compare_runs.py` 对比。
+- **[V0→V5.1 技术复盘](docs/v0_v51_technical_retrospective.md)** — 完整演进逻辑、架构核实、失败模式分析
+- **[Post-V5 实验 postmortem](docs/post_v5_experiments_postmortem.md)** — Step 0–3 回退的逐 task 归因
+- **[V5 Holdout 正式报告](docs/v5_holdout_final_report.md)** — 同模型 4/22→8/22
+- **[V5 Dev24 freeze 报告](docs/v5_dev24_freeze_report.md)**
+- **[Interview notes](docs/notes/interview_notes.md)** — 项目叙事与高频问答

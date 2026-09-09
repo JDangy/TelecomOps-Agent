@@ -2,6 +2,10 @@
 
 > 复盘原则：一切结论以 git history、各版本 `results.json`、`*.v2.json` trace、
 > 以及 `agents/` 当前实现为准；文档与实现冲突处以实现为准并标注。
+>
+> **状态（2026-09-09 定稿）**：Frozen V5 / V5.1（commit `3aa2918`）是本项目
+> 的**最终 Runtime**。第九节记录 Post-V5 实验（Step 0–3）与最终决策——
+> 机制有效于效率、回退于 success，已整体 rollback；不再有下一阶段计划。
 
 ---
 
@@ -196,7 +200,110 @@ _build_llm_context (two_agent.py:1240)
 
 ---
 
-## 七、下一阶段方向（针对真实 failure mode，未实现）
+## 七、Post-V5 实验（Step 0–3）与最终决策
+
+> 本节为 2026-09-09 收口定稿。完整逐 task 归因见
+> `docs/post_v5_experiments_postmortem.md`（本节为摘要 + 决策记录）。
+
+### 背景
+
+V5 freeze 之后，针对第三节的 failure mode 1/2/3/4 做了四个确定性机制
+（commit `b075bc5` → `808b07b`）：
+
+| Step | 机制 | 针对 failure mode |
+|---|---|---|
+| Step 0 | 双 Plan 清理：PlanStore 唯一 Plan 来源，V4 plan_tracker 降级 telemetry（不进 context） | 技术债（第六节债 3） |
+| Step 1 | Plan–Execution Consistency：连续 ≥3 次 mutation 与 current step 的 tool_hint 不匹配（或无 hint 时连续 5 次不推进任何步骤）→ 提醒一次 | mode 1（plan 不指挥执行） |
+| Step 2A | 查询复用提示：查询类调用引用的实体已在 Task State → 注入"可复用"提示 | mode 3（有状态不用） |
+| Step 2B | KA 检索预算：单次 handoff 内 KB_search ≤ 8，超限强制收尾 | mode 4（KB 检索爆炸） |
+| Step 3 | Goal Coverage：用户消息的明确数量词（"four debit cards"）vs completed 步骤覆盖实体数不足 → 提醒一次 | mode 2（过早收尾） |
+
+### Targeted smoke 的正结果（3–4 task 级）
+
+- 工具调用显著下降：077 从 47 → 12、080 从 42 → 10 的量级；
+- 复用提示确实触发（077 的 `get_credit_card_accounts ×6` 类重复被打断）；
+- coverage 在 092 形态触发并给出合理提醒；
+- **未观察到大问题** → 决定跑全量 24-task Dev 验证 freeze 条件。
+
+### Full Dev 24-task 的结果：明确回退
+
+| 指标 | Frozen V5 基线 | Step 0–3 candidate | Δ |
+|---|---|---|---|
+| **Success** | **9/24 (37.5%)** | **5/24 (20.8%)** | **-4** |
+| tool calls 总量 | 306 | 180 | **-41%** |
+| prompt+completion tokens | 6.82M | 5.11M | -25% |
+| KA KB_search 总量 | 900 | 869 | -3%（handoff 数 119→156，检索被摊薄） |
+
+回退任务（基线成功 → candidate 失败）：**003、007、010、021、024、037**；
+翻上（基线失败 → candidate 成功）：**008、046**。
+
+### 逐 task 归因（证据等级）
+
+- **Confirmed mechanism regression（4 个）**：
+  - **010 / 021 / 037**：Step 2A 的**拦截循环**——提示的判定条件是"参数引用的
+    实体在 Task State"，但**实体已知 ≠ 查询结果已知**。`get_referrals_by_user`
+    / `get_credit_card_accounts_by_user` 这类首次合法查询被反复拦截
+    （037 中 accounts 查询 9 次提案、1 次执行且参数残缺 `user_id="890"`，
+    LLM 调用反增 58→81），任务被打入 transfer_to_human。
+  - **024**：Step 2B 预算在第 8 次检索强制收尾，bronze_001（$500 welcome
+    bonus 事实）**被检索到但没进 evidence packet**——DA 拿不到 Bronze 的
+    关键事实，推荐了错误的卡。
+- **Likely LLM variance（1 个）**：**007**——candidate 零机制介入事件，
+  DA 漏调 `get_current_time`、幻觉出"as of June 22, 2026"，把用户劝退。
+- **Uncertain（1 个）**：**003**——预算触顶存在、packet 组织方式不同，
+  但 DA 的 packet 里 Silver/Gold 事实齐全，最终推荐错卡更像业务判断差异。
+- 翻上的 008 是 transfer reason 字符串恰好匹配 gold（零机制介入，纯 variance）；
+  046 是 arguments JSON 的空格格式恰好匹配 gold（hints 可能有轻微帮助，
+  uncertain）。
+
+**结论**：-4 个回退中约 4 个有机制因果链（010/021/024/037），
+007/003 更像 run-to-run variance（V5 基线自身的历史波动为 ±4pp）。
+不能把全部 -4 记在机制头上，但机制可解释的部分足以让净效果为负。
+
+### tools -41% 的去向
+
+- **89% 的节省来自 13 个"两边都失败"的任务**（077: -35、080: -32、026: -20）——
+  省下的是无效死循环的 token，不产生 reward；
+- 回退任务组只省了 6 个 tool calls；
+- 因此"效率提升"与"success 回退"发生在**不同任务群体**上，不能互相抵消。
+
+### Step 1 / Step 3 的触发事实（诚实记录）
+
+- **Step 1（consistency）在整个 24-task run 中零触发**——targeted smoke 的
+  正结果不能外推到全量 Dev 的任务形态。
+- Step 3（coverage）触发 6 次（026/077×2/080/092/095），全部在双失败任务上，
+  与回退无关。
+
+### Final Decision：Conservative Rollback（commit `0aac7b6`）
+
+1. Freeze 条件"24-task Dev 整体没有明显退化"不满足（-4）；
+2. Step 2A 的结构性缺陷（"实体已知 ≠ 查询结果已知" + 提示实现为拦截-再生
+   循环而非旁注）被 trace 证实，修复需要重新设计判定条件并再跑全量验证；
+3. 项目核心结论（V5 同模型 Holdout +4）已经拿到，继续投入风险高、期望收益低；
+4. **执行整体 revert 至 V5 基线 runtime 状态**（`agents/` 回到 `3aa2918`
+   的实现），Step 0–3 连同 smoke configs 一并移除。
+
+> **Frozen V5 / V5.1（commit `3aa2918`）是本项目最终 Runtime。**
+> 当前 `main` 的 `agents/` 与该快照逐字节一致；其后的变更只有 docs /
+> tests / CI / 收口整理。**没有 V6，没有下一阶段。**
+
+### 这次实验验证的元结论
+
+- **targeted smoke 的机制触发率/效率收益不能预测全量 success**：
+  037 在 targeted 视角里只是"重复查询减少了"，全量里却是灾难性的拦截循环。
+  全量 Dev 是唯一可信的 freeze 门槛。
+- **"非硬拦"的设计意图不等于非硬拦的实现**：Step 2A 注释写"仍执行"，实现
+  走的是 `continue` 再生循环——设计评审时必须核对拦截循环的真实控制流。
+- 若未来重做：Step 2A 应只在"同 (tool, 参数组合) 已成功执行过"时提示且
+  提示后放行原调用；Step 2B 应保证 forced-stop 前已检索的 facts 全部并入
+  packet。
+
+---
+
+## 八、原下一阶段方向（历史存档，已关闭）
+
+> 以下 A/B/C/D 方向催生了 Post-V5 实验（上一节），实验结果为回退并
+> rollback。**保留此节作为假设-实验-证伪的完整记录，不再实施。**
 
 ### 方向 A：Plan-Execution 一致性自检（针对 mode 1/2）
 - **问题**：080 策略漂移后 plan 变摆设；092 guard 挡不住自主收尾。
@@ -223,11 +330,11 @@ _build_llm_context (two_agent.py:1240)
 - **最小验证**：080/063——unlock 次数/KB_search 是否下降。
 
 ### 方向 D（更远、需实验）：业务判断质量（mode 5）
-- 这层目前无机制可达。唯一有依据的假设：**把"业务规则"从 KA 的 narrative 提到 Task State 的 knowledge 命名空间并让 plan 显式引用**（V3 已有 knowledge 规则条目，但 plan 步骤未强制引用）。属于"知识→决策"的最后一公里，复杂度高、证据不足，**建议先做 A/B/C 再看**。
+- 这层目前无机制可达。唯一有依据的假设：**把"业务规则"从 KA 的 narrative 提到 Task State 的 knowledge 命名空间并让 plan 显式引用**（V3 已有 knowledge 规则条目，但 plan 步骤未强制引用）。属于"知识→决策"的最后一公里，复杂度高、证据不足。（**历史存档注**：当时写"建议先做 A/B/C 再看"——A/B/C 已实施并随 Post-V5 实验整体 rollback，D 方向随之关闭。）
 
 ---
 
-## 八、最终判断（区分证据等级）
+## 九、最终判断（区分证据等级）
 
 **已经被 trace/eval 支持的结论**：
 1. 确定性执行结构（V2.2-V5.1 harness+state+recovery）显著降低误拦/死循环（58→3→0），且 integrity 干净。
@@ -236,13 +343,16 @@ _build_llm_context (two_agent.py:1240)
 4. 2-agent + harness + state 在 success 上不优于 V0（5/24 vs 8/24，同模型公平对比），但在质量/可控性上占优。
 
 **有迹象但证据不足**：
-1. V5 planning 对 success 的因果贡献（混模型红利 + 无 A/B）。
+1. V5 planning 对 success 的因果贡献（Dev 侧混模型红利 + 无同模型 plan-vs-no-plan A/B；但 Holdout V4→V5 同模型 +4 已是强证据）。
 2. Plan 能降低重复工具调用（080/077 数据相反）。
 3. Context 存根化的实际收益（触发少）。
 
-**仍是推测的假设**：
-1. "业务判断质量"可通过机制改善（D 方向）。
-2. 完成判定双轨对齐能显著提 success（B 方向未验证）。
-3. Task State 使用闭环能降重复（C 方向未验证）。
+**已被 Post-V5 实验证伪的假设**（原"仍是推测"，现在有实验结论）：
+1. ~~"业务判断质量"可通过机制改善（D 方向）~~——未实验，随项目收口关闭。
+2. ~~完成判定双轨对齐能显著提 success（B 方向）~~——Step 3 coverage 实施，
+   全量 Dev 上触发 6 次全在双失败任务，无 success 收益。
+3. ~~Task State 使用闭环能降重复（C 方向）~~——Step 2A/2B 实施，重复确实
+   下降（tools -41%）**但以 success -4 为代价**（拦截循环挡掉首次合法查询 +
+   预算截断证据包），整体 rollback。
 
-**一句话总结**：V0→V5.1 的真实轨迹是"**评估驱动、每步用一个确定性机制解决一个被观察到的具体问题，同时不断用实验证伪自己的假设**"——被推翻的假设（全量 memory、evidence 正确值、`[PLAN]` 文本、行为观察）与成功的机制（对象级 state、三源 harness、实体绑定 plan 推进）同等重要。当前系统在**执行结构层已扎实**，剩下的 5 个 failure mode 集中在**策略-执行一致性、完成口径、状态利用、检索收敛、业务判断**——其中 A/B/C 三个方向有确定性机制可做且有最小验证路径，D 方向证据不足建议暂缓。V5.1 不是最终版；但它的不确定性已被收窄到"计划是否真正指挥执行"这一个可实验的核心问题上。
+**一句话总结**：V0→V5.1 的真实轨迹是"**评估驱动、每步用一个确定性机制解决一个被观察到的具体问题，同时不断用实验证伪自己的假设**"——被推翻的假设（全量 memory、evidence 正确值、`[PLAN]` 文本、行为观察、Post-V5 的状态复用提示）与成功的机制（对象级 state、三源 harness、实体绑定 plan 推进）同等重要。当前系统在**执行结构层已扎实**，剩余失败集中在业务判断层。**Post-V5 实验在执行结构层的最后一次尝试（一致性/复用/覆盖）已被全量 Dev 证伪并 rollback**——"计划是否真正指挥执行"这个核心问题的答案被证明不能用更多确定性提醒解决，而业务判断层需要不属于本项目的投入。**Frozen V5 / V5.1 就是本项目最终 Runtime；项目在此收口。**
