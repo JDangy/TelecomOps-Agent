@@ -218,10 +218,6 @@ STRICT RULES:
 """
 
 KNOWLEDGE_AGENT_MAX_ROUNDS = 6  # 防失控：一次 handoff 内最多 6 轮（检索+推理）
-KNOWLEDGE_AGENT_MAX_RETRIEVALS = 8  # Step 2B：单次 handoff 内 KB_search 调用预算——
-                                     # 宽泛问题每轮可发起多个检索（063 曾 12 次/handoff），
-                                     # 超预算强制收尾（有足够事实就出 packet，缺的进
-                                     # missing_information）
 
 
 class KnowledgeAgent:
@@ -317,7 +313,6 @@ class KnowledgeAgent:
         messages: List[Message] = [system, user_msg]
 
         forced_stop = False
-        self._retrieval_budget_used = 0  # Step 2B: 本次 handoff 检索预算
         for _round in range(KNOWLEDGE_AGENT_MAX_ROUNDS):
             # 停止条件：连续 LOW_PROGRESS_LIMIT 次检索无新信息 → 强制收尾
             if (self.memory is not None and not forced_stop
@@ -344,19 +339,6 @@ class KnowledgeAgent:
                 break  # 最终 packet 已产出
             # 执行它调用的每个知识工具（BM25 本地检索，微秒级）
             for tc in assistant.tool_calls:
-                # Step 2B: 检索预算——宽泛问题一轮可多个检索，超限强制收尾
-                if str(getattr(tc, "name", "")).startswith("KB_search"):
-                    self._retrieval_budget_used += 1
-                    if self._retrieval_budget_used > KNOWLEDGE_AGENT_MAX_RETRIEVALS:
-                        messages.append(UserMessage(
-                            role="user",
-                            content=("Search budget for this question is exhausted. "
-                                     "Stop searching and return your evidence packet "
-                                     "JSON now with what you have; put unanswered parts "
-                                     "in missing_information."),
-                        ))
-                        forced_stop = True
-                        break
                 result = self._run_tool(tc)
                 messages.append(result)
                 # memory 记录 query + docs；progress 检测（确定性，无 LLM）
@@ -832,7 +814,6 @@ class DecisionAgent(LLMAgent):
         from agents.harness.plan_store import PlanStore
         self.plan_store = PlanStore()
         self._planning_prompted = False             # runtime fallback 只提示一次
-        self._query_history: dict = {}              # Step 2A: (tool,args) → 次数
         self._planning_fallback_pending = False     # 下一轮注入提示
 
     # -- V2.2: TaskState 三源喂入 ------------------------------------------------
@@ -985,108 +966,6 @@ class DecisionAgent(LLMAgent):
         except Exception:
             pass
 
-    def _query_reuse_hint(self, biz_calls, rejected) -> str:
-        """检测"查询类调用引用了 Task State 已有实体"→ 轻量复用提示。
-
-        规则（能确认已有→提示；不能确认→不打扰）：
-        1. 只对 get_/list_/check_ 查询工具
-        2. 参数中的 ID 值（account_id/card_id/user_id）在 Task State 的
-           实体对象中存在（即之前查询/操作已把该实体信息入状态）
-        3. 返回提示文本（注入一次），否则返回 ""
-        """
-        if self.task_state is None or not biz_calls:
-            return ""
-        try:
-            from agents.harness.task_state_v3 import TaskStateV3
-            known_ids = set()
-            for key, chain in getattr(self.task_state, "_entries", {}).items():
-                cur = chain[-1]
-                if cur and cur.is_current and cur.field in (
-                        "id", "account_id", "card_id", "user_id",
-                        "credit_card_account_id"):
-                    known_ids.add(str(cur.value))
-            if not known_ids:
-                return ""
-            hint_fields = []
-            for tc in biz_calls:
-                if tc.id in rejected:
-                    continue
-                # wrapper 穿透：用 inner 工具名判断查询类（外层是
-                # call_discoverable_agent_tool）
-                name = self._toolcall_inner_by_id.get(tc.id) or tc.name
-                if not (name.startswith("get_") or name.startswith("list_")
-                        or name.startswith("check_")):
-                    continue
-                args = self._toolcall_args_by_id.get(tc.id) or {}
-                # 信号1: 参数引用已知实体且该实体状态有非 id 字段（结果可复用）
-                for k, v in args.items():
-                    if isinstance(v, str) and v in known_ids and len(v) >= 4:
-                        fields = [key.split(".")[-1] for key, chain in
-                                  getattr(self.task_state, "_entries", {}).items()
-                                  if chain and chain[-1].is_current
-                                  and str(chain[-1].value) == v
-                                  and key.split(".")[-1] not in ("id",)]
-                        if fields and not any(s in name for s in ("_history", "_transactions")):
-                            hint_fields.append(f"{k}={v} (state has: {', '.join(fields[:4])})")
-                            break
-                # 信号2: 同一查询工具+同一参数组合已执行 >=3 次（077 的 history/
-                # transactions 重复——无字段级结果可复用，但重复执行是浪费）
-                sig = (name, tuple(sorted((str(x) for x in args.values() if x))))
-                if sig in self._query_history:
-                    self._query_history[sig] += 1
-                else:
-                    self._query_history[sig] = 1
-                if self._query_history[sig] >= 3 and not hint_fields:
-                    hint_fields.append(
-                        f"repeated query: {name} with same args "
-                        f"({self._query_history[sig]}x this turn-cycle) — reuse prior result")
-            if not hint_fields:
-                return ""
-            return (
-                "Note: the following entity info is already in your task state — "
-                "reuse it instead of re-querying unless you need fresh values: "
-                + "; ".join(hint_fields[:3])
-                + ". (You may still call the tool if the values may have changed.)")
-        except Exception:
-            return ""
-
-    def _extract_goal_targets(self) -> dict:
-        """从用户目标消息提取"明确数量词+实体"（确定性，无 LLM）。
-
-        匹配模式："N cards" / "two accounts" / "four debit cards" 等。
-        只在明确数量词（>=2）时返回；否则空（不猜）。
-        """
-        import re as _re
-        try:
-            txt = self._recent_user_text() or ""
-            m = _re.search(
-                r"\b(two|three|four|five|six|seven|eight|nine|ten|\d+)\s+"
-                r"((?:[a-z]+\s?){1,4}?[a-z]+s)\b", txt, _re.IGNORECASE)
-            if not m:
-                return {}
-            num_map = {"two": 2, "three": 3, "four": 4, "five": 5,
-                       "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
-            num_txt = m.group(1).lower()
-            count = int(num_txt) if num_txt.isdigit() else num_map.get(num_txt, 0)
-            if count < 2:
-                return {}
-            # 实体词取匹配串的最后一个名词（"four debit cards" → cards），
-            # 支持 "debit card"/"credit card" 复合
-            phrase = m.group(2).strip().lower()
-            phrase_s = phrase.rstrip("s") if phrase.endswith("s") else phrase
-            if phrase_s.endswith(("debit card", "credit card", "checking account",
-                                  "savings account")):
-                entity = "card" if "card" in phrase else "account"
-            else:
-                words = phrase.split()
-                entity = words[-1].rstrip("s") if words else ""
-            if entity not in ("card", "account", "transaction"):
-                return {}
-            return {"entity_word": entity, "count": count,
-                    "source": "user message"}
-        except Exception:
-            return {}
-
     def _recent_user_text(self) -> str:
         try:
             from tau2.data_model.message import UserMessage
@@ -1231,39 +1110,13 @@ class DecisionAgent(LLMAgent):
                     guarded = False
                 if guarded:
                     continue
-                # ---- V5 Step 3: Goal Coverage（guard 不触发时的第二道检查）----
-                # 用户目标明确声明了 N 个实体（"four cards"），但 completed
-                # plan 步骤覆盖不足 → 提醒一次。仅依据 User Goal + Plan/Task
-                # State，不读 evaluator/gold。
-                try:
-                    if (self.plan_store.active
-                            and not self.plan_store.guard_should_remind()):
-                        declared = self._extract_goal_targets()
-                        if declared:
-                            cov_note = self.plan_store.coverage_check(
-                                declared, task_state=self.task_state)
-                            if cov_note:
-                                state.messages.append(assistant_message)
-                                from tau2.data_model.message import SystemMessage as _SM5
-                                state.messages.append(_SM5(
-                                    role="system", content=cov_note))
-                                try:
-                                    from eval.instrumentation import get_active_recorder
-                                    rec = get_active_recorder()
-                                    if rec is not None:
-                                        rec.emit("plan_goal_coverage", "decision_agent",
-                                                 parent_span_id=getattr(rec, "task_span_id", None),
-                                                 declared=str(declared)[:200],
-                                                 note=cov_note[:200])
-                                except Exception:
-                                    pass
-                                continue
-                except Exception:
-                    pass
                 break  # 纯文本 → 与官方行为一致
 
-            # Step 0 清理：V5 不再解析 [PLAN] 文本（plan_tracker 为 telemetry，
-            # Plan 只由 write_plan/update_plan 工具落 PlanStore）
+            # V4: 解析 assistant 文本中的 [PLAN] 行（Plan Mode 时）
+            if self.plan_tracker is not None:
+                self.plan_tracker.ingest_agent_text(
+                    assistant_message.content or "")
+
             calls = assistant_message.tool_calls or []
             PLAN_TOOL_NAMES = {"write_plan", "update_plan", "read_plan"}
             ask_calls = [tc for tc in calls if tc.name == "ask_knowledge_agent"]
@@ -1334,56 +1187,6 @@ class DecisionAgent(LLMAgent):
                     if hasattr(tc, "_harness_tool"):
                         del tc._harness_tool
 
-            # ---- V5 Step 1: Plan–Execution Consistency 检查 ----
-            # 只对"通过校验、将真实执行"的 mutation 业务调用检查；查询工具
-            # 不计入偏离。触发提醒 → 注入 system 消息并重新生成（DA 自选
-            # 继续当前计划或 update_plan 写回新路线——不替 DA 决策）。
-            consistency_note = None
-            if (self.plan_store is not None and self.plan_store.active
-                    and biz_calls and not rejected):
-                for tc in biz_calls:
-                    if tc.id in rejected:
-                        continue
-                    inner = self._toolcall_inner_by_id.get(tc.id)
-                    args = self._toolcall_args_by_id.get(tc.id) or {}
-                    if inner:
-                        note = self.plan_store.consistency_check(
-                            inner, args, task_state=self.task_state)
-                        if note:
-                            consistency_note = note
-                            break
-            if consistency_note:
-                state.messages.append(assistant_message)
-                from tau2.data_model.message import SystemMessage as _SM3
-                state.messages.append(_SM3(
-                    role="system",
-                    content=consistency_note + " Do not change your business logic "
-                    "based on this note alone; it only asks you to keep the plan "
-                    "reflecting reality."))
-                continue
-
-            # ---- V5 Step 2A: 查询复用提示（有状态不用 → 提醒复用）----
-            # 查询类 biz call（get_*）若参数引用的实体信息已在 Task State，
-            # 注入轻量提示（非硬拦——仍执行，但让 DA 知道可复用）。
-            # 能确认已有→提示复用；不能确认→正常查询不打扰。
-            reuse_note = self._query_reuse_hint(biz_calls, rejected)
-            if reuse_note:
-                state.messages.append(assistant_message)
-                from tau2.data_model.message import SystemMessage as _SM4
-                state.messages.append(_SM4(
-                    role="system", content=reuse_note))
-                # trace 事件（与 plan 事件同风格——观测触发）
-                try:
-                    from eval.instrumentation import get_active_recorder
-                    rec = get_active_recorder()
-                    if rec is not None:
-                        rec.emit("state_reuse_hint", "decision_agent",
-                                 parent_span_id=getattr(rec, "task_span_id", None),
-                                 note=reuse_note[:200])
-                except Exception:
-                    pass
-                continue
-
             if not ask_calls and not rejected:
                 # 全部通过（或纯业务工具）→ 原样交给 orchestrator（V1.2 路径）
                 break
@@ -1450,11 +1253,9 @@ class DecisionAgent(LLMAgent):
         except Exception:
             v5_plan_block = ""
         combined_mem = v5_plan_block + ("\n\n" + mem_block if (v5_plan_block and mem_block) else mem_block)
-        # Step 0 清理：plan_active 仅表示"存在 V5 结构化 Plan"（决定历史
-        # 轻量化）；plan_tracker 已从 context 移除（纯 telemetry）
         return build_context(
             state, task_state=self.task_state,
-            plan_active=bool(v5_plan_block),
+            plan_tracker=getattr(self, "plan_tracker", None),
             memory_block=combined_mem, state_block=state_block,
         )
 

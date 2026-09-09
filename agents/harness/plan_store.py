@@ -48,11 +48,6 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 
-# ---- Plan–Execution Consistency 阈值（Step 1）----
-CONSISTENCY_STREAK = 3      # 有 tool_hint：连续偏离次数才提醒
-CONSISTENCY_STALLED = 5     # 无 tool_hint：连续未推进任何步骤才提醒
-
-
 # 步骤状态
 PENDING = "pending"
 IN_PROGRESS = "in_progress"
@@ -93,11 +88,6 @@ class PlanStore:
         # guard 有界（第 12 节）
         self.guard_reminders = 0
         self.GUARD_LIMIT = 2
-        # Plan–Execution Consistency（Step 1）
-        self._off_plan_streak = 0
-        self._off_plan_stall_mutations = 0
-        self._off_plan_reminded = False
-        self.coverage_reminded = False  # Step 3: goal coverage 只提醒一次
 
     # ------------------------------------------------------------------
     # planning tool 的后端（DA 调用 → 这里确定性执行）
@@ -112,8 +102,6 @@ class PlanStore:
         self.goal = (goal or "").strip()[:300]
         self.steps = []
         self._current_step_id = None
-        self.reset_consistency()
-        self.coverage_reminded = False
         for s in steps or []:
             if not isinstance(s, dict) or not s.get("description"):
                 continue
@@ -132,7 +120,6 @@ class PlanStore:
                     note: str = None, tool_hint: str = None) -> dict:
         """步骤级增量更新（不重写全计划——第 8 节条件 replanning）。"""
         if op == "set_current":
-            self.reset_consistency()
             st = self._find(step_id)
             if st is None:
                 return {"ok": False, "error": f"unknown step {step_id}"}
@@ -371,105 +358,6 @@ class PlanStore:
         if self.guard_reminders >= self.GUARD_LIMIT:
             return False
         return bool(self.pending_steps())
-
-    # ------------------------------------------------------------------
-    # Plan–Execution Consistency（Step 1）
-    # ------------------------------------------------------------------
-    def consistency_check(self, inner_tool: str, arguments: dict,
-                          task_state=None) -> Optional[str]:
-        """一次业务（mutation）工具执行前的偏离检测。
-
-        返回 None = 未明显偏离（放行）；返回 str = 提醒文本（应注入
-        DA context 一次，直到计划更新）。
-
-        规则（有明确依据才干预，不确定放行）：
-        A. current step 有 tool_hint：连续 >= CONSISTENCY_STREAK 次执行的
-           mutation 工具与 tool_hint/实体绑定不匹配 → 偏离。
-        B. current step 无 tool_hint（面向对象描述）：连续 >=
-           CONSISTENCY_STALLED 次 mutation 执行都未推进任何 plan step
-           → 计划未反映执行。
-        查询工具（get_*/list_*/check_*）不计入偏离（合法临时查询不误伤）。
-        """
-        if not self.active or self._current_step_id is None:
-            return None
-        if inner_tool.startswith(("get_", "list_", "check_")):
-            return None
-        cur = self._find(self._current_step_id)
-        if cur is None:
-            return None
-        if cur.tool_hint:
-            # 有 tool_hint 时只认工具名匹配（实体绑定用于多对象消歧，
-            # 不作为"换动作也 OK"的理由——step 明确声明了业务动作）
-            if inner_tool == cur.tool_hint:
-                self._off_plan_streak = 0
-                return None
-            self._off_plan_streak += 1
-            if self._off_plan_streak >= CONSISTENCY_STREAK and not self._off_plan_reminded:
-                self._off_plan_reminded = True
-                return (f"Your execution has diverged from the current plan step "
-                        f"({cur.step_id}: '{cur.description}'" +
-                        (f", tool: {cur.tool_hint}" if cur.tool_hint else "") +
-                        f"): {self._off_plan_streak} consecutive actions did not match it. "
-                        "If your business route has changed, call update_plan to reflect "
-                        "the new strategy (set_current/add_step/remove_step); if you are "
-                        "still on track, continue and ignore this note.")
-            return None
-        # B: 无 tool_hint 兜底——连续 mutation 未推进任何步骤
-        self._off_plan_stall_mutations += 1
-        if self._off_plan_stall_mutations >= CONSISTENCY_STALLED and not self._off_plan_reminded:
-            self._off_plan_reminded = True
-            return (f"Your plan does not seem to reflect recent execution: "
-                    f"{self._off_plan_stall_mutations} business actions have not matched "
-                    "any plan step. If the strategy changed, call update_plan to write "
-                    "the new route back into the plan; otherwise set_current to the step "
-                    "you are actually working on.")
-        return None
-
-    def reset_consistency(self) -> None:
-        """计划变更（write/update）后重置偏离计数——新计划重新对齐。"""
-        self._off_plan_streak = 0
-        self._off_plan_stall_mutations = 0
-        self._off_plan_reminded = False
-
-    # ------------------------------------------------------------------
-    # Goal Coverage（Step 3）：用户目标中的实体覆盖检查
-    # ------------------------------------------------------------------
-    def coverage_check(self, declared_targets: dict,
-                       task_state=None) -> Optional[str]:
-        """DA 准备结束时：用户明确声明了 N 个实体，但只处理了部分。
-
-        仅依据 User Goal（数量词提取）+ Plan/Task State（已处理实体），
-        不读 evaluator/gold。返回提醒文本或 None。
-
-        declared_targets: {"entity_word": "cards", "count": 4, "source": "user msg"}
-        """
-        if not declared_targets or declared_targets.get("count", 0) < 2:
-            return None
-        if self.coverage_reminded:
-            return None
-        count = int(declared_targets["count"])
-        entity = declared_targets.get("entity_word", "items")
-        # 已处理实体数：Task State 里被操作过的实体对象数（保守——
-        # 只看 plan 里 completed 步骤涉及的实体数）
-        handled = 0
-        try:
-            completed_entities = set()
-            for s in self.steps:
-                if s.status == COMPLETED:
-                    for e in s.entities:
-                        completed_entities.add(e)
-            handled = len(completed_entities)
-        except Exception:
-            handled = 0
-        if handled >= count:
-            return None
-        missing = count - handled
-        self.coverage_reminded = True
-        return (f"Goal coverage check: you stated there are {count} {entity} to "
-                f"handle, but only {handled} appear covered by completed plan steps. "
-                f"{missing} may still be unhandled. If they are still required, "
-                "continue; otherwise call update_plan to mark/remove them explicitly "
-                "before finishing.")
 
     def plan_block(self, max_chars: int = 800) -> str:
         """渲染注入 DA context 的计划块（围绕 current step——第 11 节）。"""

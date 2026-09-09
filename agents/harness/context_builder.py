@@ -30,7 +30,7 @@ RECENT_WINDOW = 12
 COMPACT_TRIGGER = 24
 
 
-def build_context(state, task_state, plan_active: bool = False,
+def build_context(state, task_state, plan_tracker,
                   memory_block: str = "",
                   state_block: str = "") -> list:
     """构造 DA 本轮消息视图（确定性替换，零 LLM）。
@@ -38,17 +38,17 @@ def build_context(state, task_state, plan_active: bool = False,
     Args:
         state: tau2 AgentState（system_messages + messages）
         task_state: TaskStateV3（判断哪些 ToolResult 已外部化）
-        plan_active: 当前是否有 V5 结构化 Plan（决定是否轻量化旧历史）
+        plan_tracker: PlanTracker（Goal/Progress block）
         memory_block / state_block: V3 已有的注入块
     Returns:
         消息列表（不修改 state 本身——副本替换）。
     """
     msgs = list(state.messages)
+    plan_block = plan_tracker.progress_block() if plan_tracker else ""
 
-    # 组装 system 尾部块（Plan 由调用方经 memory_block 注入——
-    # PlanStore 是唯一 Plan 来源；plan_tracker 仅为 telemetry，不进 context）
-    blocks = [b for b in (memory_block, state_block) if b]
-    if not plan_active:
+    # 组装 system 尾部块
+    blocks = [b for b in (memory_block, state_block, plan_block) if b]
+    if not plan_tracker or not plan_tracker.plan:
         # 非 Plan Mode：V3 路径（全量历史 + blocks）
         return _with_system(state, blocks) + msgs
 
