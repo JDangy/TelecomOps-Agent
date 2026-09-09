@@ -12,6 +12,11 @@
 # Python 3.13 兼容：tau2 的 voice 模块 import audioop（3.13 已移除），需要此 backport
 audioop-lts>=0.2.2
 
+# tau2 的 knowledge extra 未随默认安装声明进依赖链，但 BM25 检索必需
+# （tau2 pyproject 把 rank-bm25 放在 optional-dependencies.knowledge 里；
+#  本项目评测与 integrity 测试均使用 --retrieval-config bm25，必须显式安装）
+rank-bm25>=0.2.2
+
 # 用于加载 .env 环境变量
 python-dotenv>=1.0.0
 

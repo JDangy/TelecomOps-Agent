@@ -27,22 +27,33 @@ REAL_TOOL_NAMES_FILE = "third_party/tau2-bench/data/tau2/domains/banking_knowled
 
 
 def _real_discoverable_tool_names():
-    """从 tau2 toolkit 提取全部真实 discoverable 工具名（含 44 个）。"""
-    try:
-        from tau2.domains.banking_knowledge.environment import get_environment
-        env = get_environment(retrieval_variant="bm25", retrieval_kwargs={})
-        for t in env.get_tools():
-            if t.name == "call_discoverable_agent_tool":
-                tk = t._func.__self__
-                return set(tk.get_discoverable_tools().keys())
-    except Exception:
-        pass
+    """从 tau2 toolkit 提取全部真实 discoverable 工具名（含 44 个）。
+
+    失败时抛出原始异常（带根因提示）而不是静默返回空集——
+    静默会让 CI 上"缺 rank-bm25 依赖"这类环境问题变成一句无法
+    定位的"tau2 环境异常"（CI 首跑实测教训）。
+    """
+    from tau2.domains.banking_knowledge.environment import get_environment
+    env = get_environment(retrieval_variant="bm25", retrieval_kwargs={})
+    for t in env.get_tools():
+        if t.name == "call_discoverable_agent_tool":
+            tk = t._func.__self__
+            return set(tk.get_discoverable_tools().keys())
     return set()
 
 
 def test_no_real_tool_names_in_agent_prompts():
     """agents/ 下任何 .py 的字符串中不得出现真实 discoverable 工具名。"""
-    real = _real_discoverable_tool_names()
+    try:
+        real = _real_discoverable_tool_names()
+    except Exception as e:  # 环境装配问题——给出可定位的错误信息
+        raise AssertionError(
+            f"无法构建 tau2 banking_knowledge 环境以获取真实工具名列表："
+            f"{type(e).__name__}: {e}。"
+            "常见原因：未安装 rank-bm25（tau2 的 knowledge extra，"
+            "BM25 检索必需）——`pip install -r requirements.txt` 应包含"
+            "rank-bm25>=0.2.2；或 git submodule 未初始化"
+            "（third_party/tau2-bench/data 缺失）。") from e
     assert real, "无法获取真实工具名列表（tau2 环境异常）"
     violations = []
     for f in glob.glob(os.path.join(ROOT, "agents", "**", "*.py"), recursive=True):
