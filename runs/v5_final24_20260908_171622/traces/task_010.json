@@ -1,0 +1,273 @@
+{
+  "task_id": "task_010",
+  "task": {
+    "task_id": "task_010",
+    "description": {
+      "purpose": "Task: task_010",
+      "relevant_policies": null,
+      "notes": null
+    },
+    "user_scenario": {
+      "persona": null,
+      "instructions": "**Your character:** Wei Chen, a 45-year-old software architect from Boston. You are methodical and detail-oriented, but currently frustrated.\n\n**Your situation:** You signed up four of your friends for Rho-Bank credit cards. All four actually signed up. But you only got bonus money for two of them. You want to know why you didn't get the bonus for all four.\n\nYour user ID is 76ad9cc60e, your phone number is 617-555-0834, and your email is wei.chen.boston@gmail.com. Do NOT volunteer this unless specifically asked for it. You know this from your account settings, but a real customer would never proactively offer \"my user ID is...\" unless specifically asked for it.\n\n## How to Behave\n\n1. **Start naturally:** Explain your problem the way a real customer would: \"I got four friends to sign up for your credit cards, but I only received bonuses for two of them. What's going on?\"\n\n2. **Answer questions, don't anticipate them:** When the agent asks for information to look you up, provide what they ask for—nothing more. If they ask for your name, give your name. If they ask for email, give email. Do NOT say things like \"Would you like my user ID?\" or \"Here's my account number to help you look it up.\" Real customers don't know what lookup fields exist in the agent's system.\n\n3. **React naturally to what the agent DOES, not what you want them to do:**\n   - If the agent says they can't access your account, or gives only generic/vague reasons without actually investigating YOUR specific situation, that's unhelpful. A real customer would be frustrated and accept any offer to escalate or transfer.\n   - If the agent actually looks up YOUR account and tells you something SPECIFIC about YOUR referrals (e.g., \"I see you submitted 4 referrals but one was rejected because of X policy\"), then you've learned something concrete. Only in this case would you consider taking further action.\n\n4. **Never fish for the \"right\" answer:** Do not ask probing questions like \"Is there a cap?\" or \"Could it be a policy issue?\" A real customer doesn't know what policies exist. You're frustrated and want answers—you're not trying to coach the agent toward the correct diagnosis.\n\n5. **Tool usage:** You have access to submit_referral. Only use it if the agent has actually investigated your account and given you a SPECIFIC, CONCRETE explanation for why some referrals didn't qualify (not generic possibilities, but actual findings from looking at your data). Use your user_id (76ad9cc60e) and corresponding account_type (e.g., \"Gold Rewards Card\").\n\n6. **Default to escalation:** If the agent can't give you specific answers about YOUR situation, accept any offer to escalate or ask to speak with someone who can actually look at your account.\n\n7. **Take action when given a path forward:** If the agent explains that a referral was rejected due to a temporary restriction that has now passed, and retrying is possible, go ahead and submit a new referral for that card type. You want to recover any missed bonuses if the opportunity exists."
+    }
+  },
+  "reward": 0.0,
+  "termination_reason": "user_stop",
+  "agent_cost": 0.0,
+  "user_cost": 0.0,
+  "system_prompt": null,
+  "conversation": [
+    {
+      "turn": 0,
+      "role": "assistant",
+      "content": "Hi! How can I help you today?"
+    },
+    {
+      "turn": 1,
+      "role": "user",
+      "content": "I got four friends to sign up for your credit cards, but I only received bonuses for two of them. What's going on?"
+    },
+    {
+      "turn": 2,
+      "role": "assistant",
+      "content": "That pattern is usually explained by one of our program rules, so let me share the general policy and then check your specific referrals.\n\n**Most likely cause:** credit card referral bonuses are capped at **2 per rolling 7-day window, counted across all card types combined** (not per card, and not calendar weeks — exact timestamps). A 3rd or 4th bonus that lands inside the same window is automatically denied and can't be reinstated until older bonuses age out of that window.\n\n**Other common reasons a bonus doesn't post:**\n- The friend applied **before** using your unique referral link, so it couldn't be attributed\n- They weren't approved, or haven't yet met the card's qualifying-spend requirement (amount and window vary by card, e.g. $750/60 days up to $15,000/135 days)\n- Returns, credits, cash equivalents or fees reduced their qualifying spend below the threshold\n- You hit that card's annual cap (typically 7 for consumer cards, 8–11 for business cards)\n- Your account wasn't in good standing at verification time\n\nTo look at your actual referral records and tell you exactly which of these applies, I'll need to verify your identity. Please send:\n\n1. Your **full name or user ID**, and\n2. Any **two** of: date of birth (MM/DD/YYYY), email address, phone number, or mailing address."
+    },
+    {
+      "turn": 3,
+      "role": "user",
+      "content": "My name is Wei Chen. You can reach the account at wei.chen.boston@gmail.com, and my phone number is 617-555-0834.\n\nThat rolling-window explanation you mentioned sounds plausible, but I didn't sign all four up in the same week — they trickled in over about a month. So I'd like you to actually pull up my referral records and tell me which ones were denied and why."
+    },
+    {
+      "turn": 4,
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "call_559d4702b4564c9fb1cb5bed",
+          "name": "get_user_information_by_name",
+          "arguments": {
+            "customer_name": "Wei Chen"
+          }
+        }
+      ]
+    },
+    {
+      "turn": 5,
+      "role": "tool",
+      "tool_call_id": "call_559d4702b4564c9fb1cb5bed",
+      "name": "get_user_information_by_name",
+      "arguments": {
+        "customer_name": "Wei Chen"
+      },
+      "content": "Found 1 record(s) in 'users':\n\n1. Record ID: 76ad9cc60e\n   name: Wei Chen\n   user_id: 76ad9cc60e\n   address: 88 Harbor View Court, Boston, MA 02110\n   email: wei.chen.boston@gmail.com\n   phone_number: 617-555-0834\n   date_of_birth: 04/17/1979\n"
+    },
+    {
+      "turn": 6,
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "call_26ba2bfaa9b940b8b33bf361",
+          "name": "get_current_time",
+          "arguments": {}
+        }
+      ]
+    },
+    {
+      "turn": 7,
+      "role": "tool",
+      "tool_call_id": "call_26ba2bfaa9b940b8b33bf361",
+      "name": "get_current_time",
+      "arguments": {},
+      "content": "The current time is 2025-11-14 03:40:00 EST."
+    },
+    {
+      "turn": 8,
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "call_f1e5da33400a4a0aac816c24",
+          "name": "log_verification",
+          "arguments": {
+            "name": "Wei Chen",
+            "user_id": "76ad9cc60e",
+            "address": "88 Harbor View Court, Boston, MA 02110",
+            "email": "wei.chen.boston@gmail.com",
+            "phone_number": "617-555-0834",
+            "date_of_birth": "04/17/1979",
+            "time_verified": "2025-11-14 03:40:00 EST"
+          }
+        }
+      ]
+    },
+    {
+      "turn": 9,
+      "role": "tool",
+      "tool_call_id": "call_f1e5da33400a4a0aac816c24",
+      "name": "log_verification",
+      "arguments": {
+        "name": "Wei Chen",
+        "user_id": "76ad9cc60e",
+        "address": "88 Harbor View Court, Boston, MA 02110",
+        "email": "wei.chen.boston@gmail.com",
+        "phone_number": "617-555-0834",
+        "date_of_birth": "04/17/1979",
+        "time_verified": "2025-11-14 03:40:00 EST"
+      },
+      "content": "Verification logged successfully.\n  - User: Wei Chen (ID: 76ad9cc60e)\n  - Verified at: 2025-11-14 03:40:00 EST"
+    },
+    {
+      "turn": 10,
+      "role": "assistant",
+      "content": "I pulled up your profile and attempted to retrieve the referral list, but I have to be straight with you: I don't have a view that shows the per-referral denial reason or the exact bonus timestamps on your account. I can see the program rules, but not the underlying records the way the app dashboard does.\n\nHere's what I can tell you, including why your \"not the same week\" point may not rule out the rolling cap:\n\n**The cap is measured on bonus timestamps, not signup dates.** A bonus only posts after your friend is approved *and* completes the card's qualifying spend, which runs 60–135 days after account opening. So four friends signing up over a month can easily produce bonuses that land within the same 7-day window — and the 3rd and 4th would then be auto-denied. That's the most common reason for exactly your pattern.\n\n**What to check in the app:** go to your referral dashboard (in the rewards section) and look at the status on each of the four:\n\n- **REJECTED** — the rolling 2-per-7-day cap was hit. These cannot be reinstated or appealed; the only remedy is waiting for older bonuses to age out of the window.\n- **COMPLETE** — criteria met, bonus granted.\n- **IN_PROGRESS** / **APPLIED** — the friend was approved or applied but hasn't finished qualifying spend yet. The bonus isn't denied, just not earned yet.\n- **NO_PROGRESS** — no application was ever started through your link, which usually means they applied before using it and it can't be attributed.\n- **ERROR** — a system issue, which I *can* escalate.\n\nIf you tell me **which card each friend opened and what status the dashboard shows for each**, I can check the specific qualifying-spend requirement and annual cap for those cards and tell you which of the four is genuinely gone versus still pending. If any of them shows ERROR, let me know, since that's treated differently from a cap rejection."
+    },
+    {
+      "turn": 11,
+      "role": "user",
+      "content": "Honestly, that's not what I was hoping for. You're asking me to go play detective in the app and read the statuses back to you — but I called because *you* have the account systems and I don't have anyone to interpret them.\n\nI'm not going to guess which of my four is \"REJECTED\" versus \"IN_PROGRESS.\" Can you transfer me to whoever can actually see the referral records and the bonus timestamps on my account? Someone who can tell me, for each of the four friends, whether the bonus is gone or still pending?"
+    },
+    {
+      "turn": 12,
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "call_55daf0860ed44a0087777b2c",
+          "name": "transfer_to_human_agents",
+          "arguments": {
+            "reason": "kb_search_unsuccessful_customer_requests_transfer",
+            "summary": "Verified customer Wei Chen (user_id 76ad9cc60e; email wei.chen.boston@gmail.com; phone 617-555-0834; verification logged 2025-11-14 03:40:00 EST) reports making four credit card referrals over roughly a month but receiving only two bonuses. He asks for a per-referral determination — for each of the four friends, whether the bonus is denied/gone or still pending — along with the referral statuses and bonus timestamps.\n\nWhat was attempted: I searched the knowledge base twice for an internal agent tool that lists a customer's credit card referral records, per-referral status, denial reason codes, and bonus timestamps. The KB confirms no such agent-facing tool exists; the only documented referral tool is the customer-run get_referral_link(user_id, card_name), which creates a NO_PROGRESS record and is not a lookup tool. Referral status is otherwise customer-visible only in the app referral dashboard.\n\nI explained the documented program rules: a rolling cap of 2 credit card referral bonuses per 7-day window across all card types, evaluated on exact bonus timestamps rather than signup dates (so referrals spread over a month can still collide), plus per-card annual caps (typically 7 consumer / 8-11 business) and non-payment triggers (applying before the link, not approved, qualifying spend of 60-135 days not met, returns/cash equivalents reducing spend, account not in good standing). Status semantics: REJECTED = rolling-limit denial, COMPLETE = bonus granted, IN_PROGRESS/APPLIED = still pending, NO_PROGRESS = no application started via link, ERROR = system issue.\n\nI asked the customer to read the four statuses from his app dashboard so I could interpret them against the specific card terms. He declined, explaining he called precisely because he lacks access to anyone who can interpret those internal records, and requested transfer to someone who can see the referral records and bonus timestamps and give him a per-friend answer. Two KB searches for a referral-specific escalation path or specialized rewards team returned nothing, so the generic human transfer is the documented route.\n\nNote for the receiving agent: the KB documents no appeal or manual-reinstatement process for rolling-cap referral denials, so if two of the four are REJECTED under the 7-day cap, the customer may need that expectation set directly."
+          }
+        }
+      ]
+    },
+    {
+      "turn": 13,
+      "role": "tool",
+      "tool_call_id": "call_55daf0860ed44a0087777b2c",
+      "name": "transfer_to_human_agents",
+      "arguments": {
+        "reason": "kb_search_unsuccessful_customer_requests_transfer",
+        "summary": "Verified customer Wei Chen (user_id 76ad9cc60e; email wei.chen.boston@gmail.com; phone 617-555-0834; verification logged 2025-11-14 03:40:00 EST) reports making four credit card referrals over roughly a month but receiving only two bonuses. He asks for a per-referral determination — for each of the four friends, whether the bonus is denied/gone or still pending — along with the referral statuses and bonus timestamps.\n\nWhat was attempted: I searched the knowledge base twice for an internal agent tool that lists a customer's credit card referral records, per-referral status, denial reason codes, and bonus timestamps. The KB confirms no such agent-facing tool exists; the only documented referral tool is the customer-run get_referral_link(user_id, card_name), which creates a NO_PROGRESS record and is not a lookup tool. Referral status is otherwise customer-visible only in the app referral dashboard.\n\nI explained the documented program rules: a rolling cap of 2 credit card referral bonuses per 7-day window across all card types, evaluated on exact bonus timestamps rather than signup dates (so referrals spread over a month can still collide), plus per-card annual caps (typically 7 consumer / 8-11 business) and non-payment triggers (applying before the link, not approved, qualifying spend of 60-135 days not met, returns/cash equivalents reducing spend, account not in good standing). Status semantics: REJECTED = rolling-limit denial, COMPLETE = bonus granted, IN_PROGRESS/APPLIED = still pending, NO_PROGRESS = no application started via link, ERROR = system issue.\n\nI asked the customer to read the four statuses from his app dashboard so I could interpret them against the specific card terms. He declined, explaining he called precisely because he lacks access to anyone who can interpret those internal records, and requested transfer to someone who can see the referral records and bonus timestamps and give him a per-friend answer. Two KB searches for a referral-specific escalation path or specialized rewards team returned nothing, so the generic human transfer is the documented route.\n\nNote for the receiving agent: the KB documents no appeal or manual-reinstatement process for rolling-cap referral denials, so if two of the four are REJECTED under the 7-day cap, the customer may need that expectation set directly."
+      },
+      "content": "Transfer successful (reason: kb_search_unsuccessful_customer_requests_transfer). A human agent will assist you shortly."
+    },
+    {
+      "turn": 14,
+      "role": "assistant",
+      "content": "You're right to push back — that lookup needs account-system access I don't have, so I've transferred you to a human agent who can see your referral records and bonus timestamps.\n\nI've passed along your verification, the four-referrals/two-bonuses situation, and your specific ask: **for each of the four friends, whether that bonus is gone or still pending**, rather than a general explanation of the rules.\n\nOne thing worth knowing going in, so the answer doesn't feel like a letdown if two come back as denied: for the rolling 7-day cap specifically, our documentation has no appeal or manual-reinstatement path — the cap is evaluated on bonus timestamps, which is why your month-long spread doesn't necessarily prevent collisions. Your agent will be able to confirm whether that's actually what happened here or whether the other two are simply still pending qualifying spend."
+    },
+    {
+      "turn": 15,
+      "role": "user",
+      "content": "###TRANSFER###"
+    }
+  ],
+  "tool_calls": [
+    {
+      "id": "call_559d4702b4564c9fb1cb5bed",
+      "name": "get_user_information_by_name",
+      "arguments": {
+        "customer_name": "Wei Chen"
+      },
+      "result": "Found 1 record(s) in 'users':\n\n1. Record ID: 76ad9cc60e\n   name: Wei Chen\n   user_id: 76ad9cc60e\n   address: 88 Harbor View Court, Boston, MA 02110\n   email: wei.chen.boston@gmail.com\n   phone_number: 617-555-0834\n   date_of_birth: 04/17/1979\n",
+      "error": false
+    },
+    {
+      "id": "call_26ba2bfaa9b940b8b33bf361",
+      "name": "get_current_time",
+      "arguments": {},
+      "result": "The current time is 2025-11-14 03:40:00 EST.",
+      "error": false
+    },
+    {
+      "id": "call_f1e5da33400a4a0aac816c24",
+      "name": "log_verification",
+      "arguments": {
+        "name": "Wei Chen",
+        "user_id": "76ad9cc60e",
+        "address": "88 Harbor View Court, Boston, MA 02110",
+        "email": "wei.chen.boston@gmail.com",
+        "phone_number": "617-555-0834",
+        "date_of_birth": "04/17/1979",
+        "time_verified": "2025-11-14 03:40:00 EST"
+      },
+      "result": "Verification logged successfully.\n  - User: Wei Chen (ID: 76ad9cc60e)\n  - Verified at: 2025-11-14 03:40:00 EST",
+      "error": false
+    },
+    {
+      "id": "call_55daf0860ed44a0087777b2c",
+      "name": "transfer_to_human_agents",
+      "arguments": {
+        "reason": "kb_search_unsuccessful_customer_requests_transfer",
+        "summary": "Verified customer Wei Chen (user_id 76ad9cc60e; email wei.chen.boston@gmail.com; phone 617-555-0834; verification logged 2025-11-14 03:40:00 EST) reports making four credit card referrals over roughly a month but receiving only two bonuses. He asks for a per-referral determination — for each of the four friends, whether the bonus is denied/gone or still pending — along with the referral statuses and bonus timestamps.\n\nWhat was attempted: I searched the knowledge base twice for an internal agent tool that lists a customer's credit card referral records, per-referral status, denial reason codes, and bonus timestamps. The KB confirms no such agent-facing tool exists; the only documented referral tool is the customer-run get_referral_link(user_id, card_name), which creates a NO_PROGRESS record and is not a lookup tool. Referral status is otherwise customer-visible only in the app referral dashboard.\n\nI explained the documented program rules: a rolling cap of 2 credit card referral bonuses per 7-day window across all card types, evaluated on exact bonus timestamps rather than signup dates (so referrals spread over a month can still collide), plus per-card annual caps (typically 7 consumer / 8-11 business) and non-payment triggers (applying before the link, not approved, qualifying spend of 60-135 days not met, returns/cash equivalents reducing spend, account not in good standing). Status semantics: REJECTED = rolling-limit denial, COMPLETE = bonus granted, IN_PROGRESS/APPLIED = still pending, NO_PROGRESS = no application started via link, ERROR = system issue.\n\nI asked the customer to read the four statuses from his app dashboard so I could interpret them against the specific card terms. He declined, explaining he called precisely because he lacks access to anyone who can interpret those internal records, and requested transfer to someone who can see the referral records and bonus timestamps and give him a per-friend answer. Two KB searches for a referral-specific escalation path or specialized rewards team returned nothing, so the generic human transfer is the documented route.\n\nNote for the receiving agent: the KB documents no appeal or manual-reinstatement process for rolling-cap referral denials, so if two of the four are REJECTED under the 7-day cap, the customer may need that expectation set directly."
+      },
+      "result": "Transfer successful (reason: kb_search_unsuccessful_customer_requests_transfer). A human agent will assist you shortly.",
+      "error": false
+    }
+  ],
+  "retrieval": {
+    "config": "bm25",
+    "config_kwargs": {},
+    "total_calls": 0,
+    "calls": []
+  },
+  "two_agent": [
+    {
+      "question": "How does the credit card referral bonus program work — what are the requirements for a referral bonus to be awarded, and are there limits on how many bonuses a referrer can receive?",
+      "latency_ms": 90090.5,
+      "evidence_packet_chars": 12328,
+      "facts": 20,
+      "document_ids": [
+        "doc_credit_cards_credit_cards_(general)_002",
+        "doc_credit_cards_credit_cards_(general)_020",
+        "doc_credit_cards_credit_cards_(general)_001",
+        "doc_credit_cards_credit_cards_(general)_009",
+        "doc_credit_cards_platinum_rewards_card_008",
+        "doc_credit_cards_silver_rewards_card_011",
+        "doc_credit_cards_ecocard_011",
+        "doc_business_credit_cards_business_gold_rewards_card_010",
+        "doc_business_credit_cards_business_platinum_rewards_card_012",
+        "doc_business_credit_cards_business_bronze_rewards_card_011",
+        "doc_business_credit_cards_business_silver_rewards_card_013",
+        "doc_business_credit_cards_silver_zoom_card_011",
+        "doc_business_credit_cards_green_rewards_card_010"
+      ],
+      "confidence": "high",
+      "missing_information": 4
+    },
+    {
+      "question": "How can an agent inspect a customer's existing credit card referral records and see why a referral was denied (e.g., rejected due to the rolling 7-day cap), and what internal tool should be used to look up referral history/status details?",
+      "latency_ms": 74140.1,
+      "evidence_packet_chars": 7754,
+      "facts": 14,
+      "document_ids": [
+        "doc_credit_cards_credit_cards_(general)_001",
+        "doc_credit_cards_credit_cards_(general)_002",
+        "doc_credit_cards_credit_cards_(general)_009",
+        "doc_credit_cards_credit_cards_(general)_020",
+        "doc_credit_cards_credit_cards_(general)_016",
+        "doc_bank_accounts_bank_accounts_(general)_048"
+      ],
+      "confidence": "high",
+      "missing_information": 5
+    },
+    {
+      "question": "When a customer needs a credit card referral records lookup with per-referral status and bonus timestamps that the service agent cannot access, what is the documented handling — should the agent transfer to a human/specialized team, and which transfer reason category applies?",
+      "latency_ms": 90528.8,
+      "evidence_packet_chars": 9113,
+      "facts": 14,
+      "document_ids": [
+        "doc_bank_accounts_bank_accounts_(general)_042",
+        "doc_credit_cards_credit_cards_(general)_009",
+        "doc_credit_cards_credit_cards_(general)_020",
+        "doc_credit_cards_credit_cards_(general)_001",
+        "doc_credit_cards_credit_cards_(general)_002",
+        "doc_credit_cards_credit_cards_(general)_010",
+        "doc_credit_cards_credit_cards_(general)_011",
+        "doc_business_credit_cards_business_silver_rewards_card_013",
+        "doc_credit_cards_credit_cards_(general)_016"
+      ],
+      "confidence": "medium",
+      "missing_information": 5
+    }
+  ]
+}

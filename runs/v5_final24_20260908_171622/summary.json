@@ -1,0 +1,247 @@
+{
+  "run_id": "v5_final24_20260908_171622",
+  "timestamp": "2026-09-08T23:55:52",
+  "agent": "two_agent_harness",
+  "model": {
+    "agent": "openai/qwen3.8-flash",
+    "user": "openai/qwen3.8-flash"
+  },
+  "domain": "banking_knowledge",
+  "retrieval_config": "bm25",
+  "retrieval_config_kwargs": null,
+  "tau2_version": "1.0.1",
+  "config": {
+    "tasks_file": "configs/banking_dev_tasks.json",
+    "num_tasks_requested": 24,
+    "max_steps": 60,
+    "seed": 42,
+    "max_errors": 10,
+    "tau2_agent": "two_agent_harness"
+  },
+  "total_tasks": 24,
+  "success_count": 5,
+  "success_rate": 0.2083,
+  "average_reward": 0.2083,
+  "average_turns": 5.3333,
+  "average_tool_calls": 7.5,
+  "total_tokens": 5111248,
+  "average_tokens": 212968.7,
+  "estimated_cost": 0.0,
+  "num_errors": 0,
+  "per_task": [
+    {
+      "task_id": "task_001",
+      "reward": 1.0,
+      "success": true,
+      "turns": 3,
+      "tool_calls": 0,
+      "trace_path": "traces/task_001.json"
+    },
+    {
+      "task_id": "task_002",
+      "reward": 1.0,
+      "success": true,
+      "turns": 3,
+      "tool_calls": 0,
+      "trace_path": "traces/task_002.json"
+    },
+    {
+      "task_id": "task_003",
+      "reward": 0.0,
+      "success": false,
+      "turns": 3,
+      "tool_calls": 0,
+      "trace_path": "traces/task_003.json"
+    },
+    {
+      "task_id": "task_004",
+      "reward": 1.0,
+      "success": true,
+      "turns": 6,
+      "tool_calls": 2,
+      "trace_path": "traces/task_004.json"
+    },
+    {
+      "task_id": "task_007",
+      "reward": 0.0,
+      "success": false,
+      "turns": 2,
+      "tool_calls": 0,
+      "trace_path": "traces/task_007.json"
+    },
+    {
+      "task_id": "task_008",
+      "reward": 1.0,
+      "success": true,
+      "turns": 5,
+      "tool_calls": 1,
+      "trace_path": "traces/task_008.json"
+    },
+    {
+      "task_id": "task_010",
+      "reward": 0.0,
+      "success": false,
+      "turns": 4,
+      "tool_calls": 4,
+      "trace_path": "traces/task_010.json"
+    },
+    {
+      "task_id": "task_020",
+      "reward": 0.0,
+      "success": false,
+      "turns": 8,
+      "tool_calls": 6,
+      "trace_path": "traces/task_020.json"
+    },
+    {
+      "task_id": "task_021",
+      "reward": 0.0,
+      "success": false,
+      "turns": 6,
+      "tool_calls": 5,
+      "trace_path": "traces/task_021.json"
+    },
+    {
+      "task_id": "task_024",
+      "reward": 0.0,
+      "success": false,
+      "turns": 5,
+      "tool_calls": 1,
+      "trace_path": "traces/task_024.json"
+    },
+    {
+      "task_id": "task_026",
+      "reward": 0.0,
+      "success": false,
+      "turns": 7,
+      "tool_calls": 8,
+      "trace_path": "traces/task_026.json"
+    },
+    {
+      "task_id": "task_027",
+      "reward": 0.0,
+      "success": false,
+      "turns": 4,
+      "tool_calls": 8,
+      "trace_path": "traces/task_027.json"
+    },
+    {
+      "task_id": "task_029",
+      "reward": 0.0,
+      "success": false,
+      "turns": 11,
+      "tool_calls": 17,
+      "trace_path": "traces/task_029.json"
+    },
+    {
+      "task_id": "task_037",
+      "reward": 0.0,
+      "success": false,
+      "turns": 6,
+      "tool_calls": 17,
+      "trace_path": "traces/task_037.json"
+    },
+    {
+      "task_id": "task_046",
+      "reward": 1.0,
+      "success": true,
+      "turns": 3,
+      "tool_calls": 6,
+      "trace_path": "traces/task_046.json"
+    },
+    {
+      "task_id": "task_053",
+      "reward": 0.0,
+      "success": false,
+      "turns": 8,
+      "tool_calls": 26,
+      "trace_path": "traces/task_053.json"
+    },
+    {
+      "task_id": "task_054",
+      "reward": 0.0,
+      "success": false,
+      "turns": 6,
+      "tool_calls": 21,
+      "trace_path": "traces/task_054.json"
+    },
+    {
+      "task_id": "task_070",
+      "reward": 0.0,
+      "success": false,
+      "turns": 4,
+      "tool_calls": 5,
+      "trace_path": "traces/task_070.json"
+    },
+    {
+      "task_id": "task_077",
+      "reward": 0.0,
+      "success": false,
+      "turns": 10,
+      "tool_calls": 12,
+      "trace_path": "traces/task_077.json"
+    },
+    {
+      "task_id": "task_080",
+      "reward": 0.0,
+      "success": false,
+      "turns": 3,
+      "tool_calls": 10,
+      "trace_path": "traces/task_080.json"
+    },
+    {
+      "task_id": "task_088",
+      "reward": 0.0,
+      "success": false,
+      "turns": 5,
+      "tool_calls": 12,
+      "trace_path": "traces/task_088.json"
+    },
+    {
+      "task_id": "task_092",
+      "reward": 0.0,
+      "success": false,
+      "turns": 5,
+      "tool_calls": 6,
+      "trace_path": "traces/task_092.json"
+    },
+    {
+      "task_id": "task_095",
+      "reward": 0.0,
+      "success": false,
+      "turns": 5,
+      "tool_calls": 8,
+      "trace_path": "traces/task_095.json"
+    },
+    {
+      "task_id": "task_100",
+      "reward": 0.0,
+      "success": false,
+      "turns": 6,
+      "tool_calls": 5,
+      "trace_path": "traces/task_100.json"
+    }
+  ],
+  "average_retrieval_calls": 0.0,
+  "average_documents_retrieved": 0.0,
+  "average_documents_per_call": null,
+  "average_required_document_recall": 0.0,
+  "average_recall_at_1": 0.0,
+  "average_recall_at_3": 0.0,
+  "average_recall_at_5": 0.0,
+  "average_recall_at_10": 0.0,
+  "average_avg_first_hit_call": null,
+  "average_max_first_hit_call": null,
+  "run_dir": "runs/v5_final24_20260908_171622",
+  "timing": {
+    "total_wall_time": 23970.2,
+    "average_task_wall_time": 998.751,
+    "p50_task_wall_time": 962.099,
+    "p95_task_wall_time": 1886.823,
+    "total_llm_calls": 1360,
+    "average_llm_latency_ms": 17780.596,
+    "p95_llm_latency_ms": 27891.6,
+    "total_rate_limit_wait_seconds": 0,
+    "throughput_tasks_per_minute": 0.06
+  }
+}
