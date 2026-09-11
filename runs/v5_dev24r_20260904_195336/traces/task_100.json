@@ -1,0 +1,211 @@
+{
+  "task_id": "task_100",
+  "task": {
+    "task_id": "task_100",
+    "description": {
+      "purpose": "Task: task_100",
+      "relevant_policies": null,
+      "notes": "BUSINESS CHECKING ACCOUNT REFERRAL - TENURE ELIGIBILITY TRAP. Customer OWNS a World Blue Account but CANNOT refer for World Blue due to tenure requirements. KEY COMPLEXITY: (1) Customer opened their first checking account only 65 days ago. (2) World Blue requires 90 days of tenure to participate in referral program - customer has only 65 days. (3) Customer OWNS World Blue, which is a DISTRACTOR - owning an account doesn't waive tenure requirements. (4) Hunter Green only requires 60 days tenure - customer qualifies for this even though they don't own it. (5) Customer's partner will deposit $30,000 which qualifies for World Blue's $25k requirement, but customer still can't refer for World Blue due to tenure. (6) Agent must realize that owning World Blue doesn't help - tenure requirements still apply. (7) Best actual option is Hunter Green at $175 (highest bonus among 60-day tenure accounts that customer qualifies for). ANSWER: Hunter Green Account is optimal at $175 referrer bonus - customer doesn't qualify for World Blue's higher bonus despite OWNING a World Blue account."
+    },
+    "user_scenario": {
+      "persona": null,
+      "instructions": "**Your character:** You are Tomoko Ishikawa, a 38-year-old software consultant in Seattle, WA. Your former business partner just incorporated her new tech consulting LLC and wants to open a business checking account. You want to refer her so YOU get the biggest possible referral bonus.\n\n**Verification info:**\n- Name: Tomoko Ishikawa | Phone: 206-555-3891 | Email: tomoko.ishikawa@seattletechconsult.com\n- DOB: 04/22/1987 | Address: 2847 Aurora Avenue North, Apt 12C, Seattle, WA 98103\n\n**Tool usage:** You have access to `submit_referral`. Use it AFTER the agent has recommended which account to use for the referral and explained the bonus amounts. Call it with your user_id (ti87k4x9m2) and the account_type the agent recommended.\n\nIMPORTANT: The account_type parameter must be one of these EXACT values for business checking accounts:\n- Navy Blue Account\n- Cobalt Blue Account\n- Hunter Green Account\n- Lime Green Account\n- World Blue Account\n- True Blue Account\n- Beige Account\n- Sky Blue Account\n\nUse the value from this list that matches the agent's recommendation (e.g., if agent says \"World Blue International\", use \"World Blue Account\").\n\n## Conversation Flow (Respond reactively - only provide details when the agent asks):\n\n1. **Opening:** \"Hi! My former business partner just incorporated her new tech consulting LLC and she needs to open a business checking account. She's going to deposit around $31,000 from her startup funding. I want to refer her to get the referral bonus.  I want to get the biggest bonus possible for ME.\"\n\n2. **If asked to provide verification:** Give your name, phone, email, DOB, and/or address.\n\n3. **If agent asks about your business accounts:** \"I have a World Blue Account and a Cobalt Blue Account - both business checking.\"\n\n4. **If agent asks about business checking account balances:** \"The World Blue has about $28,000 and the Cobalt Blue has around $15,000.\"\n\n5. **If agent asks how long you've been a customer or when you opened your accounts (proactively mention this):** \"I opened my first account with Rho-Bank back in mid-July this year. So it's been... let me think... about four months now? Maybe a bit more.\"\n\n7. **If agent asks about referral history:** \"I haven't done any referrals yet actually - this would be my first one! That's why I want to make sure I'm getting the best bonus possible.\"\n\n8. **If agent asks about the business partner's address or relationship:** \"No, we don't live together or share an address. She has her own apartment in Bellevue. We used to work at the same company before we both went independent.\"\n\n9. **If agent mentions tenure requirements or that you don't qualify for World Blue referrals:** \"Wait, really? But I HAVE a World Blue Account! How can I not refer someone for the same account I already have? That doesn't make sense.\"\n\n10. **If agent explains that tenure requirements apply regardless of account ownership:** \"Oh wow, I didn't realize that. So even though I own a World Blue, I still need to wait longer before I can refer someone for it? That's frustrating but okay.\"\n\n11. **If agent says you would be automatically denied or cannot submit a referral for ANY account**: Accept this and say \"Oh, that's really disappointing. I guess I'll have to wait and try again later. Thanks for letting me know before I wasted my time.\" ###STOP### Do NOT submit a referral.\n\n12. **If agent recommends a specific account that you DO qualify for RIGHT NOW, submit the referral immediately:** You want to get this done today — don't choose to wait for a future date even if a higher bonus might become available later. Say \"Alright, let me do that then.\" Then use the submit_referral tool with user_id=\"ti87k4x9m2\" and the account_type the agent recommended.\n\n13. **After submitting the referral:** \"Thanks for that.\" ###STOP###"
+    }
+  },
+  "reward": 0.0,
+  "termination_reason": "user_stop",
+  "agent_cost": 0.0,
+  "user_cost": 0.0,
+  "system_prompt": null,
+  "conversation": [
+    {
+      "turn": 0,
+      "role": "assistant",
+      "content": "Hi! How can I help you today?"
+    },
+    {
+      "turn": 1,
+      "role": "user",
+      "content": "Hi! My former business partner just incorporated her new tech consulting LLC and she needs to open a business checking account. She's going to deposit around $31,000 from her startup funding. I want to refer her to get the referral bonus. I want to get the biggest bonus possible for ME."
+    },
+    {
+      "turn": 2,
+      "role": "assistant",
+      "content": "With a planned deposit of about **$31,000**, the biggest referral bonus you can likely qualify for is:\n\n### Best option: World Blue — **$300 to you**\n- **You receive:** $300  \n- **She receives:** $200  \n- **Required deposit:** At least $25,000 within 90 days  \n- **Your required tenure:** At least 90 days as a Rho-Bank checking customer  \n- **Important:** World Blue appears intended for eligible international businesses, so her LLC must qualify for that product.\n\n### If she isn’t World Blue eligible: Lime Green — **$200 to you**\n- **You receive:** $200  \n- **She receives:** $150  \n- **Required deposit:** At least $15,000 within 90 days  \n- **Your required tenure:** At least 90 days as a Rho-Bank checking customer  \n\n### If she can increase the deposit to $50,000: True Blue — **$350 to you**\n- **You receive:** $350  \n- **She receives:** $250  \n- **Required deposit:** At least $50,000 within 120 days  \n- **Your required tenure:** At least 90 days as a Rho-Bank checking customer  \n\nThe **$500 Beige bonus** requires a $100,000 deposit and 120 days of your checking tenure, so it isn’t compatible with a $31,000 deposit.\n\nTo maximize your bonus, make sure the referral is attached **before she applies**, she is a new Rho-Bank customer, the deposit is new money, and the account remains open and in good standing for at least 90 days.\n\nDo you have a Rho-Bank checking account that’s at least 90 days old, and would her LLC qualify for World Blue?"
+    },
+    {
+      "turn": 3,
+      "role": "user",
+      "content": "I have a World Blue Account and a Cobalt Blue Account — both business checking. As for how long I've been with you, I opened my first account back in mid-July this year, so it's been... let me think... about four months now? Maybe a bit more.\n\nI'm not sure what you mean by international eligibility, honestly — her LLC is based right here in Bellevue, and she does tech consulting. Also, I haven't done any referrals yet, this would be my first one! That's why I want to make sure I'm getting the best bonus possible."
+    },
+    {
+      "turn": 4,
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "call_3bfe6cf24042457e9c5d692b",
+          "name": "get_current_time",
+          "arguments": {}
+        }
+      ]
+    },
+    {
+      "turn": 5,
+      "role": "tool",
+      "tool_call_id": "call_3bfe6cf24042457e9c5d692b",
+      "name": "get_current_time",
+      "arguments": {},
+      "content": "The current time is 2025-11-14 03:40:00 EST."
+    },
+    {
+      "turn": 6,
+      "role": "assistant",
+      "content": "Thanks — that clarifies things.\n\n**Your tenure:** Accounts opened in mid-July 2025 are well past the 90-day checking-tenure requirement as of today (Nov 14, 2025), and since this is your first referral, you're clear of the annual cap (12 World Blue referral bonuses/year) and the limit of 2 checking referral bonuses in any rolling 9-day window.\n\n**A correction on my part:** I shouldn't have implied World Blue is restricted to international businesses. The referral terms I have don't list any international, foreign-address, or foreign-activity requirement. What I can confirm is that World Blue's referral terms require the referred business to **open World Blue and deposit at least $25,000 within 90 days**. However, the documentation available to me does not state World Blue's general account-opening eligibility criteria, so I can't guarantee a newly formed domestic Bellevue LLC will be approved for that product — she should confirm that when applying.\n\n### Best bonus for you with a $31,000 deposit: World Blue — $300\n- You: **$300** · She: **$200**\n- Deposit threshold: $25,000 within 90 days (her $31,000 clears it)\n- Your tenure: 90 days ✅\n- True Blue ($350) needs $50,000 and Beige ($500) needs $100,000, so neither works at $31,000.\n\n### Fallback if she can't open World Blue: Lime Green — $200\n- You: **$200** · She: **$150**\n- $15,000 within 90 days, 90-day referrer tenure ✅\n\nWorth noting: **Sky Blue** is purpose-built for startups formed within the last 4 years and pays **her $250** (vs. $200 from World Blue), but only **$150 to you** — so it's better for her, worse for you.\n\n### Conditions to protect the bonus\n- Only one referral code can be applied, and it must be attached to her application — so send it before she applies.\n- The $25,000 must be new money from outside Rho-Bank, and it must stay in the account for at least 30 days after the qualifying period ends.\n- She must be a new Rho-Bank customer (no checking, savings, or closed accounts in the past 12 months), you must not share the same registered address, and she must be a different primary owner than on any existing Rho-Bank business account.\n- Both accounts must stay open and in good standing for at least 90 days, or the bonus can be reversed.\n- The referral can't be stacked with another new-account promotion.\n\nThe exact self-service steps for generating a World Blue referral code aren't documented in what I have access to, so I can't submit or generate it for you. Would you like me to transfer you to a human agent who can issue your World Blue referral code and confirm her LLC's eligibility before she applies?"
+    },
+    {
+      "turn": 7,
+      "role": "user",
+      "content": "Alright, let me do that then. And no, we don't live together or share an address — she has her own apartment in Bellevue. We used to work at the same company before we both went independent.\n\n"
+    },
+    {
+      "turn": 8,
+      "role": "tool",
+      "tool_call_id": "call_5a5147a4d7ac452a980fbe4d",
+      "name": null,
+      "arguments": null,
+      "content": "Referral request submitted successfully!\n  - Referral ID: 07c6b0c8899f11d9\n  - Referrer ID: ti87k4x9m2\n  - Account Type: World Blue Account\n  - Status: NO_PROGRESS\n  - Date: 11/14/2025\n\nShare your referral ID with the person you're referring. They will need to use this when applying for their account."
+    },
+    {
+      "turn": 9,
+      "role": "user",
+      "content": "Thanks for that. The referral went through — I got referral ID 07c6b0c8899f11d9 for the World Blue Account, so I'll send that over to her before she applies.\n\n"
+    },
+    {
+      "turn": 10,
+      "role": "tool",
+      "tool_call_id": "call_eeae8e6951d6485181e7e1dc",
+      "name": null,
+      "arguments": null,
+      "content": "Error: Unknown discoverable tool 'noop'."
+    },
+    {
+      "turn": 11,
+      "role": "user",
+      "content": "###STOP###"
+    }
+  ],
+  "tool_calls": [
+    {
+      "id": "call_3bfe6cf24042457e9c5d692b",
+      "name": "get_current_time",
+      "arguments": {},
+      "result": "The current time is 2025-11-14 03:40:00 EST.",
+      "error": false
+    },
+    {
+      "id": "call_5a5147a4d7ac452a980fbe4d",
+      "name": null,
+      "arguments": null,
+      "result": "Referral request submitted successfully!\n  - Referral ID: 07c6b0c8899f11d9\n  - Referrer ID: ti87k4x9m2\n  - Account Type: World Blue Account\n  - Status: NO_PROGRESS\n  - Date: 11/14/2025\n\nShare your referral ID with the person you're referring. They will need to use this when applying for their account.",
+      "error": false
+    },
+    {
+      "id": "call_eeae8e6951d6485181e7e1dc",
+      "name": null,
+      "arguments": null,
+      "result": "Error: Unknown discoverable tool 'noop'.",
+      "error": false
+    }
+  ],
+  "retrieval": {
+    "config": "bm25",
+    "config_kwargs": {},
+    "total_calls": 0,
+    "calls": []
+  },
+  "two_agent": [
+    {
+      "question": "What are the referral bonus rules for referring a newly incorporated LLC to open a Rho-Bank business checking account with a $31,000 deposit, and how can the referrer maximize their own bonus?",
+      "latency_ms": 136683.9,
+      "evidence_packet_chars": 8780,
+      "facts": 23,
+      "document_ids": [
+        "doc_bank_accounts_bank_accounts_(general)_047",
+        "doc_bank_accounts_bank_accounts_(general)_048",
+        "doc_business_checking_accounts_navy_blue_001",
+        "doc_business_checking_accounts_cobalt_blue_005",
+        "doc_business_checking_accounts_sky_blue_001",
+        "doc_business_checking_accounts_lime_green_003",
+        "doc_business_checking_accounts_world_blue_001",
+        "doc_business_checking_accounts_world_blue_007",
+        "doc_business_checking_accounts_true_blue_002",
+        "doc_business_checking_accounts_beige_012",
+        "doc_bank_accounts_bank_accounts_(general)_013"
+      ],
+      "confidence": "high",
+      "missing_information": 5
+    },
+    {
+      "question": "Is a newly incorporated domestic Bellevue, Washington tech consulting LLC eligible for a World Blue business checking account referral, or is World Blue restricted to international businesses?",
+      "latency_ms": 70715.0,
+      "evidence_packet_chars": 6260,
+      "facts": 15,
+      "document_ids": [
+        "doc_business_checking_accounts_world_blue_001",
+        "doc_business_checking_accounts_world_blue_007",
+        "doc_business_checking_accounts_lime_green_003",
+        "doc_business_checking_accounts_cobalt_blue_005",
+        "doc_business_checking_accounts_navy_blue_001",
+        "doc_business_checking_accounts_sky_blue_001",
+        "doc_business_checking_accounts_true_blue_002",
+        "doc_business_checking_accounts_beige_012",
+        "doc_bank_accounts_bank_accounts_(general)_047",
+        "doc_bank_accounts_bank_accounts_(general)_048",
+        "doc_bank_accounts_bank_accounts_(general)_013"
+      ],
+      "confidence": "medium",
+      "missing_information": 5
+    },
+    {
+      "question": "What is the exact process for a customer to refer a newly incorporated LLC to a Lime Green or Sky Blue business checking account, and is there a user-accessible referral tool?",
+      "latency_ms": 36033.5,
+      "evidence_packet_chars": 5462,
+      "facts": 15,
+      "document_ids": [
+        "doc_business_checking_accounts_lime_green_003",
+        "doc_business_checking_accounts_sky_blue_001",
+        "doc_bank_accounts_bank_accounts_(general)_047",
+        "doc_bank_accounts_bank_accounts_(general)_048",
+        "doc_bank_accounts_bank_accounts_(general)_013"
+      ],
+      "confidence": "high",
+      "missing_information": 8
+    },
+    {
+      "question": "How does a World Blue business checking customer generate and send a referral for a newly incorporated LLC, and what exact steps must be completed before the LLC applies?",
+      "latency_ms": 4.1,
+      "evidence_packet_chars": 5657,
+      "facts": 15,
+      "document_ids": [
+        "doc_business_checking_accounts_lime_green_003",
+        "doc_business_checking_accounts_sky_blue_001",
+        "doc_bank_accounts_bank_accounts_(general)_047",
+        "doc_bank_accounts_bank_accounts_(general)_048",
+        "doc_bank_accounts_bank_accounts_(general)_013"
+      ],
+      "confidence": "high",
+      "missing_information": 8
+    },
+    {
+      "question": "What are the World Blue business checking account opening eligibility criteria and intended customer profile, including minimum opening deposit and ongoing balance requirements?",
+      "latency_ms": 28719.8,
+      "evidence_packet_chars": 1860,
+      "facts": 3,
+      "document_ids": [
+        "doc_business_checking_accounts_world_blue_001"
+      ],
+      "confidence": "high",
+      "missing_information": 7
+    }
+  ]
+}

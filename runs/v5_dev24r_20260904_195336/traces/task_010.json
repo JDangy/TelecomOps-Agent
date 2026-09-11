@@ -1,0 +1,305 @@
+{
+  "task_id": "task_010",
+  "task": {
+    "task_id": "task_010",
+    "description": {
+      "purpose": "Task: task_010",
+      "relevant_policies": null,
+      "notes": null
+    },
+    "user_scenario": {
+      "persona": null,
+      "instructions": "**Your character:** Wei Chen, a 45-year-old software architect from Boston. You are methodical and detail-oriented, but currently frustrated.\n\n**Your situation:** You signed up four of your friends for Rho-Bank credit cards. All four actually signed up. But you only got bonus money for two of them. You want to know why you didn't get the bonus for all four.\n\nYour user ID is 76ad9cc60e, your phone number is 617-555-0834, and your email is wei.chen.boston@gmail.com. Do NOT volunteer this unless specifically asked for it. You know this from your account settings, but a real customer would never proactively offer \"my user ID is...\" unless specifically asked for it.\n\n## How to Behave\n\n1. **Start naturally:** Explain your problem the way a real customer would: \"I got four friends to sign up for your credit cards, but I only received bonuses for two of them. What's going on?\"\n\n2. **Answer questions, don't anticipate them:** When the agent asks for information to look you up, provide what they ask for—nothing more. If they ask for your name, give your name. If they ask for email, give email. Do NOT say things like \"Would you like my user ID?\" or \"Here's my account number to help you look it up.\" Real customers don't know what lookup fields exist in the agent's system.\n\n3. **React naturally to what the agent DOES, not what you want them to do:**\n   - If the agent says they can't access your account, or gives only generic/vague reasons without actually investigating YOUR specific situation, that's unhelpful. A real customer would be frustrated and accept any offer to escalate or transfer.\n   - If the agent actually looks up YOUR account and tells you something SPECIFIC about YOUR referrals (e.g., \"I see you submitted 4 referrals but one was rejected because of X policy\"), then you've learned something concrete. Only in this case would you consider taking further action.\n\n4. **Never fish for the \"right\" answer:** Do not ask probing questions like \"Is there a cap?\" or \"Could it be a policy issue?\" A real customer doesn't know what policies exist. You're frustrated and want answers—you're not trying to coach the agent toward the correct diagnosis.\n\n5. **Tool usage:** You have access to submit_referral. Only use it if the agent has actually investigated your account and given you a SPECIFIC, CONCRETE explanation for why some referrals didn't qualify (not generic possibilities, but actual findings from looking at your data). Use your user_id (76ad9cc60e) and corresponding account_type (e.g., \"Gold Rewards Card\").\n\n6. **Default to escalation:** If the agent can't give you specific answers about YOUR situation, accept any offer to escalate or ask to speak with someone who can actually look at your account.\n\n7. **Take action when given a path forward:** If the agent explains that a referral was rejected due to a temporary restriction that has now passed, and retrying is possible, go ahead and submit a new referral for that card type. You want to recover any missed bonuses if the opportunity exists."
+    }
+  },
+  "reward": 1.0,
+  "termination_reason": "user_stop",
+  "agent_cost": 0.0,
+  "user_cost": 0.0,
+  "system_prompt": null,
+  "conversation": [
+    {
+      "turn": 0,
+      "role": "assistant",
+      "content": "Hi! How can I help you today?"
+    },
+    {
+      "turn": 1,
+      "role": "user",
+      "content": "Hi, I got four friends to sign up for your credit cards, but I only received bonuses for two of them. What’s going on?"
+    },
+    {
+      "turn": 2,
+      "role": "assistant",
+      "content": "A likely explanation is Rho-Bank’s credit-card referral limit: **only two referral bonuses can be awarded in any rolling seven-day period**, across all credit-card types. A third or fourth qualifying referral in that window is automatically denied.\n\nOther possibilities include a friend not applying through your unique referral link, not yet being approved, or not yet meeting the card’s required spending threshold.\n\nI can check the exact status of all four referrals. Please provide:\n\n- Your **user ID or exact full name**, and  \n- Any **two** of these: date of birth, email address, phone number, or mailing address."
+    },
+    {
+      "turn": 3,
+      "role": "user",
+      "content": "Honestly, I'd rather not take \"a likely explanation\" — I want to know what actually happened with my four referrals.\n\nFine, let's look it up. My name is Wei Chen. For verification, my email is wei.chen.boston@gmail.com and my phone number is 617-555-0834.\n\nGo ahead and check the status of all four."
+    },
+    {
+      "turn": 4,
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "call_c5eaad90a5214dc0a17dae54",
+          "name": "get_user_information_by_name",
+          "arguments": {
+            "customer_name": "Wei Chen"
+          }
+        }
+      ]
+    },
+    {
+      "turn": 5,
+      "role": "tool",
+      "tool_call_id": "call_c5eaad90a5214dc0a17dae54",
+      "name": "get_user_information_by_name",
+      "arguments": {
+        "customer_name": "Wei Chen"
+      },
+      "content": "Found 1 record(s) in 'users':\n\n1. Record ID: 76ad9cc60e\n   name: Wei Chen\n   user_id: 76ad9cc60e\n   address: 88 Harbor View Court, Boston, MA 02110\n   email: wei.chen.boston@gmail.com\n   phone_number: 617-555-0834\n   date_of_birth: 04/17/1979\n"
+    },
+    {
+      "turn": 6,
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "call_85081116454d40c48725ae84",
+          "name": "get_current_time",
+          "arguments": {}
+        }
+      ]
+    },
+    {
+      "turn": 7,
+      "role": "tool",
+      "tool_call_id": "call_85081116454d40c48725ae84",
+      "name": "get_current_time",
+      "arguments": {},
+      "content": "The current time is 2025-11-14 03:40:00 EST."
+    },
+    {
+      "turn": 8,
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "call_a46ff4982256472bb43b3974",
+          "name": "log_verification",
+          "arguments": {
+            "name": "Wei Chen",
+            "user_id": "76ad9cc60e",
+            "address": "88 Harbor View Court, Boston, MA 02110",
+            "email": "wei.chen.boston@gmail.com",
+            "phone_number": "617-555-0834",
+            "date_of_birth": "04/17/1979",
+            "time_verified": "2025-11-14 03:40:00 EST"
+          }
+        }
+      ]
+    },
+    {
+      "turn": 9,
+      "role": "tool",
+      "tool_call_id": "call_a46ff4982256472bb43b3974",
+      "name": "log_verification",
+      "arguments": {
+        "name": "Wei Chen",
+        "user_id": "76ad9cc60e",
+        "address": "88 Harbor View Court, Boston, MA 02110",
+        "email": "wei.chen.boston@gmail.com",
+        "phone_number": "617-555-0834",
+        "date_of_birth": "04/17/1979",
+        "time_verified": "2025-11-14 03:40:00 EST"
+      },
+      "content": "Verification logged successfully.\n  - User: Wei Chen (ID: 76ad9cc60e)\n  - Verified at: 2025-11-14 03:40:00 EST"
+    },
+    {
+      "turn": 10,
+      "role": "assistant",
+      "content": ".\n\n",
+      "tool_calls": [
+        {
+          "id": "call_7375bc24da7f4d09a737ceec",
+          "name": "get_referrals_by_user",
+          "arguments": {
+            "user_id": "76ad9cc60e"
+          }
+        }
+      ]
+    },
+    {
+      "turn": 11,
+      "role": "tool",
+      "tool_call_id": "call_7375bc24da7f4d09a737ceec",
+      "name": "get_referrals_by_user",
+      "arguments": {
+        "user_id": "76ad9cc60e"
+      },
+      "content": "Found 4 record(s) in 'referrals':\n\n1. Record ID: a1b2c3d4e5f67890\n   referral_id: a1b2c3d4e5f67890\n   referrer_id: 76ad9cc60e\n   referred_account_type: Bronze Rewards Card\n   referral_status: COMPLETE\n   date: 10/20/2025\n\n2. Record ID: b2c3d4e5f6789012\n   referral_id: b2c3d4e5f6789012\n   referrer_id: 76ad9cc60e\n   referred_account_type: Gold Rewards Card\n   referral_status: COMPLETE\n   date: 10/22/2025\n\n3. Record ID: c3d4e5f678901234\n   referral_id: c3d4e5f678901234\n   referrer_id: 76ad9cc60e\n   referred_account_type: Silver Rewards Card\n   referral_status: IN_PROGRESS\n   date: 11/05/2025\n\n4. Record ID: d4e5f67890123456\n   referral_id: d4e5f67890123456\n   referrer_id: 76ad9cc60e\n   referred_account_type: Platinum Rewards Card\n   referral_status: REJECTED\n   date: 10/25/2025\n"
+    },
+    {
+      "turn": 12,
+      "role": "assistant",
+      "content": "Here's exactly what happened with your four referrals, Wei:\n\n| Date | Card | Status |\n|---|---|---|\n| 10/20/2025 | Bronze Rewards Card | **COMPLETE** — bonus awarded |\n| 10/22/2025 | Gold Rewards Card | **COMPLETE** — bonus awarded |\n| 10/25/2025 | Platinum Rewards Card | **REJECTED** — bonus denied |\n| 11/05/2025 | Silver Rewards Card | **IN_PROGRESS** — not yet qualified |\n\n**Why the Platinum referral was denied**\n\nRho-Bank caps credit-card referral bonuses at **two per rolling 7-day window**, and the cap counts across *all* card types rather than per card. Your Bronze bonus posted 10/20 and your Gold bonus posted 10/22, so when the Platinum referral qualified on **10/25 — three days later — it was the third bonus inside that rolling window and was automatically denied.** It wasn't a problem with your friend's application or spending; it was purely the timing collision.\n\n**Why the Silver referral hasn't paid yet**\n\nThis one is different — it hasn't been denied, it just hasn't qualified yet. Your friend opened the account on 11/05 but has not yet met the Silver Rewards requirement of **$750 in purchases within 60 days of account opening**. Once they hit that, the status flips to COMPLETE and the bonus typically posts within one to two billing cycles. No action is needed from you; it's still well within the window.\n\n**Can the Platinum bonus be recovered?**\n\nNo. Per the program rules, a bonus auto-denied under the rolling 7-day cap cannot be reinstated, and there's no agent-side tool to reverse or re-process that record. The remedy the program offers is to run a *new* referral once you're back under the cap — which you now are, since your last posted bonus was 10/22. The catch: Platinum Rewards terms exclude duplicate applications, so re-referring the same friend may not qualify.\n\nI can generate a fresh Platinum referral link for a *different* friend, or if you'd like to contest the denial of the 10/25 record specifically, I can arrange a transfer to a human agent since that's outside what I'm able to do. Which would you prefer?"
+    },
+    {
+      "turn": 13,
+      "role": "user",
+      "content": ""
+    },
+    {
+      "turn": 14,
+      "role": "tool",
+      "tool_call_id": "call_3f4fedc50fdc4eb7a1bac164",
+      "name": null,
+      "arguments": null,
+      "content": "Referral request submitted successfully!\n  - Referral ID: fa2896839e417592\n  - Referrer ID: 76ad9cc60e\n  - Account Type: Platinum Rewards Card\n  - Status: NO_PROGRESS\n  - Date: 11/14/2025\n\nShare your referral ID with the person you're referring. They will need to use this when applying for their account."
+    },
+    {
+      "turn": 15,
+      "role": "user",
+      "content": "I went ahead and submitted a fresh Platinum Rewards Card referral myself rather than waiting — new referral ID is **fa2896839e417592**, dated 11/14/2025. It's showing NO_PROGRESS right now, which I assume just means my friend hasn't applied yet. I'm sending it to a different friend this time, not the one whose 10/25 application got caught in the cap.\n\nTwo things I still want confirmation on:\n\n1. Since my last posted bonus was 10/22, this new Platinum referral should be counted as the first in a fresh window — not denied again, correct?\n2. The Silver one you said is still IN_PROGRESS and pending $750 in spend. If my friend hits that, will it actually pay out, or could it get swallowed by the same rolling cap once this new Platinum one posts?\n\nI don't want to chase four bonuses and end up with two again."
+    },
+    {
+      "turn": 16,
+      "role": "assistant",
+      "tool_calls": [
+        {
+          "id": "call_729b6992b742441cb03e7bf3",
+          "name": "get_referrals_by_user",
+          "arguments": {
+            "user_id": "76ad9cc60e"
+          }
+        }
+      ]
+    },
+    {
+      "turn": 17,
+      "role": "tool",
+      "tool_call_id": "call_729b6992b742441cb03e7bf3",
+      "name": "get_referrals_by_user",
+      "arguments": {
+        "user_id": "76ad9cc60e"
+      },
+      "content": "Found 5 record(s) in 'referrals':\n\n1. Record ID: a1b2c3d4e5f67890\n   referral_id: a1b2c3d4e5f67890\n   referrer_id: 76ad9cc60e\n   referred_account_type: Bronze Rewards Card\n   referral_status: COMPLETE\n   date: 10/20/2025\n\n2. Record ID: b2c3d4e5f6789012\n   referral_id: b2c3d4e5f6789012\n   referrer_id: 76ad9cc60e\n   referred_account_type: Gold Rewards Card\n   referral_status: COMPLETE\n   date: 10/22/2025\n\n3. Record ID: c3d4e5f678901234\n   referral_id: c3d4e5f678901234\n   referrer_id: 76ad9cc60e\n   referred_account_type: Silver Rewards Card\n   referral_status: IN_PROGRESS\n   date: 11/05/2025\n\n4. Record ID: d4e5f67890123456\n   referral_id: d4e5f67890123456\n   referrer_id: 76ad9cc60e\n   referred_account_type: Platinum Rewards Card\n   referral_status: REJECTED\n   date: 10/25/2025\n\n5. Record ID: fa2896839e417592\n   referral_id: fa2896839e417592\n   referrer_id: 76ad9cc60e\n   referred_account_type: Platinum Rewards Card\n   referral_status: NO_PROGRESS\n   date: 11/14/2025\n"
+    },
+    {
+      "turn": 18,
+      "role": "assistant",
+      "content": "Confirmed — I can see the new record on your account:\n\n| Referral ID | Card | Status | Date |\n|---|---|---|---|\n| fa2896839e417592 | Platinum Rewards Card | NO_PROGRESS | 11/14/2025 |\n\nAnd yes, your read of NO_PROGRESS is correct: it means the invitee hasn't submitted an application through your link yet. Nothing is wrong with the referral itself.\n\n**1. Is the new Platinum referral clear of the cap?**\n\nRight now, yes. The rolling 7-day window is evaluated on the exact timestamps of *posted bonuses*, and your last two were 10/20 and 10/22 — both 23–25 days ago. Your current window is empty, so this referral is not sitting in a position to be auto-denied the way the 10/25 one was.\n\nOne important caveat, though: **NO_PROGRESS today doesn't lock in eligibility later.** The cap is checked when the referral reaches payout, not when the link is created. So what matters is what else posts in the same 7-day stretch as this one.\n\n**2. Will Silver pay out, or could it get swallowed?**\n\nSilver will pay out on its own terms: your friend needs $750 in purchases within 60 days of the 11/05 account opening — that deadline runs to roughly **January 4, 2026**. Once they cross it, status flips to COMPLETE and the bonus posts within one to two billing cycles. No action needed from you.\n\nHere's the key arithmetic for your worry: **Silver + the new Platinum = exactly two bonuses.** That's *at* the cap, not over it. Even if both land in the same week, both pay. The 10/25 denial happened because Bronze + Gold + Platinum made **three** in one window.\n\nSo the collision risk isn't between these two — it's a third one. If you send more referral links and three referrals end up qualifying within the same rolling 7-day stretch, whichever is third by exact timestamp gets auto-denied, and that denial is not reversible.\n\n**Practical recommendation**\n\n- Let the Silver referral run its course — it's safely inside its window.\n- Nudge your new Platinum friend to apply through the link promptly, since Platinum needs $1,500 within 90 days of *account opening*, and the clock doesn't start until they apply.\n- **Hold off on any further referral links** until at least one of these two has actually posted. That keeps you at two-or-fewer per window with room to spare.\n- Also make sure your own account stays in good standing — Platinum bonuses are only paid promptly when it is.\n\nIf you'd like, I can check back on the status of both pending referrals for you any time; just ask."
+    },
+    {
+      "turn": 19,
+      "role": "user",
+      "content": "Alright, that actually makes sense — and I appreciate you pulling up the real records instead of reciting policy at me. The 10/25 Platinum denial being permanent stings, but at least now I know it was a timing collision and not something my friend did wrong. I'll drop the idea of contesting it.\n\nSo to be clear on my plan: I leave Silver alone, my friend has until around January 4th to hit the $750, and I push my new Platinum friend to apply through ID fa2896839e417592 soon so the 90-day clock starts. And I send no further links until at least one of those two has actually posted, so I don't create a third-in-a-window situation.\n\nThat's everything I came in for. Thanks.\n\n###STOP###"
+    }
+  ],
+  "tool_calls": [
+    {
+      "id": "call_c5eaad90a5214dc0a17dae54",
+      "name": "get_user_information_by_name",
+      "arguments": {
+        "customer_name": "Wei Chen"
+      },
+      "result": "Found 1 record(s) in 'users':\n\n1. Record ID: 76ad9cc60e\n   name: Wei Chen\n   user_id: 76ad9cc60e\n   address: 88 Harbor View Court, Boston, MA 02110\n   email: wei.chen.boston@gmail.com\n   phone_number: 617-555-0834\n   date_of_birth: 04/17/1979\n",
+      "error": false
+    },
+    {
+      "id": "call_85081116454d40c48725ae84",
+      "name": "get_current_time",
+      "arguments": {},
+      "result": "The current time is 2025-11-14 03:40:00 EST.",
+      "error": false
+    },
+    {
+      "id": "call_a46ff4982256472bb43b3974",
+      "name": "log_verification",
+      "arguments": {
+        "name": "Wei Chen",
+        "user_id": "76ad9cc60e",
+        "address": "88 Harbor View Court, Boston, MA 02110",
+        "email": "wei.chen.boston@gmail.com",
+        "phone_number": "617-555-0834",
+        "date_of_birth": "04/17/1979",
+        "time_verified": "2025-11-14 03:40:00 EST"
+      },
+      "result": "Verification logged successfully.\n  - User: Wei Chen (ID: 76ad9cc60e)\n  - Verified at: 2025-11-14 03:40:00 EST",
+      "error": false
+    },
+    {
+      "id": "call_7375bc24da7f4d09a737ceec",
+      "name": "get_referrals_by_user",
+      "arguments": {
+        "user_id": "76ad9cc60e"
+      },
+      "result": "Found 4 record(s) in 'referrals':\n\n1. Record ID: a1b2c3d4e5f67890\n   referral_id: a1b2c3d4e5f67890\n   referrer_id: 76ad9cc60e\n   referred_account_type: Bronze Rewards Card\n   referral_status: COMPLETE\n   date: 10/20/2025\n\n2. Record ID: b2c3d4e5f6789012\n   referral_id: b2c3d4e5f6789012\n   referrer_id: 76ad9cc60e\n   referred_account_type: Gold Rewards Card\n   referral_status: COMPLETE\n   date: 10/22/2025\n\n3. Record ID: c3d4e5f678901234\n   referral_id: c3d4e5f678901234\n   referrer_id: 76ad9cc60e\n   referred_account_type: Silver Rewards Card\n   referral_status: IN_PROGRESS\n   date: 11/05/2025\n\n4. Record ID: d4e5f67890123456\n   referral_id: d4e5f67890123456\n   referrer_id: 76ad9cc60e\n   referred_account_type: Platinum Rewards Card\n   referral_status: REJECTED\n   date: 10/25/2025\n",
+      "error": false
+    },
+    {
+      "id": "call_3f4fedc50fdc4eb7a1bac164",
+      "name": null,
+      "arguments": null,
+      "result": "Referral request submitted successfully!\n  - Referral ID: fa2896839e417592\n  - Referrer ID: 76ad9cc60e\n  - Account Type: Platinum Rewards Card\n  - Status: NO_PROGRESS\n  - Date: 11/14/2025\n\nShare your referral ID with the person you're referring. They will need to use this when applying for their account.",
+      "error": false
+    },
+    {
+      "id": "call_729b6992b742441cb03e7bf3",
+      "name": "get_referrals_by_user",
+      "arguments": {
+        "user_id": "76ad9cc60e"
+      },
+      "result": "Found 5 record(s) in 'referrals':\n\n1. Record ID: a1b2c3d4e5f67890\n   referral_id: a1b2c3d4e5f67890\n   referrer_id: 76ad9cc60e\n   referred_account_type: Bronze Rewards Card\n   referral_status: COMPLETE\n   date: 10/20/2025\n\n2. Record ID: b2c3d4e5f6789012\n   referral_id: b2c3d4e5f6789012\n   referrer_id: 76ad9cc60e\n   referred_account_type: Gold Rewards Card\n   referral_status: COMPLETE\n   date: 10/22/2025\n\n3. Record ID: c3d4e5f678901234\n   referral_id: c3d4e5f678901234\n   referrer_id: 76ad9cc60e\n   referred_account_type: Silver Rewards Card\n   referral_status: IN_PROGRESS\n   date: 11/05/2025\n\n4. Record ID: d4e5f67890123456\n   referral_id: d4e5f67890123456\n   referrer_id: 76ad9cc60e\n   referred_account_type: Platinum Rewards Card\n   referral_status: REJECTED\n   date: 10/25/2025\n\n5. Record ID: fa2896839e417592\n   referral_id: fa2896839e417592\n   referrer_id: 76ad9cc60e\n   referred_account_type: Platinum Rewards Card\n   referral_status: NO_PROGRESS\n   date: 11/14/2025\n",
+      "error": false
+    }
+  ],
+  "retrieval": {
+    "config": "bm25",
+    "config_kwargs": {},
+    "total_calls": 0,
+    "calls": []
+  },
+  "two_agent": [
+    {
+      "question": "What are the credit card referral bonus rules, including eligibility, limits, pending/qualified requirements, and reasons a referrer might receive bonuses for only some referred friends?",
+      "latency_ms": 82954.7,
+      "evidence_packet_chars": 12926,
+      "facts": 20,
+      "document_ids": [
+        "doc_credit_cards_credit_cards_(general)_020",
+        "doc_credit_cards_credit_cards_(general)_002",
+        "doc_credit_cards_credit_cards_(general)_001",
+        "doc_credit_cards_credit_cards_(general)_009",
+        "doc_credit_cards_platinum_rewards_card_008",
+        "doc_credit_cards_silver_rewards_card_011",
+        "doc_credit_cards_ecocard_011",
+        "doc_business_credit_cards_business_gold_rewards_card_010",
+        "doc_business_credit_cards_business_silver_rewards_card_013",
+        "doc_business_credit_cards_business_platinum_rewards_card_012",
+        "doc_business_credit_cards_green_rewards_card_010",
+        "doc_business_credit_cards_silver_zoom_card_011"
+      ],
+      "confidence": "high",
+      "missing_information": 4
+    },
+    {
+      "question": "For a credit-card referral with status REJECTED because the 2-per-rolling-7-day bonus cap was exceeded, can the bonus be reinstated or re-processed after the 7-day window has passed, and is there an agent tool or procedure to do so?",
+      "latency_ms": 57727.2,
+      "evidence_packet_chars": 7999,
+      "facts": 11,
+      "document_ids": [
+        "doc_credit_cards_credit_cards_(general)_002",
+        "doc_credit_cards_credit_cards_(general)_001",
+        "doc_credit_cards_credit_cards_(general)_009",
+        "doc_credit_cards_credit_cards_(general)_020",
+        "doc_credit_cards_credit_cards_(general)_017",
+        "doc_credit_cards_platinum_rewards_card_008",
+        "doc_credit_cards_silver_rewards_card_011",
+        "doc_bank_accounts_bank_accounts_(general)_048"
+      ],
+      "confidence": "high",
+      "missing_information": 5
+    }
+  ]
+}

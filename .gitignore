@@ -31,10 +31,18 @@ env/
 runs/*
 *.log
 
-# 例外:V5 收官 run 的原始 trace 随仓库发布,作为论文主结果的证据归档。
+# 例外:V5 final 证据 trace 随仓库发布,作为论文主结果的证据归档。
 # 注意 git 语义——父目录被排除后,无法用 ! 重新包含其中文件,
 # 故这里用 `runs/*`(而非 `runs/`)让下面的否定规则生效。
 # 其余 run(含 *_holdout_archive/)继续被忽略,sealed holdout 不落库。
+#
+# (1) v5_dev24 + v5_dev24r = Frozen V5 Dev24 9/24 主结果:
+#     v5_dev24 为前段 5/24,环境故障(winterapi 中断)后续跑剩余
+#     19 个得 v5_dev24r(+4),合计 9/24 —— freeze 报告
+#     docs/v5_dev24_freeze_report.md 记载此口径。
+!runs/v5_dev24_20260904_173828/
+!runs/v5_dev24r_20260904_195336/
+# (2) Step 0–3 candidate 5/24 轮(dev 回退证据,README 0aac7b6 条目):
 !runs/v5_final24_20260908_171622/
 
 # =============================================================================
