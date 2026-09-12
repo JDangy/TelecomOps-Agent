@@ -40,6 +40,15 @@ from agents.harness.validators import (
     EvidenceParameterValidation,
     SchemaValidation,
 )
+# V6.0: Stateful, Evidence-Grounded Runtime 三件套 + context 分层视图
+from agents.harness.evidence_ledger import EvidenceLedger, EvidenceRecord
+from agents.harness.worklist import Worklist, WorkItem
+from agents.harness.decision_checkpoint import (
+    DecisionCheckpoint,
+    CheckpointArtifact,
+    should_trigger_checkpoint,
+)
+from agents.harness.context_organization import build_v6_context_view
 
 __all__ = [
     "ActionHarness",
@@ -65,4 +74,13 @@ __all__ = [
     "ValidationPolicy",
     "ValidationVerdict",
     "norm_param_name",
+    # V6.0
+    "EvidenceLedger",
+    "EvidenceRecord",
+    "Worklist",
+    "WorkItem",
+    "DecisionCheckpoint",
+    "CheckpointArtifact",
+    "should_trigger_checkpoint",
+    "build_v6_context_view",
 ]

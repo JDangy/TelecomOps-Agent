@@ -60,6 +60,12 @@ RETRIEVAL_TOOL_NAMES = {
 }
 
 
+def _v6_enabled() -> bool:
+    """V6 runtime 开关:env DSH_V6_DISABLE=1 → 回退纯 V5 行为。"""
+    import os as _os
+    return (_os.environ.get("DSH_V6_DISABLE", "") or "").strip() != "1"
+
+
 def split_tools(tools: List[Tool]) -> tuple[List[Tool], List[Tool]]:
     """把环境工具分成 (business_tools, knowledge_tools)。"""
     business, knowledge = [], []
@@ -815,6 +821,18 @@ class DecisionAgent(LLMAgent):
         self.plan_store = PlanStore()
         self._planning_prompted = False             # runtime fallback 只提示一次
         self._planning_fallback_pending = False     # 下一轮注入提示
+        # V6.0: Stateful, Evidence-Grounded Runtime
+        #   ledger   —— 事实来源分层（user_claim/tool_result/kb/system）
+        #   worklist —— 条目级未完成事项（tool-result-driven 进度）
+        #   checkpoint —— 关键动作前的轻量证据检查点
+        #   默认启用;env DSH_V6_DISABLE=1 一键回退纯 V5 行为。
+        from agents.harness.evidence_ledger import EvidenceLedger
+        from agents.harness.worklist import Worklist
+        from agents.harness.decision_checkpoint import DecisionCheckpoint
+        self.v6_enabled = _v6_enabled()
+        self.evidence_ledger = EvidenceLedger()
+        self.worklist = Worklist()
+        self.checkpoint = DecisionCheckpoint()
 
     # -- V2.2: TaskState 三源喂入 ------------------------------------------------
     def _feed_task_state(self, message) -> None:
@@ -830,6 +848,8 @@ class DecisionAgent(LLMAgent):
                 UserStateExtractor.feed(
                     self.task_state, message.content or "",
                     turn_ref="user_message")
+                # V6: 用户消息 → ledger（user_claim 证据层）
+                self._v6_feed_user_message(message)
                 # V4: Plan Mode 后首个 user 消息补 goal
                 if self.plan_tracker.plan is not None:
                     txt = (message.content or "").strip()
@@ -839,14 +859,155 @@ class DecisionAgent(LLMAgent):
                 for tm in message.tool_messages:
                     ToolResultStateExtractor.feed(
                         self.task_state, "", tm.content or "")
+                    self._v6_feed_tool_result(tm, inner_from_cache=False)
                     self._plan_progress_from_tool(tm)
             elif isinstance(message, ToolMessage):
                 # tau2 _wrap_tool_results：单结果是裸 ToolMessage
                 ToolResultStateExtractor.feed(
                     self.task_state, "tool_result", message.content or "")
+                self._v6_feed_tool_result(message, inner_from_cache=False)
                 self._plan_progress_from_tool(message)
         except Exception:
             pass  # 状态喂入失败不影响对话流
+
+    # -- V6: evidence ledger / worklist 喂入 --------------------------------
+    def _v6_feed_user_message(self, message) -> None:
+        """UserMessage → EvidenceLedger（user_claim 层,确定性提取）。
+
+        只提取**通用模式**的自述事实（不猜业务语义）:
+        - 时间/tenure 自述（"X months/days/years"→ key=tenure_*）
+        - 金额自述（复用 V5 UserStateExtractor 的金额绑定结果——
+          ledger 记 user_claim,与 TaskState 同值）
+        身份信息（姓名/地址等）不进 ledger——TaskState/工具验证已覆盖。
+        """
+        if not getattr(self, "v6_enabled", False):
+            return
+        try:
+            from agents.harness.evidence_ledger import EvidenceLedger
+            import re as _re
+            text = message.content or ""
+            if not text:
+                return
+            # tenure 类自述:"about four months" / "3 days ago" /
+            # "mid-July" —— 记为 unverified claim（100 陷阱的通用形态）
+            m = _re.search(r"\b(?:about|around|roughly|over|more than)?\s*"
+                           r"(?:four|five|six|seven|eight|nine|ten|two|three|"
+                           r"\d{1,2})\s*(months?|days?|years?|weeks?)\b",
+                           text, _re.I)
+            if m:
+                EvidenceLedger.feed_user_claim(
+                    self.evidence_ledger, "tenure_claim",
+                    f"{m.group(0).strip().lower()}", source_ref="user_message")
+        except Exception:
+            pass
+
+    def _v6_feed_tool_result(self, tm, inner_from_cache: bool = True) -> None:
+        """ToolMessage → ledger（tool_result 层）+ worklist 推进。
+
+        工具名解析同 _plan_progress_from_tool（id → inner 映射,
+        无映射时跳过——不猜）。
+        """
+        if not getattr(self, "v6_enabled", False):
+            return
+        try:
+            from agents.harness.evidence_ledger import EvidenceLedger
+            inner = self._toolcall_inner_by_id.get(tm.id)
+            if inner is None:
+                return
+            ok = not tm.error
+            # ledger: current_time 类确定性识别
+            EvidenceLedger.feed_tool_result(
+                self.evidence_ledger, inner, tm.content or "")
+            # worklist: tool-result-driven 推进（实体绑定,失败不误完成）
+            args = self._toolcall_args_by_id.get(tm.id) or {}
+            self.worklist.on_tool_result(inner, ok, args,
+                                          task_state=self.task_state)
+        except Exception:
+            pass
+
+    def _v6_sync_worklist_from_plan(self) -> None:
+        """PlanStore 变更后同步 worklist（在 _execute_plan_tool 的
+        write/update 后调用;幂等）。"""
+        if not getattr(self, "v6_enabled", False):
+            return
+        try:
+            self.worklist.sync_from_plan(self.plan_store)
+        except Exception:
+            pass
+
+    # -- V6: Selective Decision Checkpoint -----------------------------------
+    def _v6_checkpoint_for_call(self, tc) -> None:
+        """关键动作前的证据检查点（零拦截;有界提示）。
+
+        流程（docs/v6_design.md §4.3）:
+        1. should_trigger_checkpoint(inner 工具名)（确定性枚举）
+        2. build_artifact（ledger 分段 + 确定性 missing）
+        3. emit checkpoint_triggered + checkpoint_missing_evidence
+        4. 一次独立短 LLM 调用判 READY/NOT_READY（call_name=
+           "decision_checkpoint"——instrumentation 自动归类;预算
+           CHECKPOINT_MAX_PER_TASK 有界）
+        5. NOT_READY + missing 非空 → 有界回注一条 system note
+           （PROMPT_LIMIT;超限只记 trace）——**不拦截原调用**
+        6. 回注的 note 在下次 generate 前由 _v6_pending_note 注入
+
+        失败静默（checkpoint 不阻塞主流程——V5 行为优先）。
+        """
+        if not getattr(self, "v6_enabled", False):
+            return
+        try:
+            from agents.harness.decision_checkpoint import should_trigger_checkpoint
+            inner = self._toolcall_inner_by_id.get(tc.id) or tc.name
+            if not should_trigger_checkpoint(inner):
+                return  # 读类/ask/plan 工具零触发（保护 V5 成功路径）
+            # open questions（来自 DA memory,checkpoint missing 输入）
+            open_qs = []
+            if self.memory is not None:
+                open_qs = list(self.memory.read().get("open_questions") or [])[:5]
+            artifact = self.checkpoint.build_artifact(
+                tool_name=inner, arguments=dict(getattr(tc, "arguments", None) or {}),
+                ledger=self.evidence_ledger, plan_store=self.plan_store,
+                worklist=self.worklist, open_questions=open_qs)
+            try:
+                from eval.instrumentation import get_active_recorder
+                rec = get_active_recorder()
+                if rec is not None:
+                    rec.emit("checkpoint_triggered", "decision_agent",
+                             parent_span_id=getattr(rec, "task_span_id", None),
+                             tool=inner,
+                             reason="critical_action",
+                             missing=artifact.missing_evidence or None)
+                    if artifact.missing_evidence:
+                        rec.emit("checkpoint_missing_evidence", "decision_agent",
+                                 parent_span_id=getattr(rec, "task_span_id", None),
+                                 tool=inner,
+                                 missing=artifact.missing_evidence)
+            except Exception:
+                pass
+            # LLM 判定（单轮短调用;generate 从本模块命名空间解析——
+            # instrumentation 已 patch agents.two_agent.generate）
+            verdict = self.checkpoint.run_llm_check(artifact, generate)
+            if verdict is not None and self.checkpoint.should_prompt(verdict):
+                note = self.checkpoint.prompt_note(verdict)
+                if note:
+                    self._v6_note_pending = note
+        except Exception:
+            pass
+
+    def _v6_consume_pending_note(self, state) -> None:
+        """把上一轮 checkpoint 的 NOT_READY 提示注入 message state 尾部。
+
+        语义:提示必须出现在**该关键动作的下一轮 generate 之前**——
+        即拦截循环里的下一次 generate。本方法在每次 generate 前调用,
+        有 note 则 append 一条 SystemMessage（不修改历史,只追加）。
+        """
+        note = getattr(self, "_v6_note_pending", None)
+        if note:
+            self._v6_note_pending = None
+            try:
+                from tau2.data_model.message import SystemMessage as _SM3
+                state.messages.append(_SM3(role="system", content=note))
+            except Exception:
+                pass
 
     # -- V4: Plan 进度由真实 Tool Result 驱动 ------------------------------
     def _plan_progress_from_tool(self, tm) -> None:
@@ -923,6 +1084,7 @@ class DecisionAgent(LLMAgent):
                         steps = []
                 result = self.plan_store.write_plan(
                     goal=args.get("goal") or "", steps=steps)
+                self._v6_sync_worklist_from_plan()   # V6: 条目展开
                 self._emit_plan_event("plan_written", result, before)
             elif name == "update_plan":
                 result = self.plan_store.update_plan(
@@ -932,6 +1094,7 @@ class DecisionAgent(LLMAgent):
                     entities=args.get("entities"),
                     note=args.get("note"),
                     tool_hint=args.get("tool_hint"))
+                self._v6_sync_worklist_from_plan()   # V6: 增量同步
                 self._emit_plan_event("plan_updated", result, before, op=args.get("op"))
             elif name == "read_plan":
                 result = {"goal": self.plan_store.goal,
@@ -1063,6 +1226,7 @@ class DecisionAgent(LLMAgent):
                         "describing what still needs to be done, with the first "
                         "step as the current focus). Then work through it step "
                         "by step, using update_plan when circumstances change.")))
+            self._v6_consume_pending_note(state)
             full = self._build_llm_context(state)
             assistant_message = generate(
                 model=self.llm,
@@ -1155,6 +1319,11 @@ class DecisionAgent(LLMAgent):
                         self._toolcall_args_by_id[tc.id] = dict(res.arguments or {})
                     except Exception:
                         self._toolcall_inner_by_id[tc.id] = tc.name
+                    # V6.0: Selective Decision Checkpoint——关键动作前的
+                    # 证据检查（读类/ask/plan 工具零触发;LLM 判 READY/
+                    # NOT_READY,NOT_READY 只回注提示不拦截——postmortem
+                    # Step2A 教训内建;预算有界）。
+                    self._v6_checkpoint_for_call(tc)
                     # 临时挂 tool 供 harness 读 schema
                     tc._harness_tool = tool  # noqa: SLF001
                     passed, content, meta = self.harness.process(
@@ -1238,10 +1407,12 @@ class DecisionAgent(LLMAgent):
         return assistant_message, state
 
     def _build_llm_context(self, state):
-        """V4/V5 Context Builder 入口：简单任务 V3 原路径，Plan 升级视图。
+        """V4/V5/V6 Context Builder 入口：简单任务 V3 原路径，Plan 升级视图。
 
         V5: plan_store 有计划时注入结构化 plan block（围绕 current step），
         置于各 block 最前（计划是 DA 每轮第一优先信息）。
+        V6: 追加证据分层视图（evidence view）——confirmed/unverified/
+        policy/missing 分段;空状态零渲染（简单任务零开销,保护 V5 路径）。
         """
         from agents.harness.context_builder import build_context
         mem_block = self.memory.context_block() if self.memory is not None else ""
@@ -1252,11 +1423,27 @@ class DecisionAgent(LLMAgent):
             v5_plan_block = self.plan_store.plan_block() if self.plan_store.active else ""
         except Exception:
             v5_plan_block = ""
-        combined_mem = v5_plan_block + ("\n\n" + mem_block if (v5_plan_block and mem_block) else mem_block)
+        v6_block = ""
+        if getattr(self, "v6_enabled", False):
+            try:
+                from agents.harness.context_organization import build_v6_context_view
+                open_qs = []
+                if self.memory is not None:
+                    open_qs = list(self.memory.read().get("open_questions") or [])[:5]
+                v6_block = build_v6_context_view(
+                    ledger=self.evidence_ledger,
+                    plan_store=self.plan_store,
+                    worklist=self.worklist,
+                    open_questions=open_qs,
+                    recent_arguments=None)
+            except Exception:
+                v6_block = ""
+        blocks = [b for b in (v5_plan_block, mem_block, state_block, v6_block) if b]
+        combined_mem = "\n\n".join(blocks)
         return build_context(
             state, task_state=self.task_state,
             plan_tracker=getattr(self, "plan_tracker", None),
-            memory_block=combined_mem, state_block=state_block,
+            memory_block=combined_mem, state_block="",
         )
 
     def _messages_with_memory(self, state):
@@ -1414,6 +1601,14 @@ class DecisionAgent(LLMAgent):
         t0 = _time.perf_counter()
         packet = self._knowledge_agent.answer(request)
         packet_json = json.dumps(packet, ensure_ascii=False)
+
+        # V6: packet facts/constraints → EvidenceLedger（knowledge_base 层）
+        if getattr(self, "v6_enabled", False):
+            try:
+                from agents.harness.evidence_ledger import EvidenceLedger
+                EvidenceLedger.feed_packet_facts(self.evidence_ledger, packet)
+            except Exception:
+                pass
 
         # packet → DA memory（确定性提取，无 LLM）：
         # facts 作为已确认事实；missing 作为待决问题

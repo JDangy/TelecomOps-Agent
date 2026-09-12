@@ -112,6 +112,79 @@ def test_resolver_uses_unlock_state_only():
     assert "_agent_discoverable_tools_state" in src
 
 
+def test_v6_replay_no_hidden_information():
+    """V6 replay:replay 输入只用 agent-visible 数据。
+
+    1. eval/replay.py 源码不得读取 tasks.json 的 evaluation_criteria /
+       user_scenario / notes（构建路径只允许 v1 conversation +
+       system_prompt + v2 agent 侧事件）。
+    2. 已构建的 configs/banking_v6_replay.json 不含泄漏标记。
+    3. replay 输入字段白名单存在且被单测使用。"""
+    src = open(os.path.join(ROOT, "eval/replay.py"), encoding="utf-8").read()
+    # 只查**读取访问**形态（json/task 上取这些键),不查词出现——
+    # FORBIDDEN_INPUT_KEYS 断言列表与 docstring 说明是合法的。
+    access_patterns = [
+        re.compile(r"\.get\s*\(\s*['\"]evaluation_criteria['\"]"),
+        re.compile(r"\.get\s*\(\s*['\"]gold"),
+        re.compile(r"\[[\s'\"]*(evaluation_criteria|user_scenario|"
+                   r"env_api_call_sequences|communicate_info)"),
+        re.compile(r"reward_basis"),
+    ]
+    violations = []
+    for pat in access_patterns:
+        for m in pat.finditer(src):
+            line_no = src[:m.start()].count("\n") + 1
+            line = src.split("\n")[line_no - 1].strip()
+            if line.startswith("#") or '"""' in line[:4]:
+                continue
+            violations.append(f"eval/replay.py:{line_no}: {line[:60]}")
+    assert not violations, f"replay 源码疑似读取 evaluator 字段: {violations[:5]}"
+    # 已构建配置的泄漏标记检查
+    cfg = os.path.join(ROOT, "configs/banking_v6_replay.json")
+    if os.path.exists(cfg):
+        blob = open(cfg, encoding="utf-8").read().lower()
+        for marker in ("evaluation_criteria", "gold_actions",
+                       "env_api_call_sequences", "user_scenario",
+                       "reward_basis", "communicate_info"):
+            assert marker not in blob, f"replay 配置泄漏标记: {marker}"
+
+
+def test_v6_runtime_no_gold_access():
+    """V6 runtime 模块（evidence_ledger/worklist/decision_checkpoint/
+    context_organization）不得访问 evaluator/gold 字段。
+
+    同 test_no_evaluator_field_access_in_runtime 的口径——V6 新模块
+    纳入 runtime 泄漏扫描范围。"""
+    v6_files = ["agents/harness/evidence_ledger.py",
+                "agents/harness/worklist.py",
+                "agents/harness/decision_checkpoint.py",
+                "agents/harness/context_organization.py"]
+    access_patterns = [
+        re.compile(r"task\s*\[\s*['\"]evaluation_criteria['\"]\s*\]"),
+        re.compile(r"task\s*\.\s*evaluation_criteria"),
+        re.compile(r"\.get\s*\(\s*['\"]evaluation_criteria['\"]"),
+        re.compile(r"\.get\s*\(\s*['\"]gold"),
+        re.compile(r"['\"]gold_action"),
+        re.compile(r"get_discoverable_tools\(\)"),
+        re.compile(r"\.get\s*\(\s*['\"]user_scenario['\"]"),
+    ]
+    violations = []
+    for f in v6_files:
+        p = os.path.join(ROOT, f)
+        if not os.path.exists(p):
+            violations.append(f"{f}: 文件缺失")
+            continue
+        content = open(p, encoding="utf-8").read()
+        for pat in access_patterns:
+            for m in pat.finditer(content):
+                line_no = content[:m.start()].count("\n") + 1
+                line = content.split("\n")[line_no - 1].strip()
+                if line.startswith("#") or '"""' in line[:4]:
+                    continue
+                violations.append(f"{f}:{line_no}: {line[:60]}")
+    assert not violations, f"V6 runtime 泄漏: {violations[:5]}"
+
+
 def test_holdout_sealed():
     """Holdout 配置存在且只创建不运行（无对应 runs/ 目录）。"""
     cfg = json.load(open(os.path.join(ROOT, "configs/banking_holdout_sealed.json")))

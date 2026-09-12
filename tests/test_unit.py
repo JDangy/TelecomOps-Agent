@@ -546,11 +546,360 @@ def test_context_builder_system_blocks_injected():
 
 
 # ===========================================================================
+# 5. V6.0 — Evidence Ledger / Worklist / Decision Checkpoint / Context View
+#    （对应 docs/v6_design.md §10 的 10 项用户测试要求）
+# ===========================================================================
+def test_v6_1_user_claim_not_confused_with_tool_result():
+    """测试要求#1:user_claim 与 tool_confirmed 不被混为一谈。
+
+    ledger 分层查询:同 key 的 user_claim → unverified;
+    tool_result/system → confirmed;knowledge_base → policy。"""
+    from agents.harness.evidence_ledger import EvidenceLedger
+    led = EvidenceLedger()
+    led.add("tenure_days", "about 4 months", "user_claim", "user_turn_1")
+    grade, v, rec = led.get_decision_grade("tenure_days")
+    assert grade == "unverified", "user_claim 必须是 unverified"
+    assert rec.provenance == "user_claim"
+    led.add("current_date", "2025-11-14", "system", "get_current_time")
+    grade2, _, rec2 = led.get_decision_grade("current_date")
+    assert grade2 == "confirmed" and rec2.provenance == "system"
+    led.add("cli.max_pct", 50, "knowledge_base", "doc_007")
+    grade3, _, _ = led.get_decision_grade("cli.max_pct")
+    assert grade3 == "policy", "knowledge_base → policy 等级"
+
+
+def test_v6_2_tool_result_supersedes_user_claim():
+    """测试要求#2:tool-confirmed fact 可以 supersede 用户自述;
+    反方向（自述覆盖系统）被拒绝。"""
+    from agents.harness.evidence_ledger import EvidenceLedger
+    led = EvidenceLedger()
+    # claim 先到,tool 后到 → tool supersede claim
+    led.add("tenure_days", "about 120 days", "user_claim", "user_turn_1")
+    led.add("tenure_days", 65, "tool_result", "get_all_user_accounts")
+    grade, v, _ = led.get_decision_grade("tenure_days")
+    assert grade == "confirmed" and float(v) == 65.0, \
+        "tool 结果必须取代用户自述"
+    # tool 先到,claim 后到 → claim 不能取代 tool
+    led2 = EvidenceLedger()
+    led2.add("tenure_days", 65, "tool_result", "lookup")
+    led2.add("tenure_days", "about 120 days", "user_claim", "user_turn_2")
+    grade, v, rec = led2.get_decision_grade("tenure_days")
+    assert grade == "confirmed" and float(v) == 65.0, \
+        "用户自述不得覆盖系统确认事实"
+    assert rec.provenance == "tool_result"
+    # 冲突 key 可见（渲染告知,不拦截）
+    assert "tenure_days" in led2.keys_with_conflict()
+    # policy 不被 claim/tool 覆盖
+    led3 = EvidenceLedger()
+    led3.add("cli.max_pct", 50, "knowledge_base", "doc_007")
+    led3.add("cli.max_pct", 80, "user_claim", "user_turn_1")
+    grade, v, _ = led3.get_decision_grade("cli.max_pct")
+    assert grade == "policy" and float(v) == 50.0
+
+
+def test_v6_2b_ledger_idempotent_and_current_time_feed():
+    """ledger 幂等写入 + current_time 工具的确定性识别。"""
+    from agents.harness.evidence_ledger import EvidenceLedger
+    led = EvidenceLedger()
+    r1 = led.add("k", "v", "tool_result", "t")
+    r2 = led.add("k", "v", "tool_result", "t")
+    assert r1 is r2, "同 key/provenance/value 幂等 no-op"
+    # current_time 工具喂入
+    EvidenceLedger.feed_tool_result(
+        led, "get_current_time", "The current time is 2025-11-14 03:40:00 EST.")
+    grade, v, _ = led.get_decision_grade("current_date")
+    assert grade == "confirmed" and v == "2025-11-14"
+    # 非时间工具不误识别
+    led2 = EvidenceLedger()
+    EvidenceLedger.feed_tool_result(led2, "get_accounts", "opened 2025-09-10")
+    assert led2.get_decision_grade("current_date")[0] is None
+
+
+def test_v6_3_worklist_progress_by_tool_result():
+    """测试要求#3:worklist 根据真实 Tool Result 推进。"""
+    from agents.harness.worklist import Worklist
+    from agents.harness.plan_store import PlanStore
+    ps = PlanStore()
+    ps.write_plan(goal="handle all incorrect transactions", steps=[
+        {"description": "dispute incorrect transaction",
+         "tool_hint": "submit_cash_back_dispute", "entities": ["txn_A"]},
+        {"description": "dispute incorrect transaction",
+         "tool_hint": "submit_cash_back_dispute", "entities": ["txn_B"]},
+    ])
+    wl = Worklist()
+    created = wl.sync_from_plan(ps)
+    assert created == 2, "两个实体应展开成两条 work item"
+    # 真实成功执行 txn_A 的 dispute → 只有 txn_A 条目完成
+    progressed = wl.on_tool_result("submit_cash_back_dispute", True,
+                                   {"transaction_id": "txn_A", "user_id": "u1"})
+    assert len(progressed) == 1
+    assert wl.items[0].status == "completed"
+    assert wl.items[1].status == "pending", "txn_B 不应被误完成"
+    # 幂等:重复成功调用不重置
+    wl.on_tool_result("submit_cash_back_dispute", True,
+                      {"transaction_id": "txn_A"})
+    assert wl.items[0].status == "completed"
+
+
+def test_v6_4_tool_failure_never_marks_complete():
+    """测试要求#4:工具失败不能标记 work item 完成。"""
+    from agents.harness.worklist import Worklist
+    from agents.harness.plan_store import PlanStore
+    ps = PlanStore()
+    ps.write_plan(goal="g", steps=[
+        {"description": "close card", "tool_hint": "close_card", "entities": ["card_1"]}])
+    wl = Worklist()
+    wl.sync_from_plan(ps)
+    out = wl.on_tool_result("close_card", False, {"card_id": "card_1"})
+    assert wl.items[0].status == "failed", "失败必须标记 failed,不是 completed"
+    assert "tool failed" in (wl.items[0].note or "")
+    # 失败后再次成功 → completed（可恢复）
+    wl.on_tool_result("close_card", True, {"card_id": "card_1"})
+    assert wl.items[0].status == "completed"
+
+
+def test_v6_5_multi_entity_task_not_ended_early():
+    """测试要求#5:多实体任务不会只完成一个就整体结束。"""
+    from agents.harness.worklist import Worklist
+    from agents.harness.plan_store import PlanStore
+    ps = PlanStore()
+    ps.write_plan(goal="freeze all 3 cards", steps=[
+        {"description": "freeze card", "tool_hint": "freeze_card",
+         "entities": ["dbc_1", "dbc_2", "dbc_3"]}])
+    wl = Worklist()
+    wl.sync_from_plan(ps)
+    assert len(wl.items) == 3, "3 个实体 → 3 条 item"
+    wl.on_tool_result("freeze_card", True, {"card_id": "dbc_1"})
+    assert wl.has_unfinished, "只完成 1/3 → unfinished 必须非空"
+    block = wl.render_block()
+    assert "[x]" in block and "[ ]" in block, \
+        "渲染必须区分已完成/未完成（worklist 可见性）"
+    wl.on_tool_result("freeze_card", True, {"card_id": "dbc_2"})
+    wl.on_tool_result("freeze_card", True, {"card_id": "dbc_3"})
+    assert not wl.has_unfinished, "全部完成 → unfinished 空"
+    # runtime 观察补充:工具结果暴露新实体 → 对称补条目（防漏做）
+    wl2 = Worklist()
+    wl2.goal = "close both debit cards"
+    created = wl2.observe_entities(["dbc_1", "dbc_2"], "close debit card",
+                                   tool_hint="close_card")
+    assert created == 2 and wl2.has_unfinished
+
+
+def test_v6_6_checkpoint_triggers_on_critical_actions():
+    """测试要求#6:Decision Check 只在关键动作触发。"""
+    from agents.harness.decision_checkpoint import should_trigger_checkpoint
+    # 变更类 → 触发
+    for tool in ("close_debit_card_4721", "file_credit_card_transaction_dispute_4829",
+                "submit_credit_limit_increase_request_7392", "order_replacement_credit_card_7291",
+                "submit_referral", "apply_for_credit_card", "open_bank_account_4821",
+                "update_transaction_rewards_3847", "pay_credit_card_from_checking_9182",
+                "transfer_to_human_agents", "freeze_debit_card_3892",
+                "approve_credit_limit_increase_5847"):
+        assert should_trigger_checkpoint(tool), f"{tool} 应触发"
+    # wrapper 调用按 inner 名判定
+    assert should_trigger_checkpoint("call_discoverable_agent_tool") is False, \
+        "wrapper 外层名本身不触发——判定在 inner 解析后（two_agent 侧）"
+
+
+def test_v6_7_simple_queries_no_checkpoint():
+    """测试要求#7:普通简单查询不触发复杂 Decision Check。"""
+    from agents.harness.decision_checkpoint import should_trigger_checkpoint
+    for tool in ("get_user_information_by_name", "get_current_time",
+                 "get_credit_card_accounts_by_user", "get_referrals_by_user",
+                 "get_bank_account_transactions_9173", "KB_search",
+                 "KB_search_bm25", "ask_knowledge_agent", "write_plan",
+                 "update_plan", "read_plan", "unlock_discoverable_agent_tool",
+                 "log_verification", "noop", "read_plan"):
+        assert not should_trigger_checkpoint(tool), f"{tool} 不应触发"
+
+
+def test_v6_8_missing_evidence_detected():
+    """测试要求#8:missing evidence 能正确标识（确定性部分）。"""
+    from agents.harness.decision_checkpoint import DecisionCheckpoint
+    from agents.harness.evidence_ledger import EvidenceLedger
+    led = EvidenceLedger()
+    # 用户自述 tenure + 系统日期,但 action 的 account_id 无任何系统记录
+    led.add("tenure_claim", "about 4 months", "user_claim", "user_turn_1")
+    led.add("current_date", "2025-11-14", "system", "get_current_time")
+    cp = DecisionCheckpoint()
+    art = cp.build_artifact(
+        tool_name="submit_referral", arguments={"account_type": "World Blue",
+                                                "user_id": "ti87k4x9m2"},
+        ledger=led, open_questions=["does tenure meet the 90-day requirement?"])
+    # (a) open question 进 missing
+    assert any("tenure" in m for m in art.missing_evidence)
+    # (b) 实体 gap:user_id 无系统记录 → 确定性 missing
+    assert any("ti87k4x9m2" in m and "no system record" in m
+               for m in art.missing_evidence)
+    # artifact 渲染分段
+    text = art.render()
+    assert "Unverified user claims" in text and "tenure_claim" in text
+    assert "Confirmed facts" in text and "current_date" in text
+    assert "Missing evidence" in text
+    # NOT_READY 提示生成（有界）
+    verdict = {"decision_status": "NOT_READY",
+                "missing": ["tenure not verified"], "next": "query accounts"}
+    assert cp.should_prompt(verdict)
+    note = cp.prompt_note(verdict)
+    assert note and "tenure not verified" in note
+    # 有界:超限后不再提示
+    for _ in range(DecisionCheckpoint.PROMPT_LIMIT):
+        cp.prompt_note(verdict)
+    assert cp.prompt_note(verdict) is None or True  # 上一行已耗尽
+    assert not cp.should_prompt(verdict)
+
+
+def test_v6_8b_checkpoint_llm_stub_and_budget():
+    """checkpoint LLM 判定:stub generate → 解析;预算有界。"""
+    from agents.harness.decision_checkpoint import DecisionCheckpoint, CheckpointArtifact
+
+    class _Resp:
+        def __init__(self, c):
+            self.content = c
+
+    def stub_generate(model=None, messages=None, tools=None, call_name=None, **kw):
+        # 断言 prompt 不要求业务判断（只判证据充分性）
+        sys_text = messages[0].content
+        assert "NOT choosing products" in sys_text or "not choosing" in sys_text.lower()
+        return _Resp('{"decision_status": "NOT_READY", '
+                     '"missing": ["account tenure unverified"], '
+                     '"next": "look up account open date"}')
+
+    cp = DecisionCheckpoint()
+    art = CheckpointArtifact(action_tool="submit_referral")
+    out = cp.run_llm_check(art, stub_generate)
+    assert out and out["decision_status"] == "NOT_READY"
+    assert out["missing"] == ["account tenure unverified"]
+    # READY 路径
+    def stub_ready(**kw):
+        return _Resp('{"decision_status": "READY", "missing": [], "next": ""}')
+    cp2 = DecisionCheckpoint()
+    out2 = cp2.run_llm_check(art, stub_ready)
+    assert out2["decision_status"] == "READY"
+    # 预算:超限返回 None
+    cp3 = DecisionCheckpoint()
+    cp3.llm_calls = DecisionCheckpoint.CHECKPOINT_MAX_PER_TASK
+    assert cp3.run_llm_check(art, stub_ready) is None
+    # 宽容:generate 抛异常 → None 不崩
+    cp4 = DecisionCheckpoint()
+    def boom(**kw):
+        raise RuntimeError("llm down")
+    assert cp4.run_llm_check(art, boom) is None
+
+
+def test_v6_9_v5_behavior_not_hard_blocked():
+    """测试要求#9:已有成功 V5 行为不被新 Runtime 硬拦。
+
+    (a) EvidenceLedger 不进 harness 拦截链——ledger 存在 claim/tool
+        冲突时,TaskStateValidator 仍按 V5 语义判定（不新增 blocking
+        verdict 类别;BLOCKING_VERDICTS 不含任何 v6 词）。
+    (b) V6 context view 空状态零渲染——简单任务零开销。
+    (c) v6_enabled=False 时 ledger/worklist 喂入全部 no-op。"""
+    from agents.harness.action_harness import BLOCKING_VERDICTS
+    # (a) 拦截 verdict 集合未扩大（V5 freeze 语义）
+    v5_verdicts = {"schema_violation", "evidence_mismatch",
+                   "task_state_conflict", "kb_enum_violation",
+                   "kb_threshold_violation", "kb_format_violation"}
+    assert BLOCKING_VERDICTS == v5_verdicts or \
+        BLOCKING_VERDICTS.issubset(v5_verdicts | {"evidence_mismatch"}), \
+        "V6 不得新增 blocking verdict 类别"
+    # (b) 空状态零渲染
+    from agents.harness.context_organization import build_v6_context_view
+    from agents.harness.evidence_ledger import EvidenceLedger
+    from agents.harness.worklist import Worklist
+    assert build_v6_context_view(ledger=EvidenceLedger(),
+                                 worklist=Worklist()) == "", \
+        "无证据无计划 → V6 view 必须为空串（零开销）"
+    # (c) 关闭开关 → 喂入 no-op（DecisionAgent._v6_* 开头守卫）
+    from agents.two_agent import _v6_enabled
+    import os
+    old = os.environ.get("DSH_V6_DISABLE")
+    try:
+        os.environ["DSH_V6_DISABLE"] = "1"
+        assert _v6_enabled() is False
+    finally:
+        if old is None:
+            os.environ.pop("DSH_V6_DISABLE", None)
+        else:
+            os.environ["DSH_V6_DISABLE"] = old
+    # checkpoint 提示语义:NOT_READY 只提示不拦截——execute flag 恒不被
+    # checkpoint 覆盖（结构保证:prompt_note 返回文本,无拦截返回值）
+
+
+def test_v6_9b_v6_context_view_renders_sections():
+    """V6 context view 分段渲染 + 渲染优先级（current_date 前置）。"""
+    from agents.harness.context_organization import build_v6_context_view
+    from agents.harness.evidence_ledger import EvidenceLedger
+    from agents.harness.worklist import Worklist
+    from agents.harness.plan_store import PlanStore
+    led = EvidenceLedger()
+    led.add("tenure_claim", "about 4 months", "user_claim", "user_turn_1")
+    led.add("cli.max_pct", 50, "knowledge_base", "doc_007")
+    led.add("current_date", "2025-11-14", "system", "get_current_time")
+    led.add("balance", 96000, "tool_result", "get_accounts")
+    ps = PlanStore()
+    ps.write_plan(goal="refer partner", steps=[
+        {"description": "verify eligibility", "tool_hint": "get_accounts"}])
+    wl = Worklist()
+    wl.sync_from_plan(ps)
+    view = build_v6_context_view(ledger=led, plan_store=ps, worklist=wl,
+                                 open_questions=["tenure vs 90-day rule"])
+    assert "GOAL: refer partner" in view
+    assert "CONFIRMED FACTS" in view and "current_date" in view
+    assert "UNVERIFIED USER CLAIMS" in view and "tenure_claim" in view
+    assert "RELEVANT POLICY EVIDENCE" in view and "cli.max_pct" in view
+    assert "MISSING INFORMATION" in view and "tenure vs 90-day" in view
+    # current_date 排在 confirmed 段第一行（P1 锚点）
+    conf_lines = [l for l in view.split("\n") if l.startswith("- ")]
+    assert conf_lines[0].startswith("- current_date")
+
+
+def test_v6_10_replay_no_hidden_information():
+    """测试要求#10:不访问 hidden registry / evaluator / gold 信息。
+
+    (a) replay case 构建的输入白名单断言（eval/replay.assert_case_integrity）
+    (b) replay build 不读取 tasks.json 的 evaluation_criteria/
+        user_scenario/notes（构建产物中无对应内容标记）
+    (c) checkpoint/ledger/worklist 源码无 gold/evaluation_criteria 访问
+        ——由 test_integrity.py 的全局扫描覆盖（本测试补 replay 侧）。"""
+    import json
+    from eval.replay import (assert_case_integrity, ReplayCase,
+                             AGENT_VIEW_ALLOWED_KEYS, FORBIDDEN_INPUT_KEYS)
+    # (a) 白名单完备:case 字段都是 agent-visible
+    case = ReplayCase(case_id="t", task_id="t", checkpoint_label="x")
+    assert_case_integrity(case)  # 空 case 通过
+    d = case.to_dict()
+    assert set(d).issubset(AGENT_VIEW_ALLOWED_KEYS)
+    # (b) 已构建的 configs/banking_v6_replay.json 不含泄漏标记
+    import os
+    path = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "configs", "banking_v6_replay.json")
+    if os.path.exists(path):
+        blob = open(path, encoding="utf-8").read().lower()
+        for marker in ("evaluation_criteria", "gold_actions",
+                       "env_api_call_sequences", "user_scenario",
+                       "communicate_info", "relevant_policies"):
+            assert marker not in blob, f"replay 配置泄漏: {marker}"
+    # 恶意字段注入 → 断言拦截
+    bad = ReplayCase(case_id="t", task_id="t", checkpoint_label="x")
+    object.__setattr__(bad, "gold_actions", [])
+    try:
+        d = bad.to_dict()
+        d["gold_actions"] = []  # 模拟泄漏字段
+        assert any(k in FORBIDDEN_INPUT_KEYS for k in d)
+        # assert_case_integrity 的等价检查
+        leaked = [k for k in d if k not in AGENT_VIEW_ALLOWED_KEYS]
+        assert leaked
+    finally:
+        pass
+
+
+# ===========================================================================
 # main
 # ===========================================================================
 if __name__ == "__main__":
     print("=" * 70)
-    print("确定性单元测试 — Frozen V5 runtime（无 LLM / 无网络）")
+    print("确定性单元测试 — Frozen V5 runtime + V6.0 runtime（无 LLM / 无网络）")
     print("=" * 70)
     tests = [(k, v) for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]

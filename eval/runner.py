@@ -349,6 +349,52 @@ def _memory_metrics(events, ka_retr, hands, results) -> dict:
     }
 
 
+def _v6_runtime_metrics(events: list) -> dict:
+    """V6.0 runtime 机制指标（无 V6 事件时返回空 dict——V5 回退形态）。
+
+    覆盖:证据账本（provenance 分布/supersede）、worklist（推进/完成/
+    失败）、checkpoint（触发/missing/决策/提示）——归因四分法的
+    事件计数（State/Decision/Action/Update 各环）。
+    """
+    has_v6 = any(e["event_type"].startswith(("evidence_", "work_item_",
+                                             "checkpoint_"))
+                 for e in events)
+    if not has_v6:
+        return {}
+    ev_types = ("evidence_record_added", "evidence_superseded",
+                "work_item_created", "work_item_progressed",
+                "work_item_completed", "work_item_failed",
+                "checkpoint_triggered", "checkpoint_missing_evidence",
+                "checkpoint_decision", "checkpoint_prompt_injected",
+                "checkpoint_budget_exhausted",
+                "checkpoint_prompt_suppressed")
+    counts = {t: 0 for t in ev_types}
+    prov_counts: dict = {}
+    cp_decisions: dict = {}
+    for e in events:
+        et = e.get("event_type")
+        if et in counts:
+            counts[et] += 1
+        if et == "evidence_record_added":
+            p = e.get("provenance")
+            prov_counts[p] = prov_counts.get(p, 0) + 1
+        if et == "checkpoint_decision":
+            s = e.get("status")
+            cp_decisions[s] = cp_decisions.get(s, 0) + 1
+    out = {"v6_evidence_records": counts["evidence_record_added"],
+           "v6_evidence_superseded": counts["evidence_superseded"],
+           "v6_evidence_by_provenance": prov_counts,
+           "v6_work_items_created": counts["work_item_created"],
+           "v6_work_items_completed": counts["work_item_completed"],
+           "v6_work_items_failed": counts["work_item_failed"],
+           "v6_checkpoints_triggered": counts["checkpoint_triggered"],
+           "v6_checkpoint_missing_evidence": counts["checkpoint_missing_evidence"],
+           "v6_checkpoint_decisions": cp_decisions,
+           "v6_checkpoint_prompts": counts["checkpoint_prompt_injected"]}
+    # 只保留非零项（trace 简洁;零值由缺键表达）
+    return {k: v for k, v in out.items() if v}
+
+
 def _harness_metrics(events: list) -> dict:
     """V2 Action Harness 指标（无 harness 事件时返回空 dict）。"""
     proposed = [e for e in events if e["event_type"] == "action_proposed"]
@@ -694,6 +740,8 @@ def run_eval(
         m["two_agent_metrics"] = _extract_two_agent_metrics(v2)
         # V2 harness 指标（无 harness 事件时为空 dict）
         m["harness_metrics"] = _harness_metrics(v2.get("events") or [])
+        # V6.0 runtime 机制指标（无 V6 事件时为空 dict——V5 回退形态）
+        m["v6_runtime_metrics"] = _v6_runtime_metrics(v2.get("events") or [])
 
         status = "SUCCESS" if m["success"] else "FAIL"
         cost = (m.get("agent_cost") or 0.0) + (m.get("user_cost") or 0.0)
