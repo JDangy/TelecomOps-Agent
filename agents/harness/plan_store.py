@@ -58,6 +58,15 @@ REMOVED = "removed"
 
 ACTIVE_STATUSES = (PENDING, IN_PROGRESS, BLOCKED, FAILED)  # removed 除外
 
+# 单步骤目标实体的保存上限（V6.1 修复 #1）。
+# 长任务一个步骤可能要处理多笔对象（如 6 笔 transaction）——上限过低会
+# 让模型计划里的对象被静默截断、Worklist 少展开、后续任务丢失。
+# 取值 10:覆盖当前 benchmark 长任务,同时不放任无限增长。
+# 所有 PlanStep 入口（write_plan / add_step）统一使用本常量。
+# 注意:Runtime State 完整保存 ≤10 个;**展示预算**另由 ContextBuilder
+# 控制（context_builder.MAX_WORK_ITEMS,只显示最相关/未完成的前 8 个）。
+MAX_STEP_ENTITIES = 10
+
 
 @dataclass
 class PlanStep:
@@ -114,7 +123,7 @@ class PlanStore:
                 step_id=self._next_id,
                 description=str(s["description"])[:200],
                 tool_hint=s.get("tool_hint"),
-                entities=[str(e) for e in (s.get("entities") or [])][:4],
+                entities=[str(e) for e in (s.get("entities") or [])][:MAX_STEP_ENTITIES],
             )
             self.steps.append(st)
             self._next_id += 1
@@ -138,7 +147,7 @@ class PlanStore:
             st = PlanStep(step_id=self._next_id,
                           description=str(description or "")[:200],
                           tool_hint=tool_hint,
-                          entities=[str(e) for e in (entities or [])][:4])
+                          entities=[str(e) for e in (entities or [])][:MAX_STEP_ENTITIES])
             self.steps.append(st)
             self._next_id += 1
             return {"ok": True, "added": st.step_id}

@@ -1057,20 +1057,38 @@ def _mk_agent_state():
 def _install_scripted_generate(script):
     """把 agents.two_agent.generate 换成按脚本返回 AssistantMessage 的桩。
 
-    返回 (counter, restore)。用完必须 restore（避免污染其他测试）。
+    同时记录每次 generate 收到的 messages（本轮 LLM context）——
+    用于断言 checkpoint 只出现在 generate 的临时视图里,不在
+    state.messages（正式 conversation state）里。
+    返回 (box, restore)。box["messages"] = [每轮的 messages 列表]。
+    用完必须 restore（避免污染其他测试）。
     """
     import agents.two_agent as ta
-    box = {"i": 0}
+    box = {"i": 0, "messages": []}
     original = ta.generate
 
     def fake_generate(model=None, tools=None, messages=None,
                       call_name=None, **kwargs):
+        box["messages"].append(messages)
         i = box["i"]
         box["i"] += 1
         return script[min(i, len(script) - 1)]()
 
     ta.generate = fake_generate
     return box, (lambda: setattr(ta, "generate", original))
+
+
+def _context_has_checkpoint(messages):
+    """本轮传给 generate 的 messages 副本中是否含 checkpoint 6 问。"""
+    from tau2.data_model.message import SystemMessage
+    return any(isinstance(m, SystemMessage)
+               and "DECISION CHECKPOINT" in (m.content or "")
+               for m in (messages or []))
+
+
+def _state_has_checkpoint(state):
+    """正式 state.messages 中是否含 checkpoint（正确实现下应恒为 False）。"""
+    return _context_has_checkpoint(state.messages)
 
 
 def _has_dangling_tool_call(messages, accepted):
@@ -1091,7 +1109,7 @@ def test_v6_15_checkpoint_hold_leaves_no_dangling_tool_call():
     tool-call 写入正式历史（否则产生 Assistant→System→Assistant 的
     无 ToolResult 脏序列）。同签名第二次正常放行。"""
     from tau2.data_model.message import (
-        AssistantMessage, ToolCall, UserMessage, SystemMessage)
+        AssistantMessage, ToolCall, UserMessage)
     a = _mk_naked_decision_agent(seed_evidence=True)
     state = _mk_agent_state()
 
@@ -1119,10 +1137,17 @@ def test_v6_15_checkpoint_hold_leaves_no_dangling_tool_call():
            if isinstance(m, AssistantMessage) and m.tool_calls]
     assert len(atc) == 1 and atc[0] is ret, \
         "只应保留被放行的那条 tool-call"
-    # checkpoint 6 问确实注入过（以 system 尾注形式;语义 = 执行前重新决策）
-    assert any(isinstance(m, SystemMessage)
-               and "DECISION CHECKPOINT" in (m.content or "")
-               for m in state.messages), "应注入 checkpoint 6 问尾注"
+    # V6.1 修复 #2:checkpoint 是 ephemeral context——只在触发后的
+    # 下一轮 generate 视图里出现一次,**绝不进入正式 state.messages**。
+    assert not _context_has_checkpoint(box["messages"][0]), \
+        "触发轮(round1)生成时 checkpoint 尚未产生"
+    assert _context_has_checkpoint(box["messages"][1]), \
+        "触发后的下一轮 generate 视图必须含 checkpoint 6 问"
+    assert not _state_has_checkpoint(state), \
+        "checkpoint 不得写入正式 state.messages"
+    # pending 一次性消费（注入后即清空）
+    assert a._v6_note_pending is None, "checkpoint 尾注应已被消费"
+    assert a.checkpoint.pending is None, "checkpoint artifact pending 应已消费"
     assert len(a._v6_checkpointed_signatures) == 1, "同签名只 checkpoint 一次"
 
 
@@ -1130,8 +1155,7 @@ def test_v6_16_final_recommendation_checkpoint_and_restraint():
     """修复#3:纯文本最终推荐触发证据检查点（通用意图,非产品词）;
     普通文本不触发;空证据零触发;同任务只检查一次。"""
     from agents.harness.decision_checkpoint import is_final_recommendation
-    from tau2.data_model.message import (
-        AssistantMessage, UserMessage, SystemMessage)
+    from tau2.data_model.message import AssistantMessage, UserMessage
 
     # (a) 通用 recommendation/selection 意图 → 触发
     for text in ("I recommend the Sky Blue account.",
@@ -1161,9 +1185,14 @@ def test_v6_16_final_recommendation_checkpoint_and_restraint():
         restore()
     assert box["i"] == 2, "最终推荐应触发一次 checkpoint（多一轮 generate）"
     assert ret is not None and "recommend" in (ret.content or "").lower()
-    assert any(isinstance(m, SystemMessage)
-               and "DECISION CHECKPOINT" in (m.content or "")
-               for m in state.messages), "推荐前应注入证据视图 6 问"
+    assert not _context_has_checkpoint(box["messages"][0]), \
+        "含推荐的首次生成尚未注入 checkpoint"
+    assert _context_has_checkpoint(box["messages"][1]), \
+        "推荐触发后的下一轮 generate 视图应含证据 6 问"
+    assert not _state_has_checkpoint(state), \
+        "推荐 checkpoint 同样不得写入 state.messages（ephemeral context）"
+    assert a._v6_note_pending is None and a.checkpoint.pending is None, \
+        "推荐 checkpoint 的 pending 应一次性消费"
     assert a.checkpoint.triggered == 1, "同一任务推荐检查只触发一次"
     assert ("__final_recommendation__",) in a._v6_checkpointed_signatures
 
@@ -1178,7 +1207,117 @@ def test_v6_16_final_recommendation_checkpoint_and_restraint():
         restore2()
     assert box2["i"] == 1, "无任何证据时推荐不得触发 checkpoint"
     assert a2.checkpoint.triggered == 0
+    assert not _context_has_checkpoint(box2["messages"][0]), \
+        "空证据时 checkpoint 不得出现"
+    assert not _state_has_checkpoint(state2)
     assert ret2 is not None and "recommend" in (ret2.content or "").lower()
+
+
+def test_v6_17_plan_step_entities_cap_all_entries():
+    """修复#1:PlanStep 实体上限统一提高（MAX_STEP_ENTITIES）——
+    6 个实体全部保存、Worklist 全部展开、4/6 父不完成、6/6 父完成。
+    add_step 入口与 write_plan 使用同一常量。"""
+    from agents.harness.plan_store import (
+        PlanStore, COMPLETED, MAX_STEP_ENTITIES)
+    from agents.harness.worklist import Worklist
+    import inspect
+    import agents.harness.plan_store as ps_mod
+    # 统一常量:两个入口都引用 MAX_STEP_ENTITIES,无散落的字面量截断
+    assert MAX_STEP_ENTITIES >= 6, "上限必须覆盖当前 benchmark 长任务"
+    src = inspect.getsource(ps_mod)
+    assert src.count("MAX_STEP_ENTITIES") >= 3, \
+        "两个实体入口都应使用同一常量（含定义处）"
+    assert "[:4]" not in src, "不得残留旧的 4 实体截断"
+
+    ents6 = ["txn_%d" % i for i in range(1, 7)]  # 6 个对象
+    ps = PlanStore()
+    ps.write_plan("handle all incorrect transactions", [
+        {"description": "dispute incorrect transaction",
+         "tool_hint": "submit_dispute", "entities": list(ents6)},
+    ])
+    # write_plan 实际保存 6 个（不再截断到 4）
+    assert ps.steps[0].entities == ents6, \
+        f"write_plan 应保存全部 6 个实体, got {ps.steps[0].entities}"
+    # add_step 走同一常量（独立 store 验证,避免同名实体产生歧义）
+    ps_b = PlanStore()
+    ps_b.write_plan("g", [{"description": "seed"}])
+    ps_b.update_plan("add_step", description="extra", entities=list(ents6))
+    assert ps_b.steps[1].entities == ents6, "add_step 应保存全部 6 个实体"
+
+    ps.update_plan("set_current", step_id=1)
+    wl = Worklist()
+    wl.sync_from_plan(ps)
+    items = wl.items_for_step(1)
+    assert len(items) == 6, f"Worklist 应展开 6 个条目, got {len(items)}"
+    assert [i.entity for i in items] == ents6
+
+    def _apply(txn):
+        ps.on_tool_result("submit_dispute", True, {"transaction_id": txn})
+        wl.on_tool_result(ps, "submit_dispute", True, {"transaction_id": txn})
+
+    for t in ents6[:4]:
+        _apply(t)
+    assert ps.steps[0].status != COMPLETED, \
+        "完成 4/6 时父步骤仍不得 completed（后 2 个任务不能丢）"
+    assert len(wl.unfinished()) == 2, "应还剩 2 个待处理对象"
+    _apply(ents6[4])
+    assert ps.steps[0].status != COMPLETED, "5/6 仍不得 completed"
+    _apply(ents6[5])
+    assert ps.steps[0].status == COMPLETED, "6/6 完成后父步骤才 completed"
+    assert not wl.unfinished()
+
+
+def test_v6_18_checkpoint_is_ephemeral_context_not_history():
+    """修复#2:连续三轮验证 checkpoint 真正是"一次性 context"。
+
+    round1:关键动作 → trigger（本轮 generate 视图尚无 checkpoint）
+    round2:generate 视图含 checkpoint（DA 重新决策并放行同签名动作）
+    round3:无新 trigger → generate 视图不再含旧 checkpoint
+
+    全程 state.messages 不得出现 checkpoint;pending 消费后不复活。
+    """
+    from tau2.data_model.message import (
+        AssistantMessage, ToolCall, ToolMessage, UserMessage)
+    a = _mk_naked_decision_agent(seed_evidence=True)
+    state = _mk_agent_state()
+
+    def _proposal():
+        return AssistantMessage.text("", tool_calls=[ToolCall(
+            id="c1", name="submit_referral",
+            arguments={"account_type": "World Blue"})])
+
+    def _plain():
+        return AssistantMessage.text(
+            "Your referral has been submitted.", tool_calls=None)
+
+    box, restore = _install_scripted_generate([_proposal, _proposal, _plain])
+    try:
+        # 第 1 次进入:round1 触发 + round2 放行 → 返回被接受的 tool-call
+        ret, state = a.generate_next_message(
+            UserMessage(role="user", content="please refer my partner"),
+            state)
+        assert ret.tool_calls and ret.tool_calls[0].name == "submit_referral"
+        # 模拟 orchestrator 回填 ToolResult,进入下一轮（由 agent 入队）
+        ret3, state = a.generate_next_message(
+            ToolMessage(id=ret.tool_calls[0].id, role="tool",
+                        requestor="assistant",
+                        content="referral submitted", error=False), state)
+    finally:
+        restore()
+
+    assert box["i"] == 3, f"应三轮 generate, got {box['i']}"
+    # round1 尚未注入;round2 注入;round3 旧 checkpoint 不再出现
+    assert not _context_has_checkpoint(box["messages"][0]), \
+        "round1 generate 视图不应含 checkpoint"
+    assert _context_has_checkpoint(box["messages"][1]), \
+        "round2 generate 视图应含 checkpoint（一次性注入）"
+    assert not _context_has_checkpoint(box["messages"][2]), \
+        "round3 无新 trigger 时旧 checkpoint 必须消失（ephemeral）"
+    # 正式历史全程无 checkpoint
+    assert not _state_has_checkpoint(state), \
+        "checkpoint 绝不进入正式 state.messages"
+    assert a.checkpoint.triggered == 1, "只触发一次"
+    assert a.checkpoint.pending is None and a._v6_note_pending is None
 
 
 # ===========================================================================

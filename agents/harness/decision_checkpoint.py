@@ -288,13 +288,17 @@ class DecisionCheckpoint:
             return None  # 空状态零渲染（简单任务不做推荐检查）
         self.triggered += 1
         self.pending = art
+        rendered = art.render()
+        # V6.1 修复 #2:checkpoint 不进 conversation history（ephemeral
+        # context）——artifact 全文持久化到 trace,保证可审计/可归因。
         self._emit("checkpoint_triggered", tool=tool_name,
                    reason=reason,
+                   artifact=rendered[:1200],
                    missing=art.missing_evidence or None)
         if art.missing_evidence:
             self._emit("checkpoint_missing_evidence", tool=tool_name,
                        missing=art.missing_evidence)
-        return art.render()
+        return rendered
 
     @staticmethod
     def artifact_has_content(art: "CheckpointArtifact") -> bool:

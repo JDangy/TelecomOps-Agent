@@ -1015,22 +1015,6 @@ class DecisionAgent(LLMAgent):
                 pass
         return tc.name
 
-    def _v6_consume_pending_note(self, state) -> None:
-        """把 checkpoint 的 6 问尾注注入 message state 尾部（一次性）。
-
-        语义:注入必须出现在**该关键动作的下一轮 generate 之前**。
-        本方法在每次 generate 前调用,有暂存则 append 一条
-        SystemMessage（不修改历史,只追加;注入后即清空）。
-        """
-        note = getattr(self, "_v6_note_pending", None)
-        if note:
-            self._v6_note_pending = None
-            try:
-                from tau2.data_model.message import SystemMessage as _SM3
-                state.messages.append(_SM3(role="system", content=note))
-            except Exception:
-                pass
-
     # -- V4: Plan 进度由真实 Tool Result 驱动（V5/V6.1 同口径）-----------
     def _plan_progress_from_tool(self, tm, inner: str = None,
                                  ok: bool = None) -> None:
@@ -1258,7 +1242,6 @@ class DecisionAgent(LLMAgent):
                         "describing what still needs to be done, with the first "
                         "step as the current focus). Then work through it step "
                         "by step, using update_plan when circumstances change.")))
-            self._v6_consume_pending_note(state)
             full = self._build_llm_context(state)
             assistant_message = generate(
                 model=self.llm,
@@ -1499,6 +1482,10 @@ class DecisionAgent(LLMAgent):
         V6.1: 证据分层视图（evidence view）与条目视图（worklist）
         全部经 build_context 的参数进入——没有平行 context 模块,
         也没有 agent 侧散装拼块。空状态零渲染（简单任务零开销）。
+        V6.1 修复 #2: checkpoint 是 **ephemeral context**——仅在触发后的
+        下一轮 LLM 视图中出现一次,绝不写入正式 state.messages。
+        这里把 6 问作为临时 SystemMessage 追加到 build_context 返回的
+        **副本** 末尾并一次性消费（state.messages 不被修改）。
         """
         from agents.harness.context_builder import build_context
         mem_block = self.memory.context_block() if self.memory is not None else ""
@@ -1511,7 +1498,7 @@ class DecisionAgent(LLMAgent):
             v5_plan_block = ""
         combined_mem = "\n\n".join(
             b for b in (v5_plan_block, mem_block, state_block) if b)
-        return build_context(
+        messages = build_context(
             state, task_state=self.task_state,
             plan_tracker=getattr(self, "plan_tracker", None),
             memory_block=combined_mem, state_block="",
@@ -1521,6 +1508,21 @@ class DecisionAgent(LLMAgent):
             worklist=(self.worklist
                       if getattr(self, "v6_enabled", False) else None),
         )
+        # ephemeral checkpoint:附到本轮副本,消费 pending;正式历史不变。
+        note = getattr(self, "_v6_note_pending", None)
+        if note:
+            self._v6_note_pending = None
+            try:
+                self.checkpoint.consume_pending()   # pending 一次性消费
+            except Exception:
+                pass
+            try:
+                from tau2.data_model.message import SystemMessage as _SM4
+                messages = list(messages) + [
+                    _SM4(role="system", content=note)]
+            except Exception:
+                pass
+        return messages
 
     def _messages_with_memory(self, state):
         """返回 system(含 memory block + V3 task-state slice) + 历史消息。"""
