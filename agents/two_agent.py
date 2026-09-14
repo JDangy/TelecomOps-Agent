@@ -947,6 +947,55 @@ class DecisionAgent(LLMAgent):
         except Exception:
             return False            # 失败静默放行（V5 行为优先）
 
+    # -- V6.1 修复 #3: 纯文本最终推荐 → 证据检查点（零额外 LLM）-----------
+    def _v6_checkpoint_for_recommendation(self, assistant_message) -> bool:
+        """助手即将向用户给出最终推荐时的证据检查点（复用同一套 6 问）。
+
+        动机（task_070 形态）:最终推荐常发生在任何 tool call 之前,
+        tool-name 枚举覆盖不到（Agent 在关键事实未对齐时就推荐了产品）。
+        触发即构建同一套 checkpoint artifact 注入下轮生成——DA 在
+        "最终选择"前先过一遍证据视图（目标/已确认事实/未确认用户
+        陈述/KB 规则/缺失证据/冲突）。执行权始终在 DA:信息完整则正常
+        推荐,信息不完整则应先查信息。
+
+        克制（不误触发、不膨胀、不新增机制）:
+        - 仅通用 recommendation/selection 意图短语
+          （decision_checkpoint.is_final_recommendation）判断,
+          无任何产品词 / task 专名硬编码。
+        - 全任务只 checkpoint 一次（签名 "__final_recommendation__"）
+          ——模型措辞变化不会反复触发,结构性无死循环。
+        - 空证据视图零触发（skip_if_empty,简单任务零开销——
+          保护 V5 成功路径）。
+        返回 True = 本轮文本不落地,注入 6 问后重生成一次。
+        """
+        if not getattr(self, "v6_enabled", False):
+            return False
+        try:
+            from agents.harness.decision_checkpoint import (
+                is_final_recommendation)
+            if not is_final_recommendation(
+                    getattr(assistant_message, "content", "") or ""):
+                return False
+            sig = ("__final_recommendation__",)
+            if sig in self._v6_checkpointed_signatures:
+                return False        # 已检查过——放行（措辞变化不重复触发）
+            open_qs = []
+            if self.memory is not None:
+                open_qs = list(self.memory.read().get("open_questions")
+                               or [])[:5]
+            note = self.checkpoint.note_for_next_turn(
+                "<final_recommendation>", {},
+                evidence_view=self.evidence_view,
+                plan_store=self.plan_store, open_questions=open_qs,
+                reason="final_recommendation", skip_if_empty=True)
+            if note is None:
+                return False        # 空证据 / 超预算——正常放行
+            self._v6_note_pending = note
+            self._v6_checkpointed_signatures.add(sig)
+            return True
+        except Exception:
+            return False            # 失败静默放行（V5 行为优先）
+
     def _resolve_inner_name(self, tc) -> str:
         """tc → inner 工具名（resolver 穿透 wrapper;无 resolver 时用外层名）。
 
@@ -1277,6 +1326,13 @@ class DecisionAgent(LLMAgent):
                     guarded = False
                 if guarded:
                     continue
+                # V6.1 修复 #3:纯文本最终推荐 → 证据检查点（同机制,
+                # 签名防重）——推荐前先让证据视图进入本轮决策;不落地
+                # 本轮未检查的推荐文本（同 tool-call 的时序修复口径:
+                # 检查 = 执行前重新决策一次）。
+                if self._v6_checkpoint_for_recommendation(assistant_message):
+                    assistant_message = None
+                    continue
                 break  # 纯文本 → 与官方行为一致
 
             # V4: 解析 assistant 文本中的 [PLAN] 行（Plan Mode 时）
@@ -1371,11 +1427,18 @@ class DecisionAgent(LLMAgent):
                     if hasattr(tc, "_harness_tool"):
                         del tc._harness_tool
 
-            if checkpoint_hold and not ask_calls and not rejected:
-                # V6.1: 关键动作 checkpoint——把本轮提案存档,下一轮 generate
-                # 注入 6 问尾注,DA 在【执行前】过一遍六问再重新决策
-                # （同签名直接放行;零死循环——签名集合保证）
-                state.messages.append(assistant_message)
+            if checkpoint_hold:
+                # V6.1 修复:关键动作首次提出 → 本轮不执行,且**不把这条
+                # 未执行的 Assistant tool-call 写入正式消息历史**。
+                # 旧实现 append 后 continue,会留下
+                #   Assistant(tool_call) → System(checkpoint) → Assistant
+                # 这种"tool_call 后无 ToolResult"的非法半双工序列
+                # （provider 视为非法 tool-call history / 模型误以为已执行）。
+                # 正确语义:checkpoint = 动作执行前重新决策一次——丢弃
+                # 本轮提案（动作摘要已存入 checkpoint artifact + trace）,
+                # 下轮 generate 前注入 6 问,由 DA 重新决定;同签名动作
+                # 第二次直接放行（签名集合保证恰好多一轮,零死循环）。
+                assistant_message = None
                 continue
 
             if not ask_calls and not rejected:

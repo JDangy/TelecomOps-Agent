@@ -67,6 +67,11 @@ class PlanStep:
     entities: list = field(default_factory=list)  # 目标实体（Task State 对象名或 ID）
     status: str = PENDING
     note: Optional[str] = None             # blocked/failed 原因
+    # V6.1 修复:该步骤已被 Worklist 展开成条目级进度（带 entities）。
+    # child_managed=True 时,父步骤的完成由子条目整体状态决定——
+    # 单实体成功绝不整体完成（多实体大步骤不误标 completed）。
+    # 未展开（V5 回退形态 / 无 entities 步骤）保持 False，行为不变。
+    child_managed: bool = False
 
     def to_dict(self) -> dict:
         return {"id": self.step_id, "description": self.description,
@@ -193,6 +198,14 @@ class PlanStore:
             cur = self._current_in_progress_step()
             if cur is not None and cur.tool_hint in (None, "", inner_tool):
                 if self._scope_bound(cur, arguments, task_state):
+                    if getattr(cur, "child_managed", False):
+                        # V6.1 修复:条目化步骤——单实体动作不得整体完成
+                        # （完成由 Worklist 子条目整体状态派生,见
+                        # apply_children_status）。只记录"已开始"。
+                        if cur.status == PENDING:
+                            cur.status = IN_PROGRESS
+                        cur._bound_tool = inner_tool
+                        return None
                     if ok:
                         cur.status = COMPLETED
                         cur.note = None
@@ -216,6 +229,14 @@ class PlanStore:
         if len(candidates) == 1:
             st = candidates[0][0]
             if st.status == IN_PROGRESS or st.status == PENDING:
+                if getattr(st, "child_managed", False):
+                    # V6.1 修复:多实体/条目化步骤——一个实体成功只是
+                    # 子条目完成,父步骤必须等全部子条目完成（由
+                    # Worklist 检查后调用 apply_children_status 落定）。
+                    if st.status == PENDING:
+                        st.status = IN_PROGRESS
+                    st._bound_tool = inner_tool
+                    return None
                 if ok:
                     st.status = COMPLETED
                     st.note = None
@@ -223,6 +244,39 @@ class PlanStore:
                     st.status = FAILED
                     st.note = f"tool failed: {inner_tool}"
                 return st
+        return None
+
+    def apply_children_status(self, step_id, statuses) -> Optional[PlanStep]:
+        """子条目整体状态 → 父步骤状态（V6.1 修复:唯一派生点）。
+
+        数据流（用户指定）:
+            Tool Result → 更新对应 WorkItem → 检查该 PlanStep 下全部
+            WorkItem → 全部 completed → 父 PlanStep completed;
+            否则父保持未完成。
+
+        语义（最简单且与现有 PlanStore 一致）:
+        - 全部 completed → 父 completed（note 清空）。
+        - 否则父**绝不** completed:若曾被误标 completed 则回退
+          in_progress;有子条目非 pending 则父视为已开始（in_progress）。
+          子条目失败不升级为父 failed——保持未完成,由 completion
+          guard 有界提醒 DA replan（不新增状态语义）。
+        返回:转入 completed 的步骤（供 trace）;否则 None。
+        """
+        st = self._find(step_id)
+        if st is None or not statuses:
+            return None
+        if all(s == COMPLETED for s in statuses):
+            if st.status != COMPLETED:
+                st.status = COMPLETED
+                st.note = None
+                return st
+            return None
+        # 未全部完成 → 父不得 completed
+        if st.status == COMPLETED:
+            st.status = IN_PROGRESS
+        elif st.status in (PENDING, IN_PROGRESS) and any(
+                s != PENDING for s in statuses):
+            st.status = IN_PROGRESS
         return None
 
     def _current_in_progress_step(self) -> Optional[PlanStep]:

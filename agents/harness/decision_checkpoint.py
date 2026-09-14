@@ -93,6 +93,52 @@ def should_trigger_checkpoint(tool_name: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 最终推荐意图（V6.1 修复 #3）—— 覆盖"tool call 之前就发生的推荐"
+#
+# task_070 形态:Agent 在关键日期/条件尚未对齐时就向用户做了最终产品推荐
+# （"I recommend Lime Green."）——tool-name 触发枚举覆盖不到纯文本推荐。
+#
+# 设计约束（用户指令）:
+#   - 通用 recommendation / selection 意图判断,**绝不含具体产品词或
+#     task 专名**（禁止 `if "Lime Green" in text`）。
+#   - 保守:宁可少触发,不大面积误触发。普通陈述（"已查到账户"/"卡是
+#     active"/"还需确认一个信息"）不触发。
+#   - 只识别"最终选择 / 最终推荐"这一语义形态。
+# ---------------------------------------------------------------------------
+RECOMMENDATION_INTENT_RES = (
+    # 第一人称推荐/建议
+    re.compile(r"\bi(?:\s+would|\s+will|'d)?\s+recommend\b", re.I),
+    re.compile(r"\bmy recommendation\b", re.I),
+    re.compile(r"\bi\s+suggest\b", re.I),
+    # 明确让用户选某个（"You should choose X."）
+    re.compile(r"\byou should (?:choose|go with|pick|select|open|"
+               r"apply for|take)\b", re.I),
+    re.compile(r"\bi(?:'d|\s+would)\s+(?:go with|choose|pick|select)\b", re.I),
+    # 最高级判定形态（"The best option is X." / "X is the most suitable
+    # account."）——限定到"选项/账户/卡/产品/方案"这类选择对象名词,
+    # 不匹配普通描述。
+    re.compile(r"\bthe (?:best|most suitable) "
+               r"(?:option|choice|account|card|product|plan)\b", re.I),
+    re.compile(r"\b(?:is|would be) the (?:best|most suitable) "
+               r"(?:option|choice|account|card|product|plan)\b", re.I),
+)
+
+
+def is_final_recommendation(text: str) -> bool:
+    """纯文本是否为"最终选择/最终推荐"意图（通用、确定、保守）。
+
+    只在助手【准备向用户给出最终选择】时返回 True——普通进展陈述
+    （查询结果/状态说明/继续确认信息）不匹配。宁可少触发。
+    """
+    if not text:
+        return False
+    for rex in RECOMMENDATION_INTENT_RES:
+        if rex.search(text):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint artifact（6 问,短,可审计）
 # ---------------------------------------------------------------------------
 @dataclass
@@ -219,10 +265,16 @@ class DecisionCheckpoint:
     # ------------------------------------------------------------------
     def note_for_next_turn(self, tool_name: str, arguments: dict,
                            evidence_view, plan_store=None,
-                           open_questions: list | None = None) -> str | None:
+                           open_questions: list | None = None,
+                           reason: str = "critical_action",
+                           skip_if_empty: bool = False) -> str | None:
         """触发入口:构建 artifact 并暂存为下轮 system 尾注。
 
-        返回 None = 超预算（只记 trace 不再注入）;
+        reason: 触发来源（"critical_action" / "final_recommendation"
+                ——trace 区分,不改变注入语义）。
+        skip_if_empty: True 时空证据 artifact 不注入、不计数（最终推荐
+                路径的"克制"开关——空状态零渲染,保护简单任务零开销）。
+        返回 None = 超预算或（skip_if_empty 且空）不注入;
         否则返回注入文本（调用方 append 到 state.messages 的
         system 尾部——一次性,下轮 generate 前生效）。
         """
@@ -230,17 +282,28 @@ class DecisionCheckpoint:
             self._emit("checkpoint_budget_exhausted",
                        used=self.triggered, limit=self.MAX_PER_TASK)
             return None
-        self.triggered += 1
         art = self.build_artifact(tool_name, arguments, evidence_view,
                                   plan_store, open_questions)
+        if skip_if_empty and not self.artifact_has_content(art):
+            return None  # 空状态零渲染（简单任务不做推荐检查）
+        self.triggered += 1
         self.pending = art
         self._emit("checkpoint_triggered", tool=tool_name,
-                   reason="critical_action",
+                   reason=reason,
                    missing=art.missing_evidence or None)
         if art.missing_evidence:
             self._emit("checkpoint_missing_evidence", tool=tool_name,
                        missing=art.missing_evidence)
         return art.render()
+
+    @staticmethod
+    def artifact_has_content(art: "CheckpointArtifact") -> bool:
+        """artifact 是否含任何可呈现证据（克制判断:全空则无检查价值）。"""
+        if art is None:
+            return False
+        return bool(art.confirmed_facts or art.unverified_claims
+                    or art.policy_evidence or art.missing_evidence
+                    or art.conflict_keys)
 
     def consume_pending(self) -> "CheckpointArtifact | None":
         """取走暂存的 artifact（注入后清空——一次性语义）。"""

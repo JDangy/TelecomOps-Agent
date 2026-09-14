@@ -916,6 +916,272 @@ def test_v6_13_v5_behavior_not_hard_blocked():
 
 
 # ===========================================================================
+# 6. V6.1 修复回归（三处已确认实现问题;全部确定性,无 LLM/网络）
+#    #1 PlanStore/Worklist 父子进度冲突
+#    #2 DecisionCheckpoint tool-call 消息时序
+#    #3 纯文本最终推荐 Decision Check
+# ===========================================================================
+def test_v6_14_multi_entity_parent_step_waits_for_all_items():
+    """修复#1:带多 entities 且已展开 Worklist 的 PlanStep——
+    父步骤 completed 必须由子条目整体状态决定;
+    单实体成功绝不整体完成;子失败不误标 completed;重复成功幂等。"""
+    from agents.harness.plan_store import (
+        PlanStore, COMPLETED, IN_PROGRESS)
+    from agents.harness.worklist import Worklist
+    ps = PlanStore()
+    ps.write_plan("handle all incorrect transactions", [
+        {"description": "dispute incorrect transaction",
+         "tool_hint": "submit_dispute",
+         "entities": ["txn_A", "txn_B", "txn_C"]},
+    ])
+    ps.update_plan("set_current", step_id=1)
+    wl = Worklist()
+    wl.sync_from_plan(ps)
+    step = ps.steps[0]
+    assert step.child_managed, "展开后步骤应标记为条目化"
+
+    def _apply(txn, ok=True):
+        ps.on_tool_result("submit_dispute", ok, {"transaction_id": txn})
+        wl.on_tool_result(ps, "submit_dispute", ok, {"transaction_id": txn})
+
+    # (a) 3 个实体完成 1 个 → 父 step 不 completed
+    _apply("txn_A")
+    assert step.status != COMPLETED, \
+        "只有一个实体成功时父步骤不得 completed"
+    assert step.status == IN_PROGRESS, "父步骤应保持 in_progress（已开始未完成）"
+    assert wl.unfinished(), "仍有 2 个子条目未完成"
+
+    # (b) 完成 3/3 → 父 step completed
+    _apply("txn_B")
+    assert step.status != COMPLETED, "2/3 完成父步骤仍不得 completed"
+    _apply("txn_C")
+    assert step.status == COMPLETED, "全部子条目完成后父步骤才 completed"
+    assert not wl.unfinished(), "全部完成后不应再有未完成子条目"
+
+    # (d) 重复成功调用保持幂等（不重置状态）
+    _apply("txn_A")
+    assert step.status == COMPLETED, "幂等重复调用不得回退父步骤状态"
+    assert all(i.status == "completed" for i in wl.items_for_step(1)), \
+        "幂等重复调用不得重置已完成的子条目"
+
+    # (c) 其中一个失败 → 父 step 不 completed
+    ps2 = PlanStore()
+    ps2.write_plan("g", [{"description": "close cards",
+                          "tool_hint": "close_card",
+                          "entities": ["c1", "c2", "c3"]}])
+    ps2.update_plan("set_current", step_id=1)
+    wl2 = Worklist()
+    wl2.sync_from_plan(ps2)
+    step2 = ps2.steps[0]
+
+    def _apply2(card, ok=True):
+        ps2.on_tool_result("close_card", ok, {"card_id": card})
+        wl2.on_tool_result(ps2, "close_card", ok, {"card_id": card})
+
+    _apply2("c1", True)
+    _apply2("c2", False)
+    assert step2.status != COMPLETED, \
+        "存在 failed 子条目时父步骤不得 completed"
+    assert wl2.has_unfinished, "c2 失败 → 仍有未完成子条目（父不整体结束）"
+    # 失败条目可恢复;全部完成后父步骤才 completed（失败不永久阻塞）
+    _apply2("c2", True)
+    _apply2("c3", True)
+    assert step2.status == COMPLETED
+
+    # V5 回退形态:未展开 Worklist（child_managed=False）时行为不变
+    ps3 = PlanStore()
+    ps3.write_plan("g", [{"description": "x", "tool_hint": "close_card",
+                          "entities": ["c1", "c2"]}])
+    ps3.update_plan("set_current", step_id=1)
+    st3 = ps3.on_tool_result("close_card", True, {"card_id": "c1"})
+    assert st3 is not None and st3.status == COMPLETED, \
+        "无 Worklist（V5 回退）时单次匹配仍按 V5 语义完成"
+
+
+def _mk_naked_decision_agent(seed_evidence=True):
+    """构造可测的 DecisionAgent（object.__new__ 绕过需要 LLM 的 __init__）。
+
+    只装配 generate_next_message 路径所需的运行时属性——无网络 / 无 LLM。
+    """
+    from agents.harness.task_state_v3 import (
+        TaskStateV3, UserStateExtractor, ToolResultStateExtractor)
+    from agents.harness.plan_store import PlanStore
+    from agents.harness.worklist import Worklist
+    from agents.harness.evidence_view import EvidenceView
+    from agents.harness.decision_checkpoint import DecisionCheckpoint
+    from agents.harness.execution_plan import PlanTracker
+    from agents.two_agent import DecisionAgent
+    a = object.__new__(DecisionAgent)
+    a.llm = "stub"
+    a.tools = []
+    a.llm_args = {}
+    a.domain_policy = ""
+    a._knowledge_agent = None
+    a.memory = None
+    a._instruction_variant = "two_agent_harness"
+    a.task_state = TaskStateV3()
+    a.harness = None
+    a._packets = []
+    a._tool_by_name = {}
+    a._rejection_counts = {}
+    a.MAX_SAME_FIELD_REJECTIONS = 2
+    a.plan_tracker = PlanTracker()
+    a._toolcall_inner_by_id = {}
+    a._toolcall_args_by_id = {}
+    a._state_messages_cache = []
+    a.plan_store = PlanStore()
+    a._planning_prompted = False
+    a._planning_fallback_pending = False
+    a.v6_enabled = True
+    a.evidence_view = EvidenceView(a.task_state)
+    a.worklist = Worklist()
+    a.checkpoint = DecisionCheckpoint()
+    a._v6_note_pending = None
+    a._v6_checkpointed_signatures = set()
+    if seed_evidence:
+        UserStateExtractor.feed(
+            a.task_state, "I have been a customer for about four months")
+        ToolResultStateExtractor.feed(
+            a.task_state, "get_current_time",
+            "The current time is 2025-11-14 03:40:00 EST.")
+    return a
+
+
+def _mk_agent_state():
+    state = types.SimpleNamespace()
+    state.system_messages = [_tau2_system()]
+    state.messages = []
+    return state
+
+
+def _install_scripted_generate(script):
+    """把 agents.two_agent.generate 换成按脚本返回 AssistantMessage 的桩。
+
+    返回 (counter, restore)。用完必须 restore（避免污染其他测试）。
+    """
+    import agents.two_agent as ta
+    box = {"i": 0}
+    original = ta.generate
+
+    def fake_generate(model=None, tools=None, messages=None,
+                      call_name=None, **kwargs):
+        i = box["i"]
+        box["i"] += 1
+        return script[min(i, len(script) - 1)]()
+
+    ta.generate = fake_generate
+    return box, (lambda: setattr(ta, "generate", original))
+
+
+def _has_dangling_tool_call(messages, accepted):
+    """历史里是否存在未被接受的、无对应 ToolResult 的旧 Assistant tool_call。
+
+    被接受的那条（返回给 orchestrator、即将执行）不算——它的 ToolResult
+    由 orchestrator 下一轮回填。
+    """
+    from tau2.data_model.message import AssistantMessage
+    for m in messages:
+        if isinstance(m, AssistantMessage) and m.tool_calls and m is not accepted:
+            return True
+    return False
+
+
+def test_v6_15_checkpoint_hold_leaves_no_dangling_tool_call():
+    """修复#2:关键动作首次触发 checkpoint 时,不把未执行的 Assistant
+    tool-call 写入正式历史（否则产生 Assistant→System→Assistant 的
+    无 ToolResult 脏序列）。同签名第二次正常放行。"""
+    from tau2.data_model.message import (
+        AssistantMessage, ToolCall, UserMessage, SystemMessage)
+    a = _mk_naked_decision_agent(seed_evidence=True)
+    state = _mk_agent_state()
+
+    def _proposal():
+        return AssistantMessage.text("", tool_calls=[ToolCall(
+            id="c1", name="submit_referral",
+            arguments={"account_type": "World Blue"})])
+
+    box, restore = _install_scripted_generate([_proposal, _proposal])
+    try:
+        ret, state = a.generate_next_message(
+            UserMessage(role="user", content="please refer my partner"),
+            state)
+    finally:
+        restore()
+
+    # 恰好多一轮:首次 checkpoint,第二次放行
+    assert box["i"] == 2, f"应恰好两轮 generate（一次 checkpoint 重生成）, got {box['i']}"
+    assert ret is not None and ret.tool_calls, "第二次同签名动作应正常放行"
+    assert ret.tool_calls[0].name == "submit_referral"
+    # 历史中不存在无 ToolResult 的旧 Assistant tool-call（脏序列根治）
+    assert not _has_dangling_tool_call(state.messages, ret), \
+        "历史里不得残留被 checkpoint 丢弃的旧 assistant tool-call"
+    atc = [m for m in state.messages
+           if isinstance(m, AssistantMessage) and m.tool_calls]
+    assert len(atc) == 1 and atc[0] is ret, \
+        "只应保留被放行的那条 tool-call"
+    # checkpoint 6 问确实注入过（以 system 尾注形式;语义 = 执行前重新决策）
+    assert any(isinstance(m, SystemMessage)
+               and "DECISION CHECKPOINT" in (m.content or "")
+               for m in state.messages), "应注入 checkpoint 6 问尾注"
+    assert len(a._v6_checkpointed_signatures) == 1, "同签名只 checkpoint 一次"
+
+
+def test_v6_16_final_recommendation_checkpoint_and_restraint():
+    """修复#3:纯文本最终推荐触发证据检查点（通用意图,非产品词）;
+    普通文本不触发;空证据零触发;同任务只检查一次。"""
+    from agents.harness.decision_checkpoint import is_final_recommendation
+    from tau2.data_model.message import (
+        AssistantMessage, UserMessage, SystemMessage)
+
+    # (a) 通用 recommendation/selection 意图 → 触发
+    for text in ("I recommend the Sky Blue account.",
+                 "The best option is the savings account.",
+                 "You should choose the premium card.",
+                 "The checking account is the most suitable account."):
+        assert is_final_recommendation(text), f"应识别为最终推荐: {text!r}"
+    # (b) 普通进展/状态/追问 → 不触发（避免大面积误触发）
+    for text in ("I have already checked your account.",
+                 "Your card is currently active.",
+                 "I need to confirm one more piece of information.",
+                 "I will now look up your transactions.",
+                 "The Emerald account works for you."):
+        assert not is_final_recommendation(text), \
+            f"普通文本不得触发推荐检查: {text!r}"
+
+    # (c) 集成:有证据 → 触发一次（多一轮 generate）,文本不落地为最终回复
+    a = _mk_naked_decision_agent(seed_evidence=True)
+    state = _mk_agent_state()
+    rec = lambda: AssistantMessage.text(
+        "After review, I recommend the premium account.")
+    box, restore = _install_scripted_generate([rec, rec])
+    try:
+        ret, state = a.generate_next_message(
+            UserMessage(role="user", content="which one fits me?"), state)
+    finally:
+        restore()
+    assert box["i"] == 2, "最终推荐应触发一次 checkpoint（多一轮 generate）"
+    assert ret is not None and "recommend" in (ret.content or "").lower()
+    assert any(isinstance(m, SystemMessage)
+               and "DECISION CHECKPOINT" in (m.content or "")
+               for m in state.messages), "推荐前应注入证据视图 6 问"
+    assert a.checkpoint.triggered == 1, "同一任务推荐检查只触发一次"
+    assert ("__final_recommendation__",) in a._v6_checkpointed_signatures
+
+    # (d) 克制:空证据视图零触发（简单任务零开销,保护 V5 成功路径）
+    a2 = _mk_naked_decision_agent(seed_evidence=False)
+    state2 = _mk_agent_state()
+    box2, restore2 = _install_scripted_generate([rec, rec])
+    try:
+        ret2, state2 = a2.generate_next_message(
+            UserMessage(role="user", content="which one fits me?"), state2)
+    finally:
+        restore2()
+    assert box2["i"] == 1, "无任何证据时推荐不得触发 checkpoint"
+    assert a2.checkpoint.triggered == 0
+    assert ret2 is not None and "recommend" in (ret2.content or "").lower()
+
+
+# ===========================================================================
 # main
 # ===========================================================================
 if __name__ == "__main__":

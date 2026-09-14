@@ -118,6 +118,10 @@ class Worklist:
                 continue
             if step.status == "removed":
                 continue
+            # V6.1 修复:标记该步骤已被条目化——父步骤完成由子条目整体
+            # 状态决定（PlanStore.on_tool_result 对 child_managed 步骤
+            # 不整体完成,只记录"已开始"）。
+            step.child_managed = True
             for ent in step.entities:
                 key = (step.step_id, str(ent))
                 if key in self._items:
@@ -199,7 +203,31 @@ class Worklist:
             progressed.append(item)
             self._emit("work_item_failed", item, tool=inner_tool,
                        note=item.note)
+        # V6.1 修复:子条目变更后,由子条目整体状态派生父步骤状态
+        # （全部完成 → 父 completed;否则父保持未完成）。
+        self._sync_parent_step(plan_store, item.step_id)
         return progressed
+
+    def _sync_parent_step(self, plan_store, step_id: int) -> None:
+        """检查该 PlanStep 下全部条目 → 派生父步骤状态（唯一派生点）。
+
+        - 全部 completed → 父 completed（PlanStore 落定 + trace）。
+        - 否则父保持未完成（一个实体失败不得让父误标 completed）。
+        """
+        if plan_store is None:
+            return
+        statuses = [it.status for it in self.items_for_step(step_id)]
+        if not statuses:
+            return
+        try:
+            st = plan_store.apply_children_status(step_id, statuses)
+        except Exception:
+            return
+        if st is not None and st.status == COMPLETED:
+            self._emit_event(
+                "plan_step_progressed", step_id=st.step_id,
+                description=st.description, tool=st.tool_hint,
+                n_items=len(statuses), ok=True)
 
     # ------------------------------------------------------------------
     # 查询（ContextBuilder/ checkpoint 的数据来源）
@@ -231,6 +259,11 @@ class Worklist:
     # trace（实时 emit;无 recorder 静默）
     # ------------------------------------------------------------------
     def _emit(self, event_type: str, item: WorkItem, **extra) -> None:
+        self._emit_event(event_type, step_id=item.step_id,
+                         entity=item.entity[:80], status=item.status,
+                         **extra)
+
+    def _emit_event(self, event_type: str, **fields) -> None:
         try:
             from eval.instrumentation import get_active_recorder
             rec = get_active_recorder()
@@ -241,8 +274,7 @@ class Worklist:
         try:
             rec.emit(event_type, "decision_agent",
                      parent_span_id=getattr(rec, "task_span_id", None),
-                     step_id=item.step_id, entity=item.entity[:80],
-                     status=item.status, **extra)
+                     **fields)
         except Exception:
             pass
 

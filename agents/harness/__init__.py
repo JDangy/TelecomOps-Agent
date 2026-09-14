@@ -50,6 +50,7 @@ from agents.harness.decision_checkpoint import (
     DecisionCheckpoint,
     CheckpointArtifact,
     should_trigger_checkpoint,
+    is_final_recommendation,
 )
 
 __all__ = [
@@ -83,4 +84,5 @@ __all__ = [
     "DecisionCheckpoint",
     "CheckpointArtifact",
     "should_trigger_checkpoint",
+    "is_final_recommendation",
 ]
