@@ -31,6 +31,7 @@
 """
 
 import os
+import re
 import sys
 import types
 
@@ -546,352 +547,372 @@ def test_context_builder_system_blocks_injected():
 
 
 # ===========================================================================
-# 5. V6.0 — Evidence Ledger / Worklist / Decision Checkpoint / Context View
-#    （对应 docs/v6_design.md §10 的 10 项用户测试要求）
+# 5. V6.1（架构收紧）— Evidence View / Worklist / Checkpoint / Context
+#    对应用户收紧指令 §1-§7 的 10 项要求;全部确定性,无 LLM/网络
 # ===========================================================================
-def test_v6_1_user_claim_not_confused_with_tool_result():
-    """测试要求#1:user_claim 与 tool_confirmed 不被混为一谈。
-
-    ledger 分层查询:同 key 的 user_claim → unverified;
-    tool_result/system → confirmed;knowledge_base → policy。"""
-    from agents.harness.evidence_ledger import EvidenceLedger
-    led = EvidenceLedger()
-    led.add("tenure_days", "about 4 months", "user_claim", "user_turn_1")
-    grade, v, rec = led.get_decision_grade("tenure_days")
-    assert grade == "unverified", "user_claim 必须是 unverified"
-    assert rec.provenance == "user_claim"
-    led.add("current_date", "2025-11-14", "system", "get_current_time")
-    grade2, _, rec2 = led.get_decision_grade("current_date")
-    assert grade2 == "confirmed" and rec2.provenance == "system"
-    led.add("cli.max_pct", 50, "knowledge_base", "doc_007")
-    grade3, _, _ = led.get_decision_grade("cli.max_pct")
-    assert grade3 == "policy", "knowledge_base → policy 等级"
-
-
-def test_v6_2_tool_result_supersedes_user_claim():
-    """测试要求#2:tool-confirmed fact 可以 supersede 用户自述;
-    反方向（自述覆盖系统）被拒绝。"""
-    from agents.harness.evidence_ledger import EvidenceLedger
-    led = EvidenceLedger()
-    # claim 先到,tool 后到 → tool supersede claim
-    led.add("tenure_days", "about 120 days", "user_claim", "user_turn_1")
-    led.add("tenure_days", 65, "tool_result", "get_all_user_accounts")
-    grade, v, _ = led.get_decision_grade("tenure_days")
-    assert grade == "confirmed" and float(v) == 65.0, \
-        "tool 结果必须取代用户自述"
-    # tool 先到,claim 后到 → claim 不能取代 tool
-    led2 = EvidenceLedger()
-    led2.add("tenure_days", 65, "tool_result", "lookup")
-    led2.add("tenure_days", "about 120 days", "user_claim", "user_turn_2")
-    grade, v, rec = led2.get_decision_grade("tenure_days")
-    assert grade == "confirmed" and float(v) == 65.0, \
-        "用户自述不得覆盖系统确认事实"
-    assert rec.provenance == "tool_result"
-    # 冲突 key 可见（渲染告知,不拦截）
-    assert "tenure_days" in led2.keys_with_conflict()
-    # policy 不被 claim/tool 覆盖
-    led3 = EvidenceLedger()
-    led3.add("cli.max_pct", 50, "knowledge_base", "doc_007")
-    led3.add("cli.max_pct", 80, "user_claim", "user_turn_1")
-    grade, v, _ = led3.get_decision_grade("cli.max_pct")
-    assert grade == "policy" and float(v) == 50.0
+def test_v6_1_user_claim_not_confused_with_system_fact():
+    """要求#1:用户说的 ≠ 工具确认的——TaskState 是唯一事实源,
+    EvidenceView 分层呈现（不混同）。"""
+    from agents.harness.task_state_v3 import (
+        TaskStateV3, UserStateExtractor, ToolResultStateExtractor)
+    from agents.harness.evidence_view import EvidenceView
+    ts = TaskStateV3()
+    UserStateExtractor.feed(ts, "I have been a customer for about four months")
+    ToolResultStateExtractor.feed(ts, "get_current_time",
+                                  "The current time is 2025-11-14 03:40:00 EST.")
+    ev = EvidenceView(ts)
+    # user_statement → unverified 段
+    claims = ev.unverified_user_claims()
+    assert any(r.field == "duration" for r in claims), \
+        "duration 自述必须出现在 unverified 段"
+    # system_fact → confirmed 段（current_date 前置）
+    confirmed = ev.confirmed_system_facts()
+    assert confirmed and confirmed[0].key == "system.current_date"
+    # 分段永不混同:confirmed 段里没有 user 来源,unverified 段没有 tool 来源
+    assert all(r.source in ("tool", "knowledge") for r in confirmed)
+    assert all(r.source == "user" for r in ev.unverified_user_claims())
 
 
-def test_v6_2b_ledger_idempotent_and_current_time_feed():
-    """ledger 幂等写入 + current_time 工具的确定性识别。"""
-    from agents.harness.evidence_ledger import EvidenceLedger
-    led = EvidenceLedger()
-    r1 = led.add("k", "v", "tool_result", "t")
-    r2 = led.add("k", "v", "tool_result", "t")
-    assert r1 is r2, "同 key/provenance/value 幂等 no-op"
-    # current_time 工具喂入
-    EvidenceLedger.feed_tool_result(
-        led, "get_current_time", "The current time is 2025-11-14 03:40:00 EST.")
-    grade, v, _ = led.get_decision_grade("current_date")
-    assert grade == "confirmed" and v == "2025-11-14"
-    # 非时间工具不误识别
-    led2 = EvidenceLedger()
-    EvidenceLedger.feed_tool_result(led2, "get_accounts", "opened 2025-09-10")
-    assert led2.get_decision_grade("current_date")[0] is None
+def test_v6_2_no_second_fact_store_single_feed_path():
+    """要求#1(架构):EvidenceView 零存储——从 TaskState 现算,
+    不存在第二条事实写入路径。"""
+    from agents.harness.task_state_v3 import TaskStateV3, FT_SYSTEM_FACT
+    from agents.harness.evidence_view import EvidenceView
+    ts = TaskStateV3()
+    ev = EvidenceView(ts)
+    assert not hasattr(ev, "_entries"), "视图不得有独立事实存储"
+    # 最初无 confirmed
+    assert ev.confirmed_system_facts() == []
+    # TaskState 更新 → 同一视图对象立即读到新值（现算,非快照）
+    ts.set("account_x", "balance", 96000, "tool",
+           source_ref="get_accounts", fact_type=FT_SYSTEM_FACT)
+    recs = ev.confirmed_system_facts()
+    assert any(r.key == "account_x.balance" for r in recs), \
+        "视图必须从 TaskState 现算,不是快照"
+    # grade 查询口径
+    assert ev.grade("account_x.balance") == "confirmed"
 
 
-def test_v6_3_worklist_progress_by_tool_result():
-    """测试要求#3:worklist 根据真实 Tool Result 推进。"""
+def test_v6_3_tool_result_supersedes_user_claim():
+    """要求#2:工具确认可取代用户自述;用户改口不能抹掉系统事实。
+    冲突 key 由 TaskState 历史链现算暴露（零独立存储）。"""
+    from agents.harness.task_state_v3 import (
+        TaskStateV3, FT_USER_STATEMENT, FT_SYSTEM_FACT)
+    from agents.harness.evidence_view import EvidenceView
+    # claim 先到,tool 后到 → current 是 tool 值,conflict 仍可见
+    ts = TaskStateV3()
+    ts.set("user_statement", "duration", "about four months", "user",
+           fact_type=FT_USER_STATEMENT)
+    ts.set("user_statement", "duration", 65, "tool",
+           fact_type=FT_SYSTEM_FACT)
+    ev = EvidenceView(ts)
+    assert ev.grade("user_statement.duration") == "confirmed"
+    assert "user_statement.duration" in ts.conflicting_statement_keys()
+    assert not ev.unverified_user_claims(), \
+        "被工具取代的陈述不再是 unverified"
+    # tool 先到,claim 后到 → claim 记录在案但系统值不被覆盖
+    ts2 = TaskStateV3()
+    ts2.set("user_statement", "duration", 65, "tool",
+            fact_type=FT_SYSTEM_FACT)
+    ts2.set("user_statement", "duration", "about four months", "user",
+            fact_type=FT_USER_STATEMENT)
+    ev2 = EvidenceView(ts2)
+    # 系统事实在 latest_system_records 里仍然可见（用户改口不抹事实）
+    sys_recs = ev2.confirmed_system_facts()
+    assert any(r.value == 65 for r in sys_recs), \
+        "用户后到的自述不得抹掉工具确认值"
+    assert "user_statement.duration" in ts2.conflicting_statement_keys()
+
+
+def test_v6_4_authority_by_fact_type_not_global_rank():
+    """要求#5:权威按事实类型,不做 tool>user 全局排名。
+
+    - 账户开户时间（system_fact）→ 系统工具可信,用户说错以工具为准
+    - 业务规则（kb_rule）→ KB 可信
+    - 用户偏好（user_preference）→ 用户本人可信,不需要系统验证"""
+    from agents.harness.task_state_v3 import (
+        TaskStateV3, FT_USER_PREFERENCE, FT_KB_RULE)
+    from agents.harness.evidence_view import EvidenceView
+    ts = TaskStateV3()
+    # 用户偏好:出现在 preferences 段,不在 unverified 段（用户权威）
+    ts.set("user_preference", "expedited_shipping", "yes", "user",
+           fact_type=FT_USER_PREFERENCE)
+    # KB 规则
+    ts.set("close_card", "reason.allowed_values", ["a", "b"], "knowledge",
+           source_ref="doc_001", fact_type=FT_KB_RULE)
+    ev = EvidenceView(ts)
+    prefs = ev.user_preferences()
+    assert prefs and all(r.effective_fact_type == "user_preference"
+                         for r in prefs)
+    assert not any(r.effective_fact_type == "user_preference"
+                   for r in ev.unverified_user_claims()), \
+        "用户偏好不是 unverified——用户本人是权威"
+    policy = ev.policy_rules()
+    assert any(r.field == "reason.allowed_values" for r in policy)
+    # grade:偏好/规则/系统三类各自定级
+    assert ev.grade("user_preference.expedited_shipping") == "preference"
+    assert ev.grade("close_card.reason.allowed_values") == "policy"
+
+
+def test_v6_5_worklist_expanded_from_plan_step():
+    """要求#2(Worklist):大步骤 → 每个具体对象一条目;
+    WorkItem 挂在 PlanStep 下（step_id 反向引用）。"""
     from agents.harness.worklist import Worklist
     from agents.harness.plan_store import PlanStore
     ps = PlanStore()
     ps.write_plan(goal="handle all incorrect transactions", steps=[
         {"description": "dispute incorrect transaction",
-         "tool_hint": "submit_cash_back_dispute", "entities": ["txn_A"]},
-        {"description": "dispute incorrect transaction",
-         "tool_hint": "submit_cash_back_dispute", "entities": ["txn_B"]},
+         "tool_hint": "submit_cash_back_dispute",
+         "entities": ["txn_A", "txn_B", "txn_C"]},
+        {"description": "notify user"},   # 无实体 → 不展开条目
     ])
     wl = Worklist()
     created = wl.sync_from_plan(ps)
-    assert created == 2, "两个实体应展开成两条 work item"
-    # 真实成功执行 txn_A 的 dispute → 只有 txn_A 条目完成
-    progressed = wl.on_tool_result("submit_cash_back_dispute", True,
-                                   {"transaction_id": "txn_A", "user_id": "u1"})
-    assert len(progressed) == 1
-    assert wl.items[0].status == "completed"
-    assert wl.items[1].status == "pending", "txn_B 不应被误完成"
-    # 幂等:重复成功调用不重置
-    wl.on_tool_result("submit_cash_back_dispute", True,
-                      {"transaction_id": "txn_A"})
-    assert wl.items[0].status == "completed"
+    assert created == 3, "3 个实体 → 3 条 item;无实体步骤不展开"
+    items = wl.items_for_step(1)
+    assert [i.entity for i in items] == ["txn_A", "txn_B", "txn_C"]
+    assert all(i.step_id == 1 for i in items), "条目必须挂在步骤 1 下"
 
 
-def test_v6_4_tool_failure_never_marks_complete():
-    """测试要求#4:工具失败不能标记 work item 完成。"""
+def test_v6_6_worklist_progress_by_real_tool_result():
+    """要求#3:完成情况根据真实 Tool Result 更新;只推进绑定的实体。"""
     from agents.harness.worklist import Worklist
     from agents.harness.plan_store import PlanStore
     ps = PlanStore()
     ps.write_plan(goal="g", steps=[
-        {"description": "close card", "tool_hint": "close_card", "entities": ["card_1"]}])
+        {"description": "dispute txn", "tool_hint": "submit_dispute",
+         "entities": ["txn_A", "txn_B"]}])
     wl = Worklist()
     wl.sync_from_plan(ps)
-    out = wl.on_tool_result("close_card", False, {"card_id": "card_1"})
-    assert wl.items[0].status == "failed", "失败必须标记 failed,不是 completed"
-    assert "tool failed" in (wl.items[0].note or "")
-    # 失败后再次成功 → completed（可恢复）
-    wl.on_tool_result("close_card", True, {"card_id": "card_1"})
-    assert wl.items[0].status == "completed"
+    prog = wl.on_tool_result(ps, "submit_dispute", True,
+                             {"transaction_id": "txn_A"})
+    assert len(prog) == 1 and prog[0].entity == "txn_A"
+    st = {i.entity: i.status for i in wl.items_for_step(1)}
+    assert st["txn_A"] == "completed" and st["txn_B"] == "pending", \
+        "txn_B 不应被误完成"
+    # 幂等:重复成功调用不重置
+    wl.on_tool_result(ps, "submit_dispute", True, {"transaction_id": "txn_A"})
+    assert wl.items_for_step(1)[0].status == "completed"
 
 
-def test_v6_5_multi_entity_task_not_ended_early():
-    """测试要求#5:多实体任务不会只完成一个就整体结束。"""
+def test_v6_7_tool_failure_never_marks_complete():
+    """要求#4:工具失败不能标记 work item 完成。"""
     from agents.harness.worklist import Worklist
     from agents.harness.plan_store import PlanStore
+    ps = PlanStore()
+    ps.write_plan(goal="g", steps=[
+        {"description": "close card", "tool_hint": "close_card",
+         "entities": ["card_1"]}])
+    wl = Worklist()
+    wl.sync_from_plan(ps)
+    wl.on_tool_result(ps, "close_card", False, {"card_id": "card_1"})
+    it = wl.items_for_step(1)[0]
+    assert it.status == "failed" and "tool failed" in (it.note or "")
+    # 失败后再次成功 → completed（可恢复）
+    wl.on_tool_result(ps, "close_card", True, {"card_id": "card_1"})
+    assert it.status == "completed"
+
+
+def test_v6_8_multi_entity_not_ended_early():
+    """要求#5:多实体任务不会只完成一个对象就整体结束——
+    unfinished 非空 + ContextBuilder 渲染区分 [x]/[ ]。"""
+    from agents.harness.worklist import Worklist
+    from agents.harness.plan_store import PlanStore
+    from agents.harness.context_builder import worklist_block
     ps = PlanStore()
     ps.write_plan(goal="freeze all 3 cards", steps=[
         {"description": "freeze card", "tool_hint": "freeze_card",
          "entities": ["dbc_1", "dbc_2", "dbc_3"]}])
     wl = Worklist()
     wl.sync_from_plan(ps)
-    assert len(wl.items) == 3, "3 个实体 → 3 条 item"
-    wl.on_tool_result("freeze_card", True, {"card_id": "dbc_1"})
+    wl.on_tool_result(ps, "freeze_card", True, {"card_id": "dbc_1"})
     assert wl.has_unfinished, "只完成 1/3 → unfinished 必须非空"
-    block = wl.render_block()
-    assert "[x]" in block and "[ ]" in block, \
-        "渲染必须区分已完成/未完成（worklist 可见性）"
-    wl.on_tool_result("freeze_card", True, {"card_id": "dbc_2"})
-    wl.on_tool_result("freeze_card", True, {"card_id": "dbc_3"})
-    assert not wl.has_unfinished, "全部完成 → unfinished 空"
-    # runtime 观察补充:工具结果暴露新实体 → 对称补条目（防漏做）
-    wl2 = Worklist()
-    wl2.goal = "close both debit cards"
-    created = wl2.observe_entities(["dbc_1", "dbc_2"], "close debit card",
-                                   tool_hint="close_card")
-    assert created == 2 and wl2.has_unfinished
+    block = worklist_block(ps, wl)
+    assert "[x]" in block and "[ ]" in block and "dbc_2" in block
+    wl.on_tool_result(ps, "freeze_card", True, {"card_id": "dbc_2"})
+    wl.on_tool_result(ps, "freeze_card", True, {"card_id": "dbc_3"})
+    assert not wl.has_unfinished
+    # 步骤 removed → 条目移除（Worklist 不能脱离 PlanStore 存在）
+    ps.update_plan("remove_step", step_id=1)
+    wl.sync_from_plan(ps)
+    assert len(wl) == 0, "步骤移除后条目必须随之移除"
 
 
-def test_v6_6_checkpoint_triggers_on_critical_actions():
-    """测试要求#6:Decision Check 只在关键动作触发。"""
+def test_v6_9_checkpoint_triggers_only_on_critical_actions():
+    """要求#6:Decision Check 只在关键动作触发;普通工具零触发。"""
     from agents.harness.decision_checkpoint import should_trigger_checkpoint
-    # 变更类 → 触发
-    for tool in ("close_debit_card_4721", "file_credit_card_transaction_dispute_4829",
-                "submit_credit_limit_increase_request_7392", "order_replacement_credit_card_7291",
-                "submit_referral", "apply_for_credit_card", "open_bank_account_4821",
-                "update_transaction_rewards_3847", "pay_credit_card_from_checking_9182",
-                "transfer_to_human_agents", "freeze_debit_card_3892",
-                "approve_credit_limit_increase_5847"):
+    # 变更类/不可逆/transfer → 触发
+    for tool in ("close_debit_card_4721",
+                 "file_credit_card_transaction_dispute_4829",
+                 "submit_credit_limit_increase_request_7392",
+                 "submit_referral", "apply_for_credit_card",
+                 "open_bank_account_4821", "pay_credit_card_from_checking",
+                 "update_transaction_rewards_3847", "freeze_debit_card",
+                 "approve_credit_limit_increase_5847",
+                 "transfer_to_human_agents"):
         assert should_trigger_checkpoint(tool), f"{tool} 应触发"
-    # wrapper 调用按 inner 名判定
-    assert should_trigger_checkpoint("call_discoverable_agent_tool") is False, \
-        "wrapper 外层名本身不触发——判定在 inner 解析后（two_agent 侧）"
-
-
-def test_v6_7_simple_queries_no_checkpoint():
-    """测试要求#7:普通简单查询不触发复杂 Decision Check。"""
-    from agents.harness.decision_checkpoint import should_trigger_checkpoint
+    # 普通查询/检索/规划/审计 → 零触发
     for tool in ("get_user_information_by_name", "get_current_time",
                  "get_credit_card_accounts_by_user", "get_referrals_by_user",
                  "get_bank_account_transactions_9173", "KB_search",
                  "KB_search_bm25", "ask_knowledge_agent", "write_plan",
                  "update_plan", "read_plan", "unlock_discoverable_agent_tool",
-                 "log_verification", "noop", "read_plan"):
+                 "log_verification", "noop"):
         assert not should_trigger_checkpoint(tool), f"{tool} 不应触发"
 
 
-def test_v6_8_missing_evidence_detected():
-    """测试要求#8:missing evidence 能正确标识（确定性部分）。"""
+def test_v6_10_checkpoint_artifact_six_questions_no_extra_llm():
+    """要求#4:checkpoint 是 6 问短 artifact,不是"再问一次确定吗"
+    ——Runtime 零额外 LLM 调用（源码级断言）。
+
+    artifact 含:目标/确认事实/用户说的/硬规则/缺失证据/矛盾;
+    render 短且无 chain-of-thought;一次性消费;预算超限只记 trace。"""
+    import inspect
     from agents.harness.decision_checkpoint import DecisionCheckpoint
-    from agents.harness.evidence_ledger import EvidenceLedger
-    led = EvidenceLedger()
-    # 用户自述 tenure + 系统日期,但 action 的 account_id 无任何系统记录
-    led.add("tenure_claim", "about 4 months", "user_claim", "user_turn_1")
-    led.add("current_date", "2025-11-14", "system", "get_current_time")
+    from agents.harness.task_state_v3 import (
+        TaskStateV3, UserStateExtractor, ToolResultStateExtractor)
+    from agents.harness.evidence_view import EvidenceView
+    from agents.harness.plan_store import PlanStore
+    # (a) 零 LLM:类源码无第二次判定调用
+    src = inspect.getsource(DecisionCheckpoint)
+    assert "run_llm_check" not in src and "NOT_READY" not in src, \
+        "checkpoint 不得有第二次 LLM 判定调用（收紧指令 §4）"
+    # (b) 6 问 artifact 构建
+    ts = TaskStateV3()
+    UserStateExtractor.feed(ts, "a customer for about four months")
+    ToolResultStateExtractor.feed(ts, "get_current_time",
+                                  "The current time is 2025-11-14 03:40 EST.")
+    ps = PlanStore()
+    ps.write_plan(goal="refer the user's partner", steps=[
+        {"description": "submit referral"}])
     cp = DecisionCheckpoint()
-    art = cp.build_artifact(
-        tool_name="submit_referral", arguments={"account_type": "World Blue",
-                                                "user_id": "ti87k4x9m2"},
-        ledger=led, open_questions=["does tenure meet the 90-day requirement?"])
-    # (a) open question 进 missing
-    assert any("tenure" in m for m in art.missing_evidence)
-    # (b) 实体 gap:user_id 无系统记录 → 确定性 missing
-    assert any("ti87k4x9m2" in m and "no system record" in m
-               for m in art.missing_evidence)
-    # artifact 渲染分段
+    note_text = cp.note_for_next_turn(
+        "submit_referral", {"account_type": "World Blue",
+                            "user_id": "ti87k4x9m2"},
+        evidence_view=EvidenceView(ts), plan_store=ps,
+        open_questions=["tenure vs 90-day requirement"])
+    assert note_text is not None
+    # (c) 一次性消费:取回 artifact;注入文本与其 render 一致
+    art = cp.consume_pending()
+    assert art is not None
     text = art.render()
-    assert "Unverified user claims" in text and "tenure_claim" in text
-    assert "Confirmed facts" in text and "current_date" in text
-    assert "Missing evidence" in text
-    # NOT_READY 提示生成（有界）
-    verdict = {"decision_status": "NOT_READY",
-                "missing": ["tenure not verified"], "next": "query accounts"}
-    assert cp.should_prompt(verdict)
-    note = cp.prompt_note(verdict)
-    assert note and "tenure not verified" in note
-    # 有界:超限后不再提示
-    for _ in range(DecisionCheckpoint.PROMPT_LIMIT):
-        cp.prompt_note(verdict)
-    assert cp.prompt_note(verdict) is None or True  # 上一行已耗尽
-    assert not cp.should_prompt(verdict)
-
-
-def test_v6_8b_checkpoint_llm_stub_and_budget():
-    """checkpoint LLM 判定:stub generate → 解析;预算有界。"""
-    from agents.harness.decision_checkpoint import DecisionCheckpoint, CheckpointArtifact
-
-    class _Resp:
-        def __init__(self, c):
-            self.content = c
-
-    def stub_generate(model=None, messages=None, tools=None, call_name=None, **kw):
-        # 断言 prompt 不要求业务判断（只判证据充分性）
-        sys_text = messages[0].content
-        assert "NOT choosing products" in sys_text or "not choosing" in sys_text.lower()
-        return _Resp('{"decision_status": "NOT_READY", '
-                     '"missing": ["account tenure unverified"], '
-                     '"next": "look up account open date"}')
-
-    cp = DecisionCheckpoint()
-    art = CheckpointArtifact(action_tool="submit_referral")
-    out = cp.run_llm_check(art, stub_generate)
-    assert out and out["decision_status"] == "NOT_READY"
-    assert out["missing"] == ["account tenure unverified"]
-    # READY 路径
-    def stub_ready(**kw):
-        return _Resp('{"decision_status": "READY", "missing": [], "next": ""}')
+    assert text == note_text, "注入文本必须就是 artifact 渲染"
+    assert "Current goal" in text and "refer" in text
+    assert "NOT verified by system" in text and "four months" in text
+    assert "Confirmed by system" in text and "current_date" in text
+    assert "Missing key evidence" in text
+    assert "tenure vs 90-day" in text            # open question 进 missing
+    assert "no system record" in text            # 实体 gap 进 missing
+    assert len(text) < 2000, "artifact 必须短（无 chain-of-thought）"
+    assert cp.consume_pending() is None
+    # (d) 预算超限 → 只记 trace 不注入
     cp2 = DecisionCheckpoint()
-    out2 = cp2.run_llm_check(art, stub_ready)
-    assert out2["decision_status"] == "READY"
-    # 预算:超限返回 None
-    cp3 = DecisionCheckpoint()
-    cp3.llm_calls = DecisionCheckpoint.CHECKPOINT_MAX_PER_TASK
-    assert cp3.run_llm_check(art, stub_ready) is None
-    # 宽容:generate 抛异常 → None 不崩
-    cp4 = DecisionCheckpoint()
-    def boom(**kw):
-        raise RuntimeError("llm down")
-    assert cp4.run_llm_check(art, boom) is None
+    cp2.triggered = DecisionCheckpoint.MAX_PER_TASK
+    assert cp2.note_for_next_turn("submit_referral", {},
+                                  evidence_view=EvidenceView(ts)) is None
 
 
-def test_v6_9_v5_behavior_not_hard_blocked():
-    """测试要求#9:已有成功 V5 行为不被新 Runtime 硬拦。
+def test_v6_11_context_builder_single_outlet():
+    """要求#3:ContextBuilder 是最终 context 的统一出口——
+    证据块/条目块全部经 build_context 组装,无平行 context 模块。"""
+    import os
+    from agents.harness.context_builder import (
+        build_context, evidence_block, worklist_block)
+    from agents.harness.task_state_v3 import (
+        TaskStateV3, UserStateExtractor, ToolResultStateExtractor)
+    from agents.harness.evidence_view import EvidenceView
+    from agents.harness.worklist import Worklist
+    from agents.harness.plan_store import PlanStore
+    # 平行模块已删除（收紧指令 §3:不做第二套 context 系统）
+    assert not os.path.exists(os.path.join(
+        ROOT, "agents", "harness", "context_organization.py"))
+    assert not os.path.exists(os.path.join(
+        ROOT, "agents", "harness", "evidence_ledger.py"))
+    # 组装:V5 blocks 与 V6.1 blocks 同一出口
+    ts = TaskStateV3()
+    UserStateExtractor.feed(ts, "a customer for about four months")
+    ToolResultStateExtractor.feed(ts, "get_current_time",
+                                  "The current time is 2025-11-14 03:40 EST.")
+    ps = PlanStore()
+    ps.write_plan(goal="g", steps=[
+        {"description": "close card", "tool_hint": "close_card",
+         "entities": ["card_1", "card_2"]}])
+    wl = Worklist()
+    wl.sync_from_plan(ps)
+    state = _mk_state(4)
+    out = build_context(state, ts, plan_tracker=None,
+                        memory_block="MEM-BLOCK", state_block="",
+                        evidence_view=EvidenceView(ts),
+                        plan_store=ps, worklist=wl)
+    blob = out[0].content
+    assert "MEM-BLOCK" in blob
+    assert "confirmed by system" in blob and "current_date" in blob
+    assert "NOT yet verified" in blob and "four months" in blob
+    assert "Worklist" in blob and "[ ]" in blob and "card_2" in blob
+    # 空状态零渲染（简单任务零开销——V5 成功路径保护）
+    out2 = build_context(_mk_state(4), TaskStateV3(), plan_tracker=None,
+                         evidence_view=EvidenceView(TaskStateV3()),
+                         plan_store=PlanStore(), worklist=Worklist())
+    assert out2[0].content == "SYSTEM PROMPT", \
+        "空状态必须零渲染（V5 成功路径保护）"
 
-    (a) EvidenceLedger 不进 harness 拦截链——ledger 存在 claim/tool
-        冲突时,TaskStateValidator 仍按 V5 语义判定（不新增 blocking
-        verdict 类别;BLOCKING_VERDICTS 不含任何 v6 词）。
-    (b) V6 context view 空状态零渲染——简单任务零开销。
-    (c) v6_enabled=False 时 ledger/worklist 喂入全部 no-op。"""
+
+def test_v6_12_task_state_current_date_single_feed():
+    """要求#1(数据流):get_current_time → TaskState 的 system.current_date
+    ——与记录提取同一条数据流,无旁路喂入。"""
+    from agents.harness.task_state_v3 import (
+        TaskStateV3, ToolResultStateExtractor)
+    from agents.harness.evidence_view import EvidenceView
+    ts = TaskStateV3()
+    ToolResultStateExtractor.feed(ts, "get_current_time",
+                                  "The current time is 2025-11-14 03:40:00 EST.")
+    ev = EvidenceView(ts)
+    recs = ev.confirmed_system_facts()
+    assert recs and recs[0].key == "system.current_date" \
+        and recs[0].value == "2025-11-14"
+    # 非时间工具不误识别
+    ts2 = TaskStateV3()
+    ToolResultStateExtractor.feed(ts2, "get_accounts", "opened 2025-09-10")
+    assert all(r.key != "system.current_date"
+               for r in EvidenceView(ts2).confirmed_system_facts())
+
+
+def test_v6_13_v5_behavior_not_hard_blocked():
+    """要求#9:已有 V5 成功行为不被硬拦。
+
+    (a) EvidenceView/Worklist/Checkpoint 不进 harness 拦截链
+        ——BLOCKING_VERDICTS 未扩大（V5 freeze 语义）。
+    (b) DSH_V6_DISABLE=1 一键回退纯 V5 行为。
+    (c) checkpoint 注入式零 LLM（agent 侧源码断言）。"""
+    import inspect
     from agents.harness.action_harness import BLOCKING_VERDICTS
-    # (a) 拦截 verdict 集合未扩大（V5 freeze 语义）
     v5_verdicts = {"schema_violation", "evidence_mismatch",
                    "task_state_conflict", "kb_enum_violation",
                    "kb_threshold_violation", "kb_format_violation"}
     assert BLOCKING_VERDICTS == v5_verdicts or \
         BLOCKING_VERDICTS.issubset(v5_verdicts | {"evidence_mismatch"}), \
         "V6 不得新增 blocking verdict 类别"
-    # (b) 空状态零渲染
-    from agents.harness.context_organization import build_v6_context_view
-    from agents.harness.evidence_ledger import EvidenceLedger
-    from agents.harness.worklist import Worklist
-    assert build_v6_context_view(ledger=EvidenceLedger(),
-                                 worklist=Worklist()) == "", \
-        "无证据无计划 → V6 view 必须为空串（零开销）"
-    # (c) 关闭开关 → 喂入 no-op（DecisionAgent._v6_* 开头守卫）
-    from agents.two_agent import _v6_enabled
-    import os
+    # (b) 环境开关
+    import importlib
+    import agents.two_agent as ta
     old = os.environ.get("DSH_V6_DISABLE")
     try:
         os.environ["DSH_V6_DISABLE"] = "1"
-        assert _v6_enabled() is False
+        importlib.reload(ta)
+        assert ta._v6_enabled() is False, "DSH_V6_DISABLE=1 必须回退纯 V5"
     finally:
         if old is None:
             os.environ.pop("DSH_V6_DISABLE", None)
         else:
             os.environ["DSH_V6_DISABLE"] = old
-    # checkpoint 提示语义:NOT_READY 只提示不拦截——execute flag 恒不被
-    # checkpoint 覆盖（结构保证:prompt_note 返回文本,无拦截返回值）
-
-
-def test_v6_9b_v6_context_view_renders_sections():
-    """V6 context view 分段渲染 + 渲染优先级（current_date 前置）。"""
-    from agents.harness.context_organization import build_v6_context_view
-    from agents.harness.evidence_ledger import EvidenceLedger
-    from agents.harness.worklist import Worklist
-    from agents.harness.plan_store import PlanStore
-    led = EvidenceLedger()
-    led.add("tenure_claim", "about 4 months", "user_claim", "user_turn_1")
-    led.add("cli.max_pct", 50, "knowledge_base", "doc_007")
-    led.add("current_date", "2025-11-14", "system", "get_current_time")
-    led.add("balance", 96000, "tool_result", "get_accounts")
-    ps = PlanStore()
-    ps.write_plan(goal="refer partner", steps=[
-        {"description": "verify eligibility", "tool_hint": "get_accounts"}])
-    wl = Worklist()
-    wl.sync_from_plan(ps)
-    view = build_v6_context_view(ledger=led, plan_store=ps, worklist=wl,
-                                 open_questions=["tenure vs 90-day rule"])
-    assert "GOAL: refer partner" in view
-    assert "CONFIRMED FACTS" in view and "current_date" in view
-    assert "UNVERIFIED USER CLAIMS" in view and "tenure_claim" in view
-    assert "RELEVANT POLICY EVIDENCE" in view and "cli.max_pct" in view
-    assert "MISSING INFORMATION" in view and "tenure vs 90-day" in view
-    # current_date 排在 confirmed 段第一行（P1 锚点）
-    conf_lines = [l for l in view.split("\n") if l.startswith("- ")]
-    assert conf_lines[0].startswith("- current_date")
-
-
-def test_v6_10_replay_no_hidden_information():
-    """测试要求#10:不访问 hidden registry / evaluator / gold 信息。
-
-    (a) replay case 构建的输入白名单断言（eval/replay.assert_case_integrity）
-    (b) replay build 不读取 tasks.json 的 evaluation_criteria/
-        user_scenario/notes（构建产物中无对应内容标记）
-    (c) checkpoint/ledger/worklist 源码无 gold/evaluation_criteria 访问
-        ——由 test_integrity.py 的全局扫描覆盖（本测试补 replay 侧）。"""
-    import json
-    from eval.replay import (assert_case_integrity, ReplayCase,
-                             AGENT_VIEW_ALLOWED_KEYS, FORBIDDEN_INPUT_KEYS)
-    # (a) 白名单完备:case 字段都是 agent-visible
-    case = ReplayCase(case_id="t", task_id="t", checkpoint_label="x")
-    assert_case_integrity(case)  # 空 case 通过
-    d = case.to_dict()
-    assert set(d).issubset(AGENT_VIEW_ALLOWED_KEYS)
-    # (b) 已构建的 configs/banking_v6_replay.json 不含泄漏标记
-    import os
-    path = os.path.join(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))), "configs", "banking_v6_replay.json")
-    if os.path.exists(path):
-        blob = open(path, encoding="utf-8").read().lower()
-        for marker in ("evaluation_criteria", "gold_actions",
-                       "env_api_call_sequences", "user_scenario",
-                       "communicate_info", "relevant_policies"):
-            assert marker not in blob, f"replay 配置泄漏: {marker}"
-    # 恶意字段注入 → 断言拦截
-    bad = ReplayCase(case_id="t", task_id="t", checkpoint_label="x")
-    object.__setattr__(bad, "gold_actions", [])
-    try:
-        d = bad.to_dict()
-        d["gold_actions"] = []  # 模拟泄漏字段
-        assert any(k in FORBIDDEN_INPUT_KEYS for k in d)
-        # assert_case_integrity 的等价检查
-        leaked = [k for k in d if k not in AGENT_VIEW_ALLOWED_KEYS]
-        assert leaked
-    finally:
-        pass
+        importlib.reload(ta)   # 恢复默认(enabled)
+    assert ta._v6_enabled() is True
+    # (c) checkpoint 零 LLM:agent 侧注入函数不调用 generate/LLM
+    src = inspect.getsource(ta.DecisionAgent._v6_checkpoint_for_call)
+    code_lines = [l for l in src.split("\n")
+                  if l.strip() and not l.strip().startswith("#")]
+    assert not any(re.search(r"\bgenerate\s*\(", l) for l in code_lines), \
+        "checkpoint 不得调用 LLM（generate 调用）"
 
 
 # ===========================================================================

@@ -1,5 +1,79 @@
 # V6.0 设计 — Stateful, Evidence-Grounded Agent Runtime
 
+> **⚠️ V6.1 架构收紧修订（2026-09,本文档下文为 V6.0 原始设计）**
+> 用户 2026-09 指令"先收紧架构,不再建平行状态系统"落地后的修订。
+> 本节是当前唯一有效的 V6 架构说明;下文 V6.0 内容仅作历史参考。
+>
+> **V6.1 核心改变（在 V5 模块上补能力,零平行系统）**:
+>
+> 1. **TaskStateV3 仍是唯一事实源**。上一版的 EvidenceLedger
+>    （独立事实存储 + provenance 矩阵 + 双喂入路径）已删除;
+>    替代为 `evidence_view.py` 的 **EvidenceView**——零存储的只读
+>    视图,每次从 TaskStateV3 历史链现算四段:
+>    用户说的（user_statement）/ 工具确认的（system_fact）/
+>    KB 规则（kb_rule）/ 用户偏好（user_preference）。
+>    数据流严格单向:`Tool Result / User / KB → TaskState → EvidenceView`。
+> 2. **权威按事实类型,不做全局 source 排名**（§5 原则）:
+>    StateEntry 新增 fact_type 字段;authority 表为
+>    system_fact→系统 / kb_rule→KB / user_preference→用户本人 /
+>    user_statement→unverified。"开户时间问工具、业务规则问 KB、
+>    加急与否问用户"由类型表通用表达,零 task 硬编码。
+> 3. **PlanStore 仍是任务进度主模块**;Worklist 是其条目级展开:
+>    WorkItem 挂在 PlanStep 下（step_id 反向引用）,步骤 removed →
+>    条目移除;实体绑定谓词单一实现
+>    （plan_store.args_reference_entity,PlanStore/Worklist 共用）;
+>    上一版 observe_entities 的"runtime 观察"旁路入口已删
+>    （Worklist 不再有脱离 plan 的第二来源）。
+>    通用能力增量在 TaskState 提取器层:UserStateExtractor 补通用
+>    duration 自述提取与用户偏好模式;ToolResultStateExtractor 补
+>    get_current_time → system.current_date（同一数据流,无旁路）。
+> 4. **ContextBuilder 是最终 context 的统一出口**
+>    （context_builder.build_context 唯一签名）。上一版独立的
+>    context_organization.py 已删;evidence_block / worklist_block
+>    都是 build_context 的输入,空状态零渲染（V5 简单任务零开销）。
+> 5. **DecisionCheckpoint 轻量化**:不再每次触发调 LLM 判
+>    READY/NOT_READY（那是"再问一次确定吗"的变体）——零额外 LLM
+>    调用。触发即确定性构建 6 问 artifact（目标/已确认事实/用户
+>    自述/硬规则/缺失证据/可否执行——固定字段,无 chain-of-thought）
+>    注入到该关键动作**执行前**的一轮生成:首次提出 → 停一轮注入
+>    六问;同签名重提 → 直接放行。签名集合结构性防死循环
+>    （每动作恰好多一轮 generate,不是预算兜底）。触发枚举覆盖
+>    不可逆/高影响变更、transfer、转人工;读类/检索/规划零触发。
+> 6. **guard 消费 worklist**:plan completion guard 同时纳入未完成
+>    条目（多实体任务不因"做完一个对象"整体结束）,仍走同一
+>    GUARD_LIMIT=2 有界提醒,零新机制。
+> 7. **未新增任何 Agent/Planner/Memory**;闭环为用户指定的单向流:
+>    Observe → TaskState → Plan/Worklist → Decision → ActionHarness →
+>    Tool Result → TaskState 更新 → 下一轮。
+> 8. trace 事件收敛:TaskState 的 state_write/state_update 已含全部
+>    事实变更（唯一事实源的好处——审计点只有一个）;worklist 发
+>    work_item_created/completed/failed/removed;checkpoint 发
+>    checkpoint_triggered/missing_evidence/budget_exhausted。
+>    evidence_* 事件族删除（不再有第二套事实流）。
+>
+> **V6.1 文件清单**:
+> | 文件 | 动作 |
+> |---|---|
+> | `agents/harness/task_state_v3.py` | 修改:fact_type + authority 表 + duration/preference 提取 + current_date + 视图查询 |
+> | `agents/harness/plan_store.py` | 修改:args_reference_entity 单一谓词导出 |
+> | `agents/harness/evidence_view.py` | 新增（替代 evidence_ledger.py,后者删除） |
+> | `agents/harness/worklist.py` | 重写:挂 step 下/删旁路/零渲染 |
+> | `agents/harness/decision_checkpoint.py` | 重写:6 问 artifact/零 LLM/签名防重 |
+> | `agents/harness/context_builder.py` | 修改:统一出口（evidence/worklist block;context_organization.py 删除） |
+> | `agents/two_agent.py` | 修改:单路径喂入/checkpoint 动作前注入/guard 含条目 |
+> | `eval/runner.py` `eval/instrumentation.py` | 修改:事件词汇表更新 |
+> | `tests/test_unit.py` | V6 用例重写（13 个,37/37） |
+> | `tests/test_integrity.py` | 新增 test_no_task_hardcoding_in_runtime |
+> | `scripts/run_v6_tests.sh` | 移除 replay build（未获批阶段不碰 replay） |
+>
+> **测试**:37/37 unit + 8/8 integrity 全绿（含 DSH_V6_DISABLE 回退、
+> 零 LLM 源码断言、空状态零渲染、失败不误完成、多实体不整体结束、
+> 旁路模块不存在断言）。尚未跑 replay/API/Dev24/Holdout——待审。
+>
+> ---
+
+# V6.0 原始设计（历史参考）
+
 > 状态:已实现(deterministic 部分见 §8)。基线:Frozen V5(commit 3aa2918,
 > Dev24 9/24 + Holdout 8/22,agent=two_agent_harness,qwen3.8-flash,bm25,seed 42)。
 > 本文档是 V6 的唯一设计来源;trace 证据全部来自 Frozen V5 Dev24 原始 trace

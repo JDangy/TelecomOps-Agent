@@ -821,22 +821,34 @@ class DecisionAgent(LLMAgent):
         self.plan_store = PlanStore()
         self._planning_prompted = False             # runtime fallback 只提示一次
         self._planning_fallback_pending = False     # 下一轮注入提示
-        # V6.0: Stateful, Evidence-Grounded Runtime
-        #   ledger   —— 事实来源分层（user_claim/tool_result/kb/system）
-        #   worklist —— 条目级未完成事项（tool-result-driven 进度）
-        #   checkpoint —— 关键动作前的轻量证据检查点
+        # V6.1（架构收紧）: 在 V5 模块上补能力,不建平行状态系统。
+        #   EvidenceView  —— TaskStateV3 的只读视图（零存储,现算）
+        #   Worklist     —— PlanStore 步骤的条目级展开（挂在 step 下）
+        #   Checkpoint   —— 关键动作前 6 问注入（零额外 LLM 调用）
         #   默认启用;env DSH_V6_DISABLE=1 一键回退纯 V5 行为。
-        from agents.harness.evidence_ledger import EvidenceLedger
+        from agents.harness.evidence_view import EvidenceView
         from agents.harness.worklist import Worklist
         from agents.harness.decision_checkpoint import DecisionCheckpoint
         self.v6_enabled = _v6_enabled()
-        self.evidence_ledger = EvidenceLedger()
+        self.evidence_view = EvidenceView(self.task_state)
         self.worklist = Worklist()
         self.checkpoint = DecisionCheckpoint()
+        self._v6_note_pending = None   # checkpoint 待注入的下轮尾注
+        # 已 checkpoint 过的动作签名集合——结构性防重:同一 (inner_tool,
+        # 参数) 的关键动作只在**首次提出**时注入 6 问并重入一轮;
+        # DA 重新提出同一动作时直接放行执行。签名集合保证每个关键
+        # 动作恰好多一轮 generate,零死循环可能(postmortem Step 2A
+        # 拦截循环教训的结构性内建——不是"预算兜底",是不可能出现)。
+        self._v6_checkpointed_signatures: set = set()
 
-    # -- V2.2: TaskState 三源喂入 ------------------------------------------------
+    # -- V2.2: TaskState 喂入（V6.1 收紧:唯一事实写入路径）----------------
     def _feed_task_state(self, message) -> None:
-        """把进入 agent 的消息中的明确值灌入 TaskStateV3 + 驱动 Plan 进度。"""
+        """把进入 agent 的消息中的明确值灌入 TaskStateV3 + 驱动 Plan 进度。
+
+        V6.1 收紧:TaskStateV3 是唯一事实源。user 消息 / tool result /
+        KB packet 全部走各自的 V3 提取器进入同一个状态——不再有
+        ledger 旁路。EvidenceView 在读取时现算,零存储。
+        """
         if self.task_state is None:
             return
         try:
@@ -848,8 +860,6 @@ class DecisionAgent(LLMAgent):
                 UserStateExtractor.feed(
                     self.task_state, message.content or "",
                     turn_ref="user_message")
-                # V6: 用户消息 → ledger（user_claim 证据层）
-                self._v6_feed_user_message(message)
                 # V4: Plan Mode 后首个 user 消息补 goal
                 if self.plan_tracker.plan is not None:
                     txt = (message.content or "").strip()
@@ -857,77 +867,30 @@ class DecisionAgent(LLMAgent):
                         self.plan_tracker.plan.goal = txt[:200]
             elif isinstance(message, MultiToolMessage):
                 for tm in message.tool_messages:
-                    ToolResultStateExtractor.feed(
-                        self.task_state, "", tm.content or "")
-                    self._v6_feed_tool_result(tm, inner_from_cache=False)
-                    self._plan_progress_from_tool(tm)
+                    self._feed_one_tool_result(tm)
             elif isinstance(message, ToolMessage):
                 # tau2 _wrap_tool_results：单结果是裸 ToolMessage
-                ToolResultStateExtractor.feed(
-                    self.task_state, "tool_result", message.content or "")
-                self._v6_feed_tool_result(message, inner_from_cache=False)
-                self._plan_progress_from_tool(message)
+                self._feed_one_tool_result(tm)
         except Exception:
             pass  # 状态喂入失败不影响对话流
 
-    # -- V6: evidence ledger / worklist 喂入 --------------------------------
-    def _v6_feed_user_message(self, message) -> None:
-        """UserMessage → EvidenceLedger（user_claim 层,确定性提取）。
+    def _feed_one_tool_result(self, tm) -> None:
+        """单条 ToolMessage → TaskState（提取器）+ Plan/Worklist 推进。
 
-        只提取**通用模式**的自述事实（不猜业务语义）:
-        - 时间/tenure 自述（"X months/days/years"→ key=tenure_*）
-        - 金额自述（复用 V5 UserStateExtractor 的金额绑定结果——
-          ledger 记 user_claim,与 TaskState 同值）
-        身份信息（姓名/地址等）不进 ledger——TaskState/工具验证已覆盖。
+        工具名通过 id → inner 映射解析（确定性;无映射时提取器收 ""
+        ——get_current_time 类时间识别需要真名,见 _toolcall_inner_by_id）。
+        V6.1:所有喂入单路径——TaskState 一份,PlanStore/Worklist 只消费。
         """
-        if not getattr(self, "v6_enabled", False):
-            return
-        try:
-            from agents.harness.evidence_ledger import EvidenceLedger
-            import re as _re
-            text = message.content or ""
-            if not text:
-                return
-            # tenure 类自述:"about four months" / "3 days ago" /
-            # "mid-July" —— 记为 unverified claim（100 陷阱的通用形态）
-            m = _re.search(r"\b(?:about|around|roughly|over|more than)?\s*"
-                           r"(?:four|five|six|seven|eight|nine|ten|two|three|"
-                           r"\d{1,2})\s*(months?|days?|years?|weeks?)\b",
-                           text, _re.I)
-            if m:
-                EvidenceLedger.feed_user_claim(
-                    self.evidence_ledger, "tenure_claim",
-                    f"{m.group(0).strip().lower()}", source_ref="user_message")
-        except Exception:
-            pass
+        from agents.harness.task_state_v3 import ToolResultStateExtractor
+        inner = self._toolcall_inner_by_id.get(tm.id) or ""
+        ok = not tm.error
+        ToolResultStateExtractor.feed(self.task_state, inner,
+                                      tm.content or "")
+        # V4 观察升级 + V5/V6.1 计划与条目推进（同口径,真实结果驱动）
+        self._plan_progress_from_tool(tm, inner=inner, ok=ok)
 
-    def _v6_feed_tool_result(self, tm, inner_from_cache: bool = True) -> None:
-        """ToolMessage → ledger（tool_result 层）+ worklist 推进。
-
-        工具名解析同 _plan_progress_from_tool（id → inner 映射,
-        无映射时跳过——不猜）。
-        """
-        if not getattr(self, "v6_enabled", False):
-            return
-        try:
-            from agents.harness.evidence_ledger import EvidenceLedger
-            inner = self._toolcall_inner_by_id.get(tm.id)
-            if inner is None:
-                return
-            ok = not tm.error
-            # ledger: current_time 类确定性识别
-            EvidenceLedger.feed_tool_result(
-                self.evidence_ledger, inner, tm.content or "")
-            # worklist: tool-result-driven 推进（实体绑定,失败不误完成）
-            args = self._toolcall_args_by_id.get(tm.id) or {}
-            self.worklist.on_tool_result(inner, ok, args,
-                                          task_state=self.task_state)
-        except Exception:
-            pass
-
+    # -- V6.1: worklist 同步（PlanStore 变更后;幂等）----------------------
     def _v6_sync_worklist_from_plan(self) -> None:
-        """PlanStore 变更后同步 worklist（在 _execute_plan_tool 的
-        write/update 后调用;幂等）。"""
         if not getattr(self, "v6_enabled", False):
             return
         try:
@@ -935,70 +898,80 @@ class DecisionAgent(LLMAgent):
         except Exception:
             pass
 
-    # -- V6: Selective Decision Checkpoint -----------------------------------
-    def _v6_checkpoint_for_call(self, tc) -> None:
-        """关键动作前的证据检查点（零拦截;有界提示）。
+    # -- V6.1: Selective Decision Checkpoint（零 LLM,动作前注入）--------
+    def _v6_checkpoint_for_call(self, tc, inner: str) -> bool:
+        """关键动作前的证据检查点（6 问注入,零额外 LLM 调用）。
 
-        流程（docs/v6_design.md §4.3）:
-        1. should_trigger_checkpoint(inner 工具名)（确定性枚举）
-        2. build_artifact（ledger 分段 + 确定性 missing）
-        3. emit checkpoint_triggered + checkpoint_missing_evidence
-        4. 一次独立短 LLM 调用判 READY/NOT_READY（call_name=
-           "decision_checkpoint"——instrumentation 自动归类;预算
-           CHECKPOINT_MAX_PER_TASK 有界）
-        5. NOT_READY + missing 非空 → 有界回注一条 system note
-           （PROMPT_LIMIT;超限只记 trace）——**不拦截原调用**
-        6. 回注的 note 在下次 generate 前由 _v6_pending_note 注入
-
-        失败静默（checkpoint 不阻塞主流程——V5 行为优先）。
+        时序（"动作前检查"的正确实现）:
+        1. 首次提出关键动作 → 构建 6 问 artifact 暂存,返回 True
+           （调用方:把本轮 assistant 提案追加进 state、注入尾注、
+            本轮不放行——下轮 generate 时 DA 在【执行前】读到六问）
+        2. DA 重新提出同一 (工具+参数) → 签名命中 → 返回 False
+           （放行执行——检查已完成,不重复,不循环）
+        3. 预算超限 → 返回 False（放行;只记 trace）
+        同签名永不二次 checkpoint:结构性无死循环;同一轮多个关键
+        调用只 checkpoint 第一个（其余签名同样记录,下轮直接过）。
         """
         if not getattr(self, "v6_enabled", False):
-            return
+            return False
         try:
-            from agents.harness.decision_checkpoint import should_trigger_checkpoint
-            inner = self._toolcall_inner_by_id.get(tc.id) or tc.name
+            import json as _json
+            from agents.harness.decision_checkpoint import \
+                should_trigger_checkpoint
             if not should_trigger_checkpoint(inner):
-                return  # 读类/ask/plan 工具零触发（保护 V5 成功路径）
-            # open questions（来自 DA memory,checkpoint missing 输入）
+                return False  # 普通工具调用零触发（保护 V5 成功路径）
+            sig = (str(inner),
+                   _json.dumps(getattr(tc, "arguments", None) or {},
+                               sort_keys=True, default=str))
+            if sig in self._v6_checkpointed_signatures:
+                return False        # 已检查过——放行
+            if self.checkpoint.triggered >= self.checkpoint.MAX_PER_TASK:
+                self.checkpoint._emit(
+                    "checkpoint_budget_exhausted",
+                    used=self.checkpoint.triggered,
+                    limit=self.checkpoint.MAX_PER_TASK)
+                return False        # 超预算——放行,只记 trace
             open_qs = []
             if self.memory is not None:
-                open_qs = list(self.memory.read().get("open_questions") or [])[:5]
-            artifact = self.checkpoint.build_artifact(
-                tool_name=inner, arguments=dict(getattr(tc, "arguments", None) or {}),
-                ledger=self.evidence_ledger, plan_store=self.plan_store,
-                worklist=self.worklist, open_questions=open_qs)
+                open_qs = list(self.memory.read().get("open_questions")
+                               or [])[:5]
+            note = self.checkpoint.note_for_next_turn(
+                inner, dict(getattr(tc, "arguments", None) or {}),
+                evidence_view=self.evidence_view,
+                plan_store=self.plan_store, open_questions=open_qs)
+            if note is None:
+                return False        # 预算尽——放行
+            self._v6_note_pending = note
+            self._v6_checkpointed_signatures.add(sig)
+            return True             # checkpoint 这一轮 → 下轮带六问重生成
+        except Exception:
+            return False            # 失败静默放行（V5 行为优先）
+
+    def _resolve_inner_name(self, tc) -> str:
+        """tc → inner 工具名（resolver 穿透 wrapper;无 resolver 时用外层名）。
+
+        checkpoint 的触发判定需要 inner 名（wrapper 外层名本身不触发）。
+        harness 未启用（V1.2 回退形态）时也要有确定的 inner 解析。
+        """
+        resolver = getattr(self.harness, "resolver", None) \
+            if self.harness is not None else None
+        if resolver is not None:
             try:
-                from eval.instrumentation import get_active_recorder
-                rec = get_active_recorder()
-                if rec is not None:
-                    rec.emit("checkpoint_triggered", "decision_agent",
-                             parent_span_id=getattr(rec, "task_span_id", None),
-                             tool=inner,
-                             reason="critical_action",
-                             missing=artifact.missing_evidence or None)
-                    if artifact.missing_evidence:
-                        rec.emit("checkpoint_missing_evidence", "decision_agent",
-                                 parent_span_id=getattr(rec, "task_span_id", None),
-                                 tool=inner,
-                                 missing=artifact.missing_evidence)
+                res = resolver.resolve(tc)
+                inner = getattr(res, "tool_name", None) or tc.name
+                self._toolcall_args_by_id[tc.id] = dict(
+                    getattr(res, "arguments", None) or {})
+                return inner
             except Exception:
                 pass
-            # LLM 判定（单轮短调用;generate 从本模块命名空间解析——
-            # instrumentation 已 patch agents.two_agent.generate）
-            verdict = self.checkpoint.run_llm_check(artifact, generate)
-            if verdict is not None and self.checkpoint.should_prompt(verdict):
-                note = self.checkpoint.prompt_note(verdict)
-                if note:
-                    self._v6_note_pending = note
-        except Exception:
-            pass
+        return tc.name
 
     def _v6_consume_pending_note(self, state) -> None:
-        """把上一轮 checkpoint 的 NOT_READY 提示注入 message state 尾部。
+        """把 checkpoint 的 6 问尾注注入 message state 尾部（一次性）。
 
-        语义:提示必须出现在**该关键动作的下一轮 generate 之前**——
-        即拦截循环里的下一次 generate。本方法在每次 generate 前调用,
-        有 note 则 append 一条 SystemMessage（不修改历史,只追加）。
+        语义:注入必须出现在**该关键动作的下一轮 generate 之前**。
+        本方法在每次 generate 前调用,有暂存则 append 一条
+        SystemMessage（不修改历史,只追加;注入后即清空）。
         """
         note = getattr(self, "_v6_note_pending", None)
         if note:
@@ -1009,22 +982,27 @@ class DecisionAgent(LLMAgent):
             except Exception:
                 pass
 
-    # -- V4: Plan 进度由真实 Tool Result 驱动 ------------------------------
-    def _plan_progress_from_tool(self, tm) -> None:
-        """一次工具执行结束 → V4 观察升级 + V5 PlanStore 步骤推进。
+    # -- V4: Plan 进度由真实 Tool Result 驱动（V5/V6.1 同口径）-----------
+    def _plan_progress_from_tool(self, tm, inner: str = None,
+                                 ok: bool = None) -> None:
+        """一次工具执行结束 → V4 观察升级 + V5 PlanStore 步骤推进
+        + V6.1 Worklist 条目推进。
 
         内层工具名解析：tau2 ToolMessage 无 name——用 id 关联本 agent
         拦截循环记录的 tool_call（id → inner name 映射，确定性）。
-        V5：同时把 (inner, args) 交给 plan_store.on_tool_result——
-        完成推进带实体绑定（多对象同工具不误批量 completed）。
+        inner/ok 可由调用方直传（单路径喂入时已知,避免重复解析）。
+        PlanStore.on_tool_result 与 Worklist.on_tool_result 用同一
+        实体绑定谓词——两处进度永远同源。
         """
         try:
             if self.plan_tracker is None:
                 return
-            inner = self._toolcall_inner_by_id.get(tm.id)
+            if inner is None:
+                inner = self._toolcall_inner_by_id.get(tm.id)
             if inner is None:
                 return
-            ok = not tm.error
+            if ok is None:
+                ok = not tm.error
             upgraded = self.plan_tracker.maybe_upgrade(inner, ok)
             self.plan_tracker.on_tool_result(inner, ok)
             if upgraded:
@@ -1047,9 +1025,9 @@ class DecisionAgent(LLMAgent):
                 if not self.plan_store.active and not self._planning_prompted:
                     self._planning_prompted = True
                     self._planning_fallback_pending = True
+            args = self._toolcall_args_by_id.get(tm.id) or {}
             # V5: PlanStore 步骤推进（真实 Tool Result + 实体绑定）
             if self.plan_store.active:
-                args = self._toolcall_args_by_id.get(tm.id) or {}
                 step = self.plan_store.on_tool_result(
                     inner, ok, args, task_state=self.task_state)
                 if step is not None:
@@ -1065,6 +1043,11 @@ class DecisionAgent(LLMAgent):
                                      tool=inner, ok=ok)
                     except Exception:
                         pass
+            # V6.1: Worklist 条目推进（挂在 plan 步骤下,同口径推进）
+            if getattr(self, "v6_enabled", False) and len(self.worklist):
+                self.worklist.on_tool_result(
+                    self.plan_store, inner, ok, args,
+                    task_state=self.task_state)
         except Exception:
             pass
 
@@ -1239,14 +1222,34 @@ class DecisionAgent(LLMAgent):
                     and (assistant_message.tool_calls or [])):
                 # V5: completion guard——结构化 Plan 的真实 pending
                 # （优先于 V4 行为观察 guard；有界，允许 update_plan 后正常结束）
+                # V6.1: guard 同时纳入 worklist 未完成条目（多实体任务
+                # 不因"做完一个对象"而整体结束——080 的漏 activate 形态）。
+                # 仍走同一个 guard（有界 GUARD_LIMIT=2）,不新增机制。
                 guarded = False
                 try:
-                    if self.plan_store.active and self.plan_store.guard_should_remind():
+                    unfinished_items = []
+                    if getattr(self, "v6_enabled", False):
+                        try:
+                            unfinished_items = [
+                                f"{it.entity}: {it.status}"
+                                + (f" ({it.note})" if it.note else "")
+                                for it in self.worklist.unfinished()[:6]]
+                        except Exception:
+                            unfinished_items = []
+                    if (self.plan_store.active
+                            and self.plan_store.guard_should_remind()) \
+                            or (unfinished_items
+                                and self.plan_store.guard_should_remind()):
                         self.plan_store.guard_reminders += 1
-                        pend = "; ".join(
+                        pend_parts = [
                             f"{s.status}: {s.description}" +
                             (f" (objects: {', '.join(s.entities)})" if s.entities else "")
-                            for s in self.plan_store.pending_steps())
+                            for s in self.plan_store.pending_steps()]
+                        if unfinished_items:
+                            pend_parts.append(
+                                "unfinished per-object items: "
+                                + "; ".join(unfinished_items))
+                        pend = "; ".join(pend_parts)
                         state.messages.append(assistant_message)
                         from tau2.data_model.message import SystemMessage as _SM
                         reminder = _SM(
@@ -1305,6 +1308,23 @@ class DecisionAgent(LLMAgent):
             # ---- V2 Harness：业务工具执行前校验（只拦 rejected；通过的原样
             # 留给 orchestrator 执行，保持消息结构与 V1.2 完全兼容）----
             rejected = {}
+            checkpoint_hold = False   # V6.1: 关键动作首次提出 → 停一轮
+            if biz_calls and (self.harness is not None or
+                              getattr(self, "v6_enabled", False)):
+                # V6.1 先于 harness:关键动作的 6 问必须出现在执行前
+                # （checkpoint_hold=True 时本轮不放行——下轮 generate
+                #  DA 在六问下重新决策;同签名第二次直接过）
+                if getattr(self, "v6_enabled", False):
+                    for tc in biz_calls:
+                        inner = tc.name
+                        try:
+                            inner = self._resolve_inner_name(tc)
+                        except Exception:
+                            pass
+                        self._toolcall_inner_by_id[tc.id] = inner
+                        if self._v6_checkpoint_for_call(tc, inner):
+                            checkpoint_hold = True
+                            break   # 一轮只 checkpoint 一个动作
             if self.harness is not None and biz_calls:
                 ctx = self._harness_context({})
                 for tc in biz_calls:
@@ -1319,11 +1339,6 @@ class DecisionAgent(LLMAgent):
                         self._toolcall_args_by_id[tc.id] = dict(res.arguments or {})
                     except Exception:
                         self._toolcall_inner_by_id[tc.id] = tc.name
-                    # V6.0: Selective Decision Checkpoint——关键动作前的
-                    # 证据检查（读类/ask/plan 工具零触发;LLM 判 READY/
-                    # NOT_READY,NOT_READY 只回注提示不拦截——postmortem
-                    # Step2A 教训内建;预算有界）。
-                    self._v6_checkpoint_for_call(tc)
                     # 临时挂 tool 供 harness 读 schema
                     tc._harness_tool = tool  # noqa: SLF001
                     passed, content, meta = self.harness.process(
@@ -1355,6 +1370,13 @@ class DecisionAgent(LLMAgent):
                 for tc in biz_calls:
                     if hasattr(tc, "_harness_tool"):
                         del tc._harness_tool
+
+            if checkpoint_hold and not ask_calls and not rejected:
+                # V6.1: 关键动作 checkpoint——把本轮提案存档,下一轮 generate
+                # 注入 6 问尾注,DA 在【执行前】过一遍六问再重新决策
+                # （同签名直接放行;零死循环——签名集合保证）
+                state.messages.append(assistant_message)
+                continue
 
             if not ask_calls and not rejected:
                 # 全部通过（或纯业务工具）→ 原样交给 orchestrator（V1.2 路径）
@@ -1407,12 +1429,13 @@ class DecisionAgent(LLMAgent):
         return assistant_message, state
 
     def _build_llm_context(self, state):
-        """V4/V5/V6 Context Builder 入口：简单任务 V3 原路径，Plan 升级视图。
+        """Context Builder 统一入口（V4/V5/V6.1 唯一 context 出口）。
 
         V5: plan_store 有计划时注入结构化 plan block（围绕 current step），
         置于各 block 最前（计划是 DA 每轮第一优先信息）。
-        V6: 追加证据分层视图（evidence view）——confirmed/unverified/
-        policy/missing 分段;空状态零渲染（简单任务零开销,保护 V5 路径）。
+        V6.1: 证据分层视图（evidence view）与条目视图（worklist）
+        全部经 build_context 的参数进入——没有平行 context 模块,
+        也没有 agent 侧散装拼块。空状态零渲染（简单任务零开销）。
         """
         from agents.harness.context_builder import build_context
         mem_block = self.memory.context_block() if self.memory is not None else ""
@@ -1423,27 +1446,17 @@ class DecisionAgent(LLMAgent):
             v5_plan_block = self.plan_store.plan_block() if self.plan_store.active else ""
         except Exception:
             v5_plan_block = ""
-        v6_block = ""
-        if getattr(self, "v6_enabled", False):
-            try:
-                from agents.harness.context_organization import build_v6_context_view
-                open_qs = []
-                if self.memory is not None:
-                    open_qs = list(self.memory.read().get("open_questions") or [])[:5]
-                v6_block = build_v6_context_view(
-                    ledger=self.evidence_ledger,
-                    plan_store=self.plan_store,
-                    worklist=self.worklist,
-                    open_questions=open_qs,
-                    recent_arguments=None)
-            except Exception:
-                v6_block = ""
-        blocks = [b for b in (v5_plan_block, mem_block, state_block, v6_block) if b]
-        combined_mem = "\n\n".join(blocks)
+        combined_mem = "\n\n".join(
+            b for b in (v5_plan_block, mem_block, state_block) if b)
         return build_context(
             state, task_state=self.task_state,
             plan_tracker=getattr(self, "plan_tracker", None),
             memory_block=combined_mem, state_block="",
+            evidence_view=(self.evidence_view
+                           if getattr(self, "v6_enabled", False) else None),
+            plan_store=self.plan_store,
+            worklist=(self.worklist
+                      if getattr(self, "v6_enabled", False) else None),
         )
 
     def _messages_with_memory(self, state):
@@ -1602,11 +1615,20 @@ class DecisionAgent(LLMAgent):
         packet = self._knowledge_agent.answer(request)
         packet_json = json.dumps(packet, ensure_ascii=False)
 
-        # V6: packet facts/constraints → EvidenceLedger（knowledge_base 层）
+        # V6.1: packet facts → TaskStateV3（kb_rule 类型——唯一事实源,
+        # 不再经旁路 ledger。constraints 已由 _update_kb_constraints
+        # 进 KnowledgeStateExtractor,同一条数据流）
         if getattr(self, "v6_enabled", False):
             try:
-                from agents.harness.evidence_ledger import EvidenceLedger
-                EvidenceLedger.feed_packet_facts(self.evidence_ledger, packet)
+                from agents.harness.task_state_v3 import (
+                    KnowledgeStateExtractor, FT_KB_RULE)
+                for f in (packet.get("facts") or [])[:6]:
+                    if isinstance(f, dict) and f.get("claim"):
+                        self.task_state.set(
+                            "kb_fact", f["claim"][:120], f["claim"][:200],
+                            "knowledge",
+                            source_ref=f.get("source_doc_id") or "",
+                            fact_type=FT_KB_RULE)
             except Exception:
                 pass
 

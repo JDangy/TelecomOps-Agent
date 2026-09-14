@@ -306,29 +306,11 @@ class PlanStore:
         判定（确定性）：任一参数值（str 匹配）等于实体名/实体 ID——
         或在 Task State 中该实体对象的 id 字段值与参数值相等
         （account_sav_x 对象 .id = sav_x；调用 account_id="sav_x" 命中）。
+
+        V6 收紧:这是 PlanStore/Worklist 共享的**唯一**实体绑定谓词
+        （单一实现,worklist 挂在 PlanStore 步骤上复用它,不再各抄一份）。
         """
-        vals = [str(v) for v in (arguments or {}).values()
-                if v is not None and not isinstance(v, (dict, list))]
-        for e in entities:
-            e = str(e)
-            for v in vals:
-                if v == e or (e in v) or (v in e and len(v) >= 4):
-                    return e
-        # Task State 实体 ID 二次确认
-        if task_state is not None:
-            try:
-                for key, chain in getattr(task_state, "_entries", {}).items():
-                    cur = chain[-1]
-                    if not cur or not cur.is_current:
-                        continue
-                    if cur.field in ("id", "account_id", "card_id", "user_id"):
-                        for e in entities:
-                            if cur.object.endswith(e) or e in cur.object:
-                                if str(cur.value) in vals:
-                                    return e
-            except Exception:
-                pass
-        return None
+        return args_reference_entity(arguments, entities, task_state)
 
     # ------------------------------------------------------------------
     # 读取 / 渲染
@@ -387,3 +369,39 @@ class PlanStore:
         self._next_id = 1
         self._current_step_id = None
         self.guard_reminders = 0
+
+
+# ---------------------------------------------------------------------------
+# 共享实体绑定谓词（V6 收紧:PlanStore 与其上的 Worklist 用同一实现,
+# 推进口径永远一致——单一定义点）
+# ---------------------------------------------------------------------------
+def args_reference_entity(arguments: dict, entities: list,
+                          task_state=None) -> Optional[str]:
+    """调用参数是否引用了 entities 中的实体（确定性,两层）。
+
+    1. 字符串命中:任一参数值等于实体名/实体 ID,或互为子串
+       （短于 4 字符的子串不算——防误命中）。
+    2. Task State 实体 ID 二次确认:实体对象的 id 字段值出现在
+       参数值中（account_sav_x .id = sav_x;调用 account_id=sav_x 命中）。
+    """
+    vals = [str(v) for v in (arguments or {}).values()
+            if v is not None and not isinstance(v, (dict, list))]
+    for e in entities:
+        e = str(e)
+        for v in vals:
+            if v == e or (e in v) or (v in e and len(v) >= 4):
+                return e
+    if task_state is not None:
+        try:
+            for key, chain in getattr(task_state, "_entries", {}).items():
+                cur = chain[-1]
+                if not cur or not cur.is_current:
+                    continue
+                if cur.field in ("id", "account_id", "card_id", "user_id"):
+                    for e in entities:
+                        if cur.object.endswith(e) or e in cur.object:
+                            if str(cur.value) in vals:
+                                return e
+        except Exception:
+            pass
+    return None

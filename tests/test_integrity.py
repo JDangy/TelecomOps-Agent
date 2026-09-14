@@ -150,15 +150,16 @@ def test_v6_replay_no_hidden_information():
 
 
 def test_v6_runtime_no_gold_access():
-    """V6 runtime 模块（evidence_ledger/worklist/decision_checkpoint/
-    context_organization）不得访问 evaluator/gold 字段。
+    """V6.1 runtime 模块不得访问 evaluator/gold 字段 + 无 task 硬编码。
 
-    同 test_no_evaluator_field_access_in_runtime 的口径——V6 新模块
-    纳入 runtime 泄漏扫描范围。"""
-    v6_files = ["agents/harness/evidence_ledger.py",
+    1. 不访问 evaluation_criteria / gold actions / user_scenario
+       （泄漏扫描,同 test_no_evaluator_field_access_in_runtime 口径）。
+    2. 禁止 task_id/referral_task 式硬编码（用户指令 §6:解决通用
+       Agent failure,不刷 benchmark——源码级扫描）。"""
+    v6_files = ["agents/harness/evidence_view.py",
                 "agents/harness/worklist.py",
                 "agents/harness/decision_checkpoint.py",
-                "agents/harness/context_organization.py"]
+                "agents/harness/context_builder.py"]
     access_patterns = [
         re.compile(r"task\s*\[\s*['\"]evaluation_criteria['\"]\s*\]"),
         re.compile(r"task\s*\.\s*evaluation_criteria"),
@@ -167,6 +168,12 @@ def test_v6_runtime_no_gold_access():
         re.compile(r"['\"]gold_action"),
         re.compile(r"get_discoverable_tools\(\)"),
         re.compile(r"\.get\s*\(\s*['\"]user_scenario['\"]"),
+        # §6:task 硬编码禁令——只匹配**可执行条件**（if task==… /
+        # if referral_task:/force_query_tenure() 式变相分支）,
+        # 不匹配 docstring 里的 trace 归因叙述（那是设计依据,不是规则）
+        re.compile(r"if\s+.*\btask(_id)?\s*=="),
+        re.compile(r"if\s+\w*referral\w*\s*:"),
+        re.compile(r"force_(query|lookup|verify)_\w+\("),
     ]
     violations = []
     for f in v6_files:
@@ -182,7 +189,30 @@ def test_v6_runtime_no_gold_access():
                 if line.startswith("#") or '"""' in line[:4]:
                     continue
                 violations.append(f"{f}:{line_no}: {line[:60]}")
-    assert not violations, f"V6 runtime 泄漏: {violations[:5]}"
+    assert not violations, f"V6 runtime 泄漏/硬编码: {violations[:5]}"
+
+
+def test_no_task_hardcoding_in_runtime():
+    """agents/ 全目录禁止 task_id/referral_task 式硬编码（§6 通用性）。
+
+    扫描可执行代码（排除注释/docstring/trace 场景说明）。变量形式的
+    变相硬编码（if referral_task: force_query_tenure()）同禁——
+    匹配 task 语义条件分支调用特定工具的模式。"""
+    task_literal = re.compile(r"['\"]task_\d{2,4}['\"]")
+    task_cond = re.compile(r"if\s+\w*task\w*\s*(==|in\b)")
+    force_tools = re.compile(r"force_(query|lookup|verify)_\w+")
+    violations = []
+    for f in glob.glob(os.path.join(ROOT, "agents", "**", "*.py"),
+                       recursive=True):
+        content = open(f, encoding="utf-8").read()
+        for pat in (task_literal, task_cond, force_tools):
+            for m in pat.finditer(content):
+                line_no = content[:m.start()].count("\n") + 1
+                line = content.split("\n")[line_no - 1].strip()
+                if line.startswith("#") or '"""' in line[:4] or line.startswith("*"):
+                    continue
+                violations.append(f"{os.path.relpath(f, ROOT)}:{line_no}: {line[:60]}")
+    assert not violations, f"Runtime 疑似 task 硬编码: {violations[:5]}"
 
 
 def test_holdout_sealed():

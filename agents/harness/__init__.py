@@ -40,15 +40,17 @@ from agents.harness.validators import (
     EvidenceParameterValidation,
     SchemaValidation,
 )
-# V6.0: Stateful, Evidence-Grounded Runtime 三件套 + context 分层视图
-from agents.harness.evidence_ledger import EvidenceLedger, EvidenceRecord
+# V6.1（架构收紧）: TaskState 唯一事实源之上的三个只读/派生模块。
+# - EvidenceView: TaskStateV3 → 分层证据视图（零存储,现算）
+# - Worklist:    PlanStore 步骤的条目级展开（挂在 step 下,单一来源）
+# - DecisionCheckpoint: 关键动作前的 6 问检查点（轻量,无额外 LLM 调用）
+from agents.harness.evidence_view import EvidenceView
 from agents.harness.worklist import Worklist, WorkItem
 from agents.harness.decision_checkpoint import (
     DecisionCheckpoint,
     CheckpointArtifact,
     should_trigger_checkpoint,
 )
-from agents.harness.context_organization import build_v6_context_view
 
 __all__ = [
     "ActionHarness",
@@ -74,13 +76,11 @@ __all__ = [
     "ValidationPolicy",
     "ValidationVerdict",
     "norm_param_name",
-    # V6.0
-    "EvidenceLedger",
-    "EvidenceRecord",
+    # V6.1（架构收紧）
+    "EvidenceView",
     "Worklist",
     "WorkItem",
     "DecisionCheckpoint",
     "CheckpointArtifact",
     "should_trigger_checkpoint",
-    "build_v6_context_view",
 ]

@@ -1,6 +1,17 @@
-"""Context Builder（V4）—— DA 每轮看到什么。
+"""Context Builder（V4/V5/V6.1）—— DA 每轮 context 的统一出口。
 
-三层渐进（对照验收 1/6/7/8）：
+收紧原则（用户指令 §3）:其他模块只提供【信息】,不各自拼 context:
+    TaskState        → 状态块（V3 已有）
+    Plan / Worklist  → 计划块 + 条目块
+    Evidence View    → 证据分层块（confirmed/unverified/policy）
+    Decision State   → checkpoint 待决块（由 agent 注入的 system 尾注,
+                        不经过本模块）
+    Recent Tool Result → 历史窗口（存根化策略,本模块的 V4 职责）
+
+    最后全部由 ContextBuilder 统一整理给 Decision Agent——本模块
+    是唯一的 context 组装点,不再有平行的 context 模块。
+
+三层渐进（V4 原有,保留不动）：
   短任务    → V3 原路径（memory block + task state block，全量历史）
   Plan Mode → 追加 Goal/Progress block + 近期窗口
   历史变长  → 旧 Tool Result 轻量化（事实已入 Task State 的原始
@@ -17,6 +28,13 @@
       "[tool result archived: <已入库实体摘要>]（全文在 trace，不需要重看）"
   harness 拒绝的 error ToolMessage 保留（修正依据）；ask packet 保留
   近期部分（知识来源）；纯文本用户消息不替换（对白是任务语义）。
+
+V6.1 增量（全部经同一出口,无平行模块）:
+  - evidence_block: EvidenceView 四段视图（confirmed / unverified /
+    policy / conflict / preference）,空状态零渲染
+  - worklist_block: 大步骤下的未完成条目视图（[x]/[ ] 形态）,
+    空状态零渲染
+  - current_date 前置（时间锚点,P1——任何"有效期/资格"判断的第一依据）
 """
 
 from __future__ import annotations
@@ -29,25 +47,160 @@ RECENT_WINDOW = 12
 # 触发轻量化的历史长度下限（更长才开始清旧 ToolResult）
 COMPACT_TRIGGER = 24
 
+# 各注入块的预算（防膨胀）
+MAX_CONFIRMED = 6
+MAX_UNVERIFIED = 4
+MAX_POLICY = 4
+MAX_PREFERENCES = 3
+MAX_WORK_ITEMS = 8
+BLOCK_MAX_CHARS = 1200
 
+
+# ---------------------------------------------------------------------------
+# V6.1 证据分层块（EvidenceView → 注入文本;ContextBuilder 唯一渲染点）
+# ---------------------------------------------------------------------------
+def evidence_block(evidence_view, max_chars: int = BLOCK_MAX_CHARS) -> str:
+    """TaskStateV3 → 四段证据视图（空状态返回 ''——简单任务零开销）。
+
+    组织（按事实类型分层,不按来源排名）:
+        CONFIRMED FACTS       system_fact（工具/系统确认;时间锚点前置）
+        UNVERIFIED CLAIMS     user_statement（用户说的,未对齐系统）
+        USER PREFERENCES      user_preference（用户本人权威——不需要
+                              系统验证,标注给决策层直接采信）
+        POLICY RULES          kb_rule（KB 硬规则）
+    矛盾 key 附加在 UNVERIFIED 段（用户说法与系统记录不一致时显式
+    暴露——054/100 形态的确定性可见性）。
+    """
+    if evidence_view is None:
+        return ""
+    sections = []
+    confirmed = evidence_view.confirmed_system_facts(MAX_CONFIRMED)
+    if confirmed:
+        lines = ["[Evidence — confirmed by system records:]"]
+        for r in confirmed:
+            v = str(r.value)
+            if len(v) > 90:
+                v = v[:90] + "…"
+            ref = f" [from {r.source_ref}]" if r.source_ref else ""
+            lines.append(f"- {r.key} = {v}{ref}")
+        sections.append("\n".join(lines))
+    unver = evidence_view.unverified_user_claims(MAX_UNVERIFIED)
+    conflicts = set(evidence_view.conflict_keys())
+    if unver:
+        lines = ["[Evidence — stated by user, NOT yet verified by system "
+                 "records — verify before relying on them:]"]
+        for r in unver:
+            v = str(r.value)
+            if len(v) > 90:
+                v = v[:90] + "…"
+            flag = "  ! contradicts system record" if r.key in conflicts else ""
+            lines.append(f"- {r.key} ≈ {v}{flag}")
+        sections.append("\n".join(lines))
+    prefs = evidence_view.user_preferences(MAX_PREFERENCES)
+    if prefs:
+        lines = ["[User preferences — the user is the authority on these:]"]
+        for r in prefs:
+            v = str(r.value)
+            if len(v) > 90:
+                v = v[:90] + "…"
+            lines.append(f"- {r.key} = {v}")
+        sections.append("\n".join(lines))
+    policy = evidence_view.policy_rules(MAX_POLICY)
+    if policy:
+        lines = ["[Knowledge-base rules (hard constraints):]"]
+        for r in policy:
+            v = str(r.value)
+            if len(v) > 110:
+                v = v[:110] + "…"
+            doc = f" [doc: {r.source_ref}]" if r.source_ref else ""
+            lines.append(f"- {r.key}: {v}{doc}")
+        sections.append("\n".join(lines))
+    if not sections:
+        return ""
+    text = "\n\n".join(sections)
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n... (evidence view truncated)"
+    return text
+
+
+# ---------------------------------------------------------------------------
+# V6.1 Worklist 块（PlanStore 步骤 → 条目级视图）
+# ---------------------------------------------------------------------------
+def worklist_block(plan_store, worklist,
+                   max_items: int = MAX_WORK_ITEMS,
+                   max_chars: int = 700) -> str:
+    """大步骤下的条目级进度视图（空状态返回 ''）。
+
+    形态（对照用户指令 §2 的展开关系）:
+        [Worklist — per-object progress under the current plan:]
+        GOAL: <PlanStore.goal>
+        - dispute transaction A (object: txn_A) [x]
+        - dispute transaction B (object: txn_B) [ ]
+        已完成 N 条
+    条目挂在大步骤下渲染（step 描述为行前缀——"一个大步骤下面有
+    哪些具体对象还没处理"）;状态图标区分完成/未完成/失败。
+    """
+    if plan_store is None or worklist is None or not len(worklist):
+        return ""
+    lines = ["[Worklist — per-object progress under the current plan:]"]
+    if getattr(plan_store, "goal", None):
+        lines.append(f"GOAL: {str(plan_store.goal)[:200]}")
+    icons = {"completed": "[x]", "in_progress": "[~]", "pending": "[ ]",
+             "failed": "[!]", "blocked": "[=]"}
+    order = {"in_progress": 0, "pending": 1, "failed": 2, "blocked": 3}
+    items = sorted(worklist.unfinished(),
+                   key=lambda it: order.get(it.status, 9))
+    step_desc = {}
+    for s in plan_store.steps:
+        step_desc[s.step_id] = (s.description or "")[:60]
+    for it in items[:max_items]:
+        icon = icons.get(it.status, "[ ]")
+        desc = step_desc.get(it.step_id, "")
+        note = f"  note: {it.note}" if it.note else ""
+        lines.append(f"{icon} {desc} (object: {it.entity}){note}")
+    done = worklist.completed()
+    if done:
+        ents = ", ".join(it.entity for it in done[:6])
+        more = f" (+{len(done) - 6} more)" if len(done) > 6 else ""
+        lines.append(f"[x] {len(done)} item(s) completed: {ents}{more}")
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n... (worklist truncated)"
+    return text
+
+
+# ---------------------------------------------------------------------------
+# 统一出口（V4 原签名 + V6.1 两个可选输入）
+# ---------------------------------------------------------------------------
 def build_context(state, task_state, plan_tracker,
                   memory_block: str = "",
-                  state_block: str = "") -> list:
-    """构造 DA 本轮消息视图（确定性替换，零 LLM）。
+                  state_block: str = "",
+                  evidence_view=None,
+                  plan_store=None,
+                  worklist=None) -> list:
+    """构造 DA 本轮消息视图（确定性替换，零 LLM）——统一出口。
 
     Args:
         state: tau2 AgentState（system_messages + messages）
         task_state: TaskStateV3（判断哪些 ToolResult 已外部化）
         plan_tracker: PlanTracker（Goal/Progress block）
         memory_block / state_block: V3 已有的注入块
+        evidence_view: EvidenceView（V6.1 证据分层块来源;None = 无块）
+        plan_store + worklist: V6.1 条目块来源（None = 无块）
     Returns:
         消息列表（不修改 state 本身——副本替换）。
     """
     msgs = list(state.messages)
     plan_block = plan_tracker.progress_block() if plan_tracker else ""
 
-    # 组装 system 尾部块
-    blocks = [b for b in (memory_block, state_block, plan_block) if b]
+    # V6.1: 证据块 + 条目块（空状态零渲染——简单任务零开销）
+    ev_block = evidence_block(evidence_view)
+    wl_block = (worklist_block(plan_store, worklist)
+                if (worklist is not None and plan_store is not None) else "")
+
+    # 组装 system 尾部块（顺序:计划 → 记忆 → 状态 → 条目 → 证据）
+    blocks = [b for b in (plan_block, memory_block, state_block,
+                          wl_block, ev_block) if b]
     if not plan_tracker or not plan_tracker.plan:
         # 非 Plan Mode：V3 路径（全量历史 + blocks）
         return _with_system(state, blocks) + msgs

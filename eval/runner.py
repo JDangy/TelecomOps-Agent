@@ -350,47 +350,33 @@ def _memory_metrics(events, ka_retr, hands, results) -> dict:
 
 
 def _v6_runtime_metrics(events: list) -> dict:
-    """V6.0 runtime 机制指标（无 V6 事件时返回空 dict——V5 回退形态）。
+    """V6.1 runtime 机制指标（无 V6 事件时返回空 dict——V5 回退形态）。
 
-    覆盖:证据账本（provenance 分布/supersede）、worklist（推进/完成/
-    失败）、checkpoint（触发/missing/决策/提示）——归因四分法的
-    事件计数（State/Decision/Action/Update 各环）。
+    覆盖:worklist（创建/完成/失败/移除）、checkpoint（触发/missing/
+    预算）。证据分层不产生独立事件——TaskStateV3 的 state_write/
+    state_update 已含全部事实变更（唯一事实源的直接好处:State 环
+    归因看 state_* 事件即可,无需第二套 evidence_* 事件流）。
     """
-    has_v6 = any(e["event_type"].startswith(("evidence_", "work_item_",
-                                             "checkpoint_"))
+    has_v6 = any(e["event_type"].startswith(("work_item_", "checkpoint_"))
                  for e in events)
     if not has_v6:
         return {}
-    ev_types = ("evidence_record_added", "evidence_superseded",
-                "work_item_created", "work_item_progressed",
-                "work_item_completed", "work_item_failed",
+    ev_types = ("work_item_created", "work_item_completed",
+                "work_item_failed", "work_item_removed",
                 "checkpoint_triggered", "checkpoint_missing_evidence",
-                "checkpoint_decision", "checkpoint_prompt_injected",
-                "checkpoint_budget_exhausted",
-                "checkpoint_prompt_suppressed")
+                "checkpoint_budget_exhausted")
     counts = {t: 0 for t in ev_types}
-    prov_counts: dict = {}
-    cp_decisions: dict = {}
     for e in events:
         et = e.get("event_type")
         if et in counts:
             counts[et] += 1
-        if et == "evidence_record_added":
-            p = e.get("provenance")
-            prov_counts[p] = prov_counts.get(p, 0) + 1
-        if et == "checkpoint_decision":
-            s = e.get("status")
-            cp_decisions[s] = cp_decisions.get(s, 0) + 1
-    out = {"v6_evidence_records": counts["evidence_record_added"],
-           "v6_evidence_superseded": counts["evidence_superseded"],
-           "v6_evidence_by_provenance": prov_counts,
-           "v6_work_items_created": counts["work_item_created"],
+    out = {"v6_work_items_created": counts["work_item_created"],
            "v6_work_items_completed": counts["work_item_completed"],
            "v6_work_items_failed": counts["work_item_failed"],
+           "v6_work_items_removed": counts["work_item_removed"],
            "v6_checkpoints_triggered": counts["checkpoint_triggered"],
            "v6_checkpoint_missing_evidence": counts["checkpoint_missing_evidence"],
-           "v6_checkpoint_decisions": cp_decisions,
-           "v6_checkpoint_prompts": counts["checkpoint_prompt_injected"]}
+           "v6_checkpoint_budget_exhausted": counts["checkpoint_budget_exhausted"]}
     # 只保留非零项（trace 简洁;零值由缺键表达）
     return {k: v for k, v in out.items() if v}
 

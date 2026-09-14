@@ -1,38 +1,40 @@
-"""Worklist（V6.0）—— Goal/未完成事项的条目级表达。
+"""Worklist（V6.1 架构收紧）—— PlanStore 大步骤下的条目级展开。
 
-动机（Frozen V5 Dev24 trace 归因,docs/v6_design.md §2-B）:
+动机（用户收紧指令 §2 + Frozen V5 Dev24 trace 归因 docs/v6_design.md §2-B）:
     task_026（6 笔 transaction 的 dispute→correction）:33 次工具调用
-    交错重复,Phase 2 的 update 反复穿插重新查询,max_steps。
-    task_080（5 张卡 freeze/unfreeze/close/order + 3 dispute）:
-    42 次调用,unfreeze 了 3 张卡（gold 只 1 张）,漏查 pending
-    transactions,最后 activate 缺席 → max_steps。
-    task_077:47 次调用,close→unfreeze→close 循环。
+    交错重复;task_080（5 卡 freeze/unfreeze/close/order）:unfreeze 了
+    3 张卡（gold 只 1 张）+ 漏 activate;task_077:close→unfreeze→close
+    循环。V5 PlanStep 是"步骤意图",多实体任务里一个 step 没有逐实体
+    粒度,agent 靠记忆在 N 个对象间往返。
 
-    V5 PlanStore 的 PlanStep 是"步骤意图",多实体任务里一个 step
-    （"dispute all incorrect transactions"）没有 per-entity 粒度,
-    完成推进在多实体下歧义不推进（宁 pending 不猜——正确但导致
-    步骤状态长期 pending,agent 无法从 plan 视图知道"哪笔已完成"）。
+正确关系（§2 原文）:
+    PlanStore
+    大步骤：处理所有异常交易
+        ↓ 展开
+    Worklist
+    transaction A / transaction B / transaction C
 
-设计（严格对照用户 V6 指令 §三-2）:
-    - 不删除/不重写 PlanStore —— Worklist 是 PlanStore 之上的轻量层:
-      从带 entities 的 PlanStep **展开** per-entity 条目。
-    - tool-result-driven（V5 已验证原则）:on_tool_result 与
-      PlanStore.on_tool_result 同口径（tool_hint + 实体绑定）,
-      绝不由 LLM 声明"完成"推进。
-    - 失败 → failed,不误标完成（用户测试要求 #4）。
-    - 通用结构:（goal 语义, entities, tool_hint）,无任何
-      task/domain 硬编码——适用于多 dispute/多卡/多账户/多流程。
+    Worklist 只是"一个大步骤下面有哪些具体对象还没处理"。
+    完成情况必须根据真实 Tool Result 更新。
 
-与 PlanStore 的分工:
-    PlanStep = "还要做什么"的步骤意图（含无实体的顺序步骤）
-    WorkItem = "每个实体的完成条目"（只从带 entities 的步骤派生,
-    外加 runtime 观察（工具结果里的实体集）补充——见 sync_from_state）
+收紧要点（与上一版 V6 的差异）:
+    1. WorkItem 挂在 PlanStep 下（step_id 反向引用）——不是独立清单。
+       条目的生命周期 = 步骤的生命周期:步骤 removed → 条目移除。
+    2. 唯一来源是 plan 步骤的展开——上一版的 observe_entities
+       （"runtime 观察"旁路补条目）已删:脱离 plan 的第二入口正是
+       "第二套 Plan"的开端,不做。
+    3. 实体绑定谓词复用 plan_store.args_reference_entity（单一实现,
+       推进口径永远与 PlanStore 一致）。
+    4. 渲染不在这里——ContextBuilder 是 context 的统一出口
+       （本模块只提供数据结构 + 状态查询）。
+    5. tool-result-driven,ok=False → failed,幂等,与 PlanStore 同语义。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Optional
+
+from agents.harness.plan_store import args_reference_entity
 
 # 条目状态（与 PlanStore 对齐）
 PENDING = "pending"
@@ -44,126 +46,151 @@ BLOCKED = "blocked"
 ACTIVE = (PENDING, IN_PROGRESS, BLOCKED, FAILED)
 
 
-@dataclass
 class WorkItem:
-    item_id: int
-    goal: str                 # 业务语义（"dispute transaction A"）
-    tool_hint: Optional[str] = None
-    entities: list = field(default_factory=list)   # 实体 ID/对象名
-    status: str = PENDING
-    source: str = "plan"      # plan（步骤展开）/ runtime（观察派生）
-    note: Optional[str] = None
-    _bound_tool: Optional[str] = None   # 实际推进它的工具（观察记录）
+    """一个具体对象的完成条目（挂在 PlanStep 下）。
+
+    不再是独立 dataclass 状态机——就是步骤实体的进度载体。
+    """
+
+    __slots__ = ("step_id", "entity", "status", "note", "bound_tool")
+
+    def __init__(self, step_id: int, entity: str, status: str = PENDING):
+        self.step_id: int = step_id           # 父 PlanStep.step_id
+        self.entity: str = str(entity)        # 具体对象（ID/对象名）
+        self.status: str = status
+        self.note: Optional[str] = None
+        self.bound_tool: Optional[str] = None  # 实际推进它的工具（观察记录）
 
     def to_dict(self) -> dict:
-        return {"id": self.item_id, "goal": self.goal,
-                "status": self.status, "tool_hint": self.tool_hint,
-                "entities": self.entities, "source": self.source,
-                "note": self.note}
+        return {"step_id": self.step_id, "entity": self.entity,
+                "status": self.status, "note": self.note}
 
 
 class Worklist:
-    """条目级未完成事项（确定性,零 LLM）。
+    """PlanStore 之上的条目级进度（确定性,零 LLM,零独立来源）。
 
-    trace 事件实时 emit（work_item_*）——与 PlanStore 的 plan_* 事件
-    同模式,由调用方或本类直接发（recorder 缺失静默）。
+    数据流（单向,只有一个写入路径）:
+        PlanStore.write_plan/update_plan
+            → sync_from_plan 展开/同步（结构派生）
+        Tool Result（真实执行）
+            → on_tool_result 推进（与 PlanStore.on_tool_result 同口径）
+
+    生命周期语义（与 PlanStore 一致,worklist 不自造第二套）:
+        - 步骤 removed / 计划重写 → 条目随之消失/重建（step_id 变更
+          → 新条目）。重写后条目回到 pending 是 PlanStore 本身的语义
+          （重写 = 重新声明意图）,worklist 跟随,不加"完成缓存"。
+        - 推进只认 (tool_hint, entity) + 真实 Tool Result,与 PlanStore
+          的推进条件完全一致——两处进度永远同源。
     """
 
     def __init__(self):
-        self.goal: Optional[str] = None      # 总目标（从 PlanStore.goal 同步）
-        self.items: list[WorkItem] = []
-        self._next_id = 1
+        self._items: dict[tuple[int, str], WorkItem] = {}  # (step_id, entity) → item
 
     # ------------------------------------------------------------------
-    # 从 PlanStore 同步（展开,不替代）
+    # 从 PlanStore 同步（展开,不替代,幂等）
     # ------------------------------------------------------------------
     def sync_from_plan(self, plan_store) -> int:
-        """把 PlanStore 当前 active 计划的带-entities 步骤展开成条目。
+        """把 active 计划中带 entities 的步骤展开成条目。
 
         规则（全确定性）:
-        - 只处理 status ∈ ACTIVE 的步骤（completed/removed 的跳过——
-          其实体若已有条目则按步骤完成状态初始化条目状态）。
-        - step.entities 非空 → 每个实体一条 WorkItem
-          （goal = step description,tool_hint 同步骤）。
-        - step.entities 空 → 不生成条目（无实体粒度,归 PlanStep 管）。
-        - 幂等:同一（goal 文本, entity）已存在 → 不重复创建;
-          已 COMPLETED 的条目不被重新同步为 pending（防 plan 重写
-          把已完成事项"抹掉"——026 的 plan 二次 write 场景）。
-        返回新建条数。
+        - step.entities 非空 → 每个实体一条 WorkItem（挂在 step_id 下）
+        - step.entities 空 → 不生成条目（无实体粒度,归 PlanStep 自己管）
+        - 步骤已真实完成的（completed/failed/blocked）→ 条目按步骤状态
+          初始化（plan 重写防"抹掉"已完成——026 的二次 write 场景）
+        - 步骤 removed → 条目移除（步骤没了,条目随之消失）
+        - 幂等:已存在且非 pending 的条目不被重置
+        返回净新增条数。
         """
         if plan_store is None or not plan_store.active:
+            # 计划清空/未建 → 条目全部移除（Worklist 不能脱离 plan 存在）
+            removed = len(self._items)
+            self._items.clear()
             return 0
-        self.goal = plan_store.goal
         created = 0
+        # 1) 移除不存在/已 removed 步骤的条目（步骤没了,条目随之消失）
+        live_steps = {s.step_id for s in plan_store.steps
+                      if s.status != "removed"}
+        for key in [k for k in self._items if k[0] not in live_steps]:
+            self._emit("work_item_removed", self._items.pop(key))
+        # 2) 展开带 entities 的步骤
         for step in plan_store.steps:
             if not getattr(step, "entities", None):
                 continue
             if step.status == "removed":
                 continue
             for ent in step.entities:
-                key = (str(step.description), str(ent))
-                if self._find_by_key(key) is not None:
+                key = (step.step_id, str(ent))
+                if key in self._items:
                     continue
                 status = PENDING
                 if step.status == "completed":
-                    status = COMPLETED   # 步骤已真实完成 → 条目已完成
+                    status = COMPLETED
                 elif step.status == "failed":
                     status = FAILED
                 elif step.status == "blocked":
                     status = BLOCKED
                 elif step.status == "in_progress":
                     status = IN_PROGRESS
-                item = WorkItem(
-                    item_id=self._next_id, goal=str(step.description)[:200],
-                    tool_hint=step.tool_hint, entities=[str(ent)],
-                    status=status, source="plan")
-                self.items.append(item)
-                self._next_id += 1
+                item = WorkItem(step_id=step.step_id, entity=ent,
+                                status=status)
+                self._items[key] = item
                 created += 1
-                self._emit("work_item_created", item)
+                self._emit("work_item_created", item,
+                           goal=str(getattr(step, "description", ""))[:120])
         return created
 
     # ------------------------------------------------------------------
     # tool-result-driven 推进（与 PlanStore.on_tool_result 同口径）
     # ------------------------------------------------------------------
-    def on_tool_result(self, inner_tool: str, ok: bool,
-                       arguments: dict, task_state=None) -> list[WorkItem]:
+    def on_tool_result(self, plan_store, inner_tool: str, ok: bool,
+                       arguments: dict, task_state=None) -> list:
         """一次内层工具执行结束 → 推进匹配条目。
 
-        匹配（确定性,两层——沿用 PlanStore 已验证语义）:
-        1. tool_hint == inner_tool 的 ACTIVE 条目集合 M
-        2. M 中条目:调用参数引用其 entity（字符串命中或 Task State
-           实体 ID 二次确认）→ 候选;唯一候选才推进（多候选歧义保持
-           现状——宁可不推进,不猜）。
-        3. hint 缺失/不匹配的条目:仅在工具结果**携带新实体**时由
-           runtime 观察补充（见 observe_entities）,不在这里猜。
-
-        ok=True → completed（记 _bound_tool）
-        ok=False → failed（note 带工具名）——**绝不 completed**（测试 #4）
-        已 completed 的条目再次匹配成功 → 幂等 no-op（防重复调用重置,
-        026 形态）。
-        返回被推进（或失败）的条目列表（trace 用）。
+        匹配（确定性,两层——与 PlanStore.on_tool_result 完全同口径,
+        绑定谓词共用 plan_store.args_reference_entity）:
+        1. 候选 = 条目的父步骤 tool_hint == inner_tool（或父步骤无 hint
+           且是 current in_progress——与 PlanStore 无-hint 回退同条件）
+        2. 候选中调用参数引用其 entity → 唯一命中才推进（多命中歧义
+           → 不动,宁可不推进,不猜）
+        ok=True → completed（记 bound_tool）
+        ok=False → failed（note 带工具名）——绝不 completed
+        已 completed 再次匹配成功 → 幂等 no-op（重复调用不重置）
+        返回被推进/失败的条目列表（trace 用）。
         """
         progressed: list[WorkItem] = []
-        if not self.items or not inner_tool:
+        if not self._items or not inner_tool or plan_store is None:
             return progressed
-        matches = [it for it in self.items
-                   if it.tool_hint == inner_tool and it.status in ACTIVE]
+        # 无-hint 回退条件（与 PlanStore 一致:current step 且 in_progress）
+        cur_step = None
+        try:
+            cur_step = plan_store._current_in_progress_step()
+        except Exception:
+            cur_step = None
         candidates = []
-        for it in matches:
-            hit = self._args_reference_entity(arguments, it.entities, task_state)
-            if hit:
-                candidates.append((it, hit))
+        for key, item in self._items.items():
+            if item.status not in ACTIVE and item.status != COMPLETED:
+                continue
+            step = next((s for s in plan_store.steps
+                         if s.step_id == item.step_id), None)
+            if step is None or step.status == "removed":
+                continue
+            hint = getattr(step, "tool_hint", None)
+            hint_hit = (hint == inner_tool) or (
+                hint in (None, "") and step is cur_step)
+            if not hint_hit:
+                continue
+            if args_reference_entity(arguments, [item.entity], task_state):
+                candidates.append(item)
         if len(candidates) != 1:
             # 无候选/多候选歧义 → 不动（有明确依据才动）
             return progressed
-        item = candidates[0][0]
+        item = candidates[0]
         if item.status == COMPLETED:
             return progressed  # 幂等
         if ok:
             item.status = COMPLETED
             item.note = None
-            item._bound_tool = inner_tool
+            item.bound_tool = inner_tool
             progressed.append(item)
             self._emit("work_item_completed", item, tool=inner_tool)
         else:
@@ -175,125 +202,34 @@ class Worklist:
         return progressed
 
     # ------------------------------------------------------------------
-    # runtime 观察补充（多实体任务的"漏掉的对象"可见性——080 形态）
+    # 查询（ContextBuilder/ checkpoint 的数据来源）
     # ------------------------------------------------------------------
-    def observe_entities(self, entities: list, goal_hint: str = "",
-                         tool_hint: str = None) -> int:
-        """工具结果里发现的新实体集 → 对称补条目（防"只做一半"）。
+    def items_for_step(self, step_id: int) -> list:
+        """某步骤下的全部条目（按 entity 插入序）。"""
+        return [it for (sid, _), it in sorted(self._items.items())
+                if sid == step_id]
 
-        场景（通用,非 task 特定）:用户目标涉及 N 个实体（3 张卡、
-        6 笔交易）,plan 里只有部分实体有条目。当工具结果暴露完整
-        实体集（如 get_debit_cards 返回 3 张卡）且 goal_hint 非空时,
-        为"同 goal_hint、无条目"的实体补 PENDING 条目。
-        幂等:（goal_hint, entity）已存在任何条目 → 跳过。
-        返回补充条数。**保守**:goal_hint 为空不补（无语义锚不猜）。
-        """
-        if not entities or not goal_hint:
-            return 0
-        existing = {(it.goal, e) for it in self.items for e in it.entities}
-        created = 0
-        for ent in entities:
-            key = (goal_hint, str(ent))
-            if key in existing:
-                continue
-            item = WorkItem(item_id=self._next_id,
-                            goal=str(goal_hint)[:200],
-                            tool_hint=tool_hint, entities=[str(ent)],
-                            status=PENDING, source="runtime")
-            self.items.append(item)
-            self._next_id += 1
-            created += 1
-            self._emit("work_item_created", item)
-        return created
-
-    # ------------------------------------------------------------------
-    # 查询/渲染
-    # ------------------------------------------------------------------
-    def unfinished(self) -> list[WorkItem]:
+    def unfinished(self) -> list:
         """未完成条目（pending/in_progress/failed/blocked）。
-        多实体任务只要有一条未完成 → 非空（测试 #5:不会只完成
-        一个就整体结束的可见性基础）。"""
-        return [it for it in self.items if it.status in ACTIVE]
+
+        多实体任务只要有一条未完成 → 非空（"不会只完成一个就整体
+        结束"的可见性基础——guard 消费此查询）。
+        """
+        return [it for it in self._items.values() if it.status in ACTIVE]
 
     @property
     def has_unfinished(self) -> bool:
         return bool(self.unfinished())
 
-    def completed(self) -> list[WorkItem]:
-        return [it for it in self.items if it.status == COMPLETED]
+    def completed(self) -> list:
+        return [it for it in self._items.values() if it.status == COMPLETED]
 
-    def render_block(self, max_items: int = 10, max_chars: int = 700) -> str:
-        """渲染注入 context 的 worklist 视图。
-
-        组织（对照用户 V6 指令 §三-2 的 [x]/[ ] 形态）:
-            GOAL 行 + 当前条目优先（in_progress→pending→failed）+
-            已完成摘要（压缩一行计数 + 实体列表）。
-        无条目时返回空串（简单任务零开销——保护 001/004 路径）。
-        """
-        if not self.items:
-            return ""
-        icons = {COMPLETED: "[x]", IN_PROGRESS: "[~]", PENDING: "[ ]",
-                 FAILED: "[!]", BLOCKED: "[=]"}
-        lines = []
-        if self.goal:
-            lines.append(f"GOAL: {self.goal}")
-        # 当前优先
-        order = {IN_PROGRESS: 0, PENDING: 1, FAILED: 2, BLOCKED: 3}
-        active_items = sorted(self.unfinished(),
-                              key=lambda it: order.get(it.status, 9))
-        for it in active_items[:max_items]:
-            icon = icons.get(it.status, "[ ]")
-            ent = it.entities[0] if len(it.entities) == 1 else str(it.entities)
-            note = f"  note: {it.note}" if it.note else ""
-            lines.append(f"{icon} {it.goal} (object: {ent}){note}")
-        done = self.completed()
-        if done:
-            ents = ", ".join(it.entities[0] for it in done[:6])
-            more = f" (+{len(done) - 6} more)" if len(done) > 6 else ""
-            lines.append(f"[x] {len(done)} item(s) completed: {ents}{more}")
-        text = "\n".join(lines)
-        if len(text) > max_chars:
-            text = text[:max_chars] + "\n... (worklist truncated)"
-        return text
+    def __len__(self) -> int:
+        return len(self._items)
 
     # ------------------------------------------------------------------
-    # 内部
+    # trace（实时 emit;无 recorder 静默）
     # ------------------------------------------------------------------
-    def _find_by_key(self, key: tuple) -> Optional[WorkItem]:
-        goal, ent = key
-        for it in self.items:
-            if it.goal == goal and ent in it.entities:
-                return it
-        return None
-
-    @staticmethod
-    def _args_reference_entity(arguments: dict, entities: list,
-                               task_state) -> Optional[str]:
-        """调用参数是否引用条目实体（与 PlanStore._args_reference_entity
-        同口径:字符串命中 + Task State 实体 ID 二次确认）。"""
-        vals = [str(v) for v in (arguments or {}).values()
-                if v is not None and not isinstance(v, (dict, list))]
-        for e in entities:
-            e = str(e)
-            for v in vals:
-                if v == e or (e in v) or (v in e and len(v) >= 4):
-                    return e
-        if task_state is not None:
-            try:
-                for key, chain in getattr(task_state, "_entries", {}).items():
-                    cur = chain[-1] if chain else None
-                    if not cur or not cur.is_current:
-                        continue
-                    if cur.field in ("id", "account_id", "card_id", "user_id",
-                                     "transaction_id"):
-                        for e in entities:
-                            if cur.object.endswith(e) or e in cur.object:
-                                if str(cur.value) in vals:
-                                    return e
-            except Exception:
-                pass
-        return None
-
     def _emit(self, event_type: str, item: WorkItem, **extra) -> None:
         try:
             from eval.instrumentation import get_active_recorder
@@ -305,13 +241,10 @@ class Worklist:
         try:
             rec.emit(event_type, "decision_agent",
                      parent_span_id=getattr(rec, "task_span_id", None),
-                     item_id=item.item_id, goal=item.goal[:120],
-                     entities=item.entities, status=item.status,
-                     source=item.source, **extra)
+                     step_id=item.step_id, entity=item.entity[:80],
+                     status=item.status, **extra)
         except Exception:
             pass
 
     def reset(self) -> None:
-        self.goal = None
-        self.items = []
-        self._next_id = 1
+        self._items.clear()

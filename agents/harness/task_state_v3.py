@@ -17,9 +17,25 @@ V3 核心改变：状态有"属于谁"的概念——
     object    —— 业务对象（request 请求 / 实体 ID 对象 / 规则命名空间）
     field     —— 对象的字段（amount / id / status / allowed_values …）
     value     —— 值
-    source    —— user / tool / knowledge
+    source    —— user / tool / knowledge（这条记录是怎么来的）
+    fact_type —— 这条记录属于什么类型的事实（V6 收紧新增,见下）
     source_ref —— 具体引用（工具名 / doc_id / user 轮次）
     seq       —— 写入顺序
+
+fact_type（事实类型——V6 架构收紧的核心字段）:
+    system_fact      系统里的客观状态（余额、开户日期、卡状态、当前日期）
+    user_statement   用户口头陈述（"大概四个月"、"我说过要转 500"）
+    kb_rule          知识库业务规则（enum 集合、阈值、格式约束）
+    user_preference  用户的意愿/偏好（要不要加急、想选哪个方案、怎么称呼）
+
+    authority（权威来源）由 fact_type 决定,不做全局 source 排名:
+        system_fact     → 系统工具最可信（用户说错以工具为准）
+        kb_rule         → KB 最可信
+        user_preference → 用户本人最可信（系统无权代答）
+        user_statement  → 默认 unverified,待工具/KB 对齐
+    这正是"账户开户时间问工具、业务规则问 KB、想不想加急问用户"的
+    通用化——由【写入方】按提取规则声明事实类型,查询方按类型表判定,
+    任何模块都不做全局 provenance 排名,也不做 task/domain 硬编码。
 
 Supersede 语义（用户改口）：
     同一 (object, field) 重复写入 → 历史保留（trace 可查），
@@ -43,6 +59,31 @@ from typing import Any, Optional
 # ---------------------------------------------------------------------------
 # 数据模型
 # ---------------------------------------------------------------------------
+# 事实类型（V6 收紧:authority 由事实类型决定,非全局 source 排名）
+FT_SYSTEM_FACT = "system_fact"
+FT_USER_STATEMENT = "user_statement"
+FT_KB_RULE = "kb_rule"
+FT_USER_PREFERENCE = "user_preference"
+
+FACT_TYPES = (FT_SYSTEM_FACT, FT_USER_STATEMENT, FT_KB_RULE,
+              FT_USER_PREFERENCE)
+
+# 类型 → 权威来源（EvidenceView 据此给记录标 authority,零硬编码）
+AUTHORITY_BY_TYPE = {
+    FT_SYSTEM_FACT: "system",
+    FT_KB_RULE: "knowledge_base",
+    FT_USER_PREFERENCE: "user",
+    FT_USER_STATEMENT: "unverified",   # 待工具/KB 对齐
+}
+
+# source → 默认 fact_type（写入方未显式声明时的通用映射）
+_DEFAULT_FACT_TYPE = {
+    "user": FT_USER_STATEMENT,
+    "tool": FT_SYSTEM_FACT,
+    "knowledge": FT_KB_RULE,
+}
+
+
 @dataclass
 class StateEntry:
     object: str          # 业务对象（transfer_request / card_dbc_12345 / transfer_reason_rule）
@@ -50,8 +91,19 @@ class StateEntry:
     value: Any
     source: str          # user / tool / knowledge
     source_ref: Optional[str] = None
+    fact_type: str = ""  # 事实类型（空 = 取 _DEFAULT_FACT_TYPE[source]）
     seq: int = 0
     superseded_by: Optional[int] = None  # 被哪条 seq 取代（历史链）
+
+    @property
+    def effective_fact_type(self) -> str:
+        """写入方未声明类型时按 source 通用映射。"""
+        return self.fact_type or _DEFAULT_FACT_TYPE.get(self.source, FT_USER_STATEMENT)
+
+    @property
+    def authority(self) -> str:
+        """该条记录的权威来源（按事实类型,不按 source 全局排名）。"""
+        return AUTHORITY_BY_TYPE.get(self.effective_fact_type, "unverified")
 
     @property
     def key(self) -> str:
@@ -90,9 +142,15 @@ class TaskStateV3:
     # 写入
     # ------------------------------------------------------------------
     def set(self, obj: str, field_name: str, value: Any, source: str,
-            source_ref: Optional[str] = None) -> Optional[StateEntry]:
+            source_ref: Optional[str] = None,
+            fact_type: str = "") -> Optional[StateEntry]:
         """写入一条状态（同 key 旧条目自动 supersede——历史保留）。
 
+        fact_type: 事实类型（system_fact/user_statement/kb_rule/
+        user_preference）。写入方按提取规则声明——如 UserStateExtractor
+        的金额绑定是 user_statement,而"加急/称呼"类是 user_preference;
+        ToolResultStateExtractor 一律 system_fact;KnowledgeStateExtractor
+        一律 kb_rule。空 = 按 source 通用映射。
         返回 None = 空值被跳过；返回新条目。
         """
         if field_name in (None, "") or value in (None, ""):
@@ -119,7 +177,8 @@ class TaskStateV3:
                 return cur
         self._seq += 1
         entry = StateEntry(object=obj, field=field_name, value=value,
-                           source=source, source_ref=source_ref, seq=self._seq)
+                           source=source, source_ref=source_ref,
+                           fact_type=fact_type or "", seq=self._seq)
         # supersede：当前条目链上最后一条标记被取代
         if chain:
             chain[-1].superseded_by = self._seq
@@ -231,9 +290,82 @@ class TaskStateV3:
     def current_snapshot(self) -> dict:
         """trace 用：全部当前有效状态（superseded 排除，无历史——防膨胀）。"""
         return {k: {"value": c.value, "source": c.source,
-                    "ref": c.source_ref, "seq": c.seq}
+                    "ref": c.source_ref, "seq": c.seq,
+                    "fact_type": c.effective_fact_type}
                 for k, chain in self._entries.items()
                 if (c := chain[-1]) and c.is_current}
+
+    # ------------------------------------------------------------------
+    # 证据视图查询（V6 收紧:EvidenceView 从这里现算,不自建存储）
+    # ------------------------------------------------------------------
+    def evidence_records(self, fact_types: Optional[tuple] = None,
+                         max_entries: int = 30) -> list[StateEntry]:
+        """按事实类型取当前有效记录（EvidenceView 的唯一数据入口）。
+
+        fact_types: 过滤类型（None = 全部）。只返回 current 条目,
+        按 seq 升序——视图层自己排序渲染。这是"TaskState → Evidence
+        View"单向数据流的查询侧:视图无独立写入,每次现读现算。
+        """
+        out = []
+        for chain in self._entries.values():
+            cur = chain[-1] if chain else None
+            if not cur or not cur.is_current:
+                continue
+            if fact_types is not None and cur.effective_fact_type not in fact_types:
+                continue
+            out.append(cur)
+            if len(out) >= max_entries * 3:   # 采集上限防大状态扫描
+                break
+        return sorted(out, key=lambda e: e.seq)[:max_entries]
+
+    def latest_system_records(self, max_entries: int = 20) -> list[StateEntry]:
+        """每个 key 上【最近一次】tool/knowledge 写入的记录（视图用）。
+
+        不要求 current——用户后来改口（user 写入把 tool 记录挤到历史）
+        时,工具确认过的值仍然返回:系统事实不因用户口头改写而消失,
+        由视图呈现为 conflict。这是"系统事实权威"在查询侧的表达,
+        不改 set() 的 supersede 语义（V5 冻结行为零变更）。
+        """
+        out = []
+        for chain in self._entries.values():
+            rec = next((r for r in reversed(chain)
+                        if r.source in ("tool", "knowledge")), None)
+            if rec is not None:
+                out.append(rec)
+                if len(out) >= max_entries:
+                    break
+        return sorted(out, key=lambda e: e.seq)
+
+    def user_claim_records(self, max_entries: int = 10) -> list[StateEntry]:
+        """当前有效的用户陈述/偏好记录（视图的 unverified/偏好段来源）。"""
+        return self.evidence_records(
+            fact_types=(FT_USER_STATEMENT, FT_USER_PREFERENCE),
+            max_entries=max_entries)
+
+    def conflicting_statement_keys(self) -> list[str]:
+        """同 key 上用户陈述与系统事实并存且值矛盾的 key 列表。
+
+        "并存"的两种形态（TaskStateV3 每次写入 supersede 前一条,
+        同 key 同时只有一条 current）:
+        a) 系统值 current、用户旧陈述 superseded（tool 后到覆盖 claim）
+        b) 用户陈述 current、系统旧值 superseded（claim 后到但无权
+           抹掉系统事实——latest_system_records 仍可见系统值）
+        两种都算 conflict——决策层必须看到矛盾,零独立存储。
+        """
+        out = []
+        for key, chain in self._entries.items():
+            if len(chain) < 2:
+                continue
+            sys_rec = next((r for r in reversed(chain)
+                            if r.source in ("tool", "knowledge")), None)
+            user_rec = next((r for r in reversed(chain)
+                             if r.source == "user"), None)
+            if (sys_rec and user_rec
+                    and user_rec.effective_fact_type in (FT_USER_STATEMENT,
+                                                         FT_USER_PREFERENCE)
+                    and not _loose_eq(sys_rec.value, user_rec.value)):
+                out.append(key)
+        return out
 
     def drain_trace(self) -> list[dict]:
         """取出并清空 pending trace 事件（runner 每 task flush 到 v2 events）。"""
@@ -306,15 +438,48 @@ class UserStateExtractor:
     """用户消息 → 对象级状态（V3：动作金额绑到对应 request 命名空间）。
 
     延续 V2.3 的动作语境规则（余额描述不绑）。
+    V6 收紧:
+    - 通用 duration 自述提取（"about four months"/"2 days ago"…→
+      user_statement 类的 user_statement.duration,无任何业务语境限制
+      ——不猜它属于哪个业务,只记"用户这么说过"）
+    - 用户偏好/意愿模式（expedited/称呼/想选哪个）→ user_preference
+      ——这类事实用户本人是权威,系统工具不覆盖
     """
 
     STATE_MARKERS = re.compile(r"(balance|savings of|of about|worth|currently)", re.I)
+
+    # 通用 duration 自述:前缀限定词(可选) + 数词/数字 + 时间单位
+    _DURATION_RE = re.compile(
+        r"\b(?:about|around|roughly|over|more than|almost|nearly|at least)?\s*"
+        r"(?:a|an|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve"
+        r"|\d{1,3})\s*"
+        r"(months?|days?|years?|weeks?)\b", re.I)
+
+    # 用户偏好/意愿模式（用户本人权威的事实——通用词形,无业务绑定）
+    _PREFERENCE_RES = [
+        (re.compile(r"\bexpedited\b", re.I), "expedited_shipping"),
+        (re.compile(r"\brush\b|\burgent(ly)?\b", re.I), "priority"),
+    ]
 
     @classmethod
     def feed(cls, state: TaskStateV3, user_text: str,
              turn_ref: str = "") -> None:
         if not user_text:
             return
+        # 通用 duration 自述 → user_statement（待系统工具对齐;
+        # 落 TaskState,不再有旁路 ledger）
+        m = cls._DURATION_RE.search(user_text)
+        if m:
+            state.set("user_statement", "duration", m.group(0).strip().lower(),
+                      "user", source_ref=turn_ref,
+                      fact_type=FT_USER_STATEMENT)
+        # 用户偏好 → user_preference（用户本人权威）
+        for rex, fname in cls._PREFERENCE_RES:
+            pm = rex.search(user_text)
+            if pm:
+                state.set("user_preference", fname, pm.group(0).strip().lower(),
+                          "user", source_ref=turn_ref,
+                          fact_type=FT_USER_PREFERENCE)
         for m in _USER_NUM_RE.finditer(user_text):
             start = m.start()
             window = user_text[max(0, start - 40):start]
@@ -349,9 +514,19 @@ class ToolResultStateExtractor:
     - ID 字段（card_id/account_id/…）→ 实体对象 <type>_<id8> 的 .id
     - 同一记录块内的 status/balance/amount 等字段 → 挂到该实体对象
     - 无实体锚点的散字段 → 不入（防止来源不明的值污染全局）
+
+    V6 收紧:
+    - get_current_time 类工具结果 → 全局 system_fact 命名空间
+      "system.current_date"（时间锚点——决策视图的 P1 事实）。
+      之前这个能力长在独立 ledger 里（旁路喂入）,现在回到
+      TaskState 这个唯一事实源,与记录提取同一条数据流。
     """
 
     RECORD_ID_RE = re.compile(r"record\s+id\s*[:=]\s*(\S+)", re.I)
+    # 当前时间类工具的确定性识别（工具名匹配 + 文本日期提取）
+    CURRENT_TIME_TOOL_RE = re.compile(r"(get_current_time|current_time)", re.I)
+    TIME_VALUE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+
     FIELD_RES = {
         "user_id": re.compile(r"\buser_id\s*[:=]\s*(\S+)"),
         "account_id": re.compile(r"\baccount_id\s*[:=]\s*(\S+)"),
@@ -375,6 +550,12 @@ class ToolResultStateExtractor:
              result_text: str) -> None:
         if not result_text:
             return
+        # 时间类工具 → system.current_date（与记录提取同入口,零旁路）
+        if cls.CURRENT_TIME_TOOL_RE.search(tool_name or ""):
+            tm = cls.TIME_VALUE_RE.search(result_text)
+            if tm:
+                state.set("system", "current_date", tm.group(1), "tool",
+                          source_ref=tool_name, fact_type=FT_SYSTEM_FACT)
         text = result_text[:4000]
         # 防文档说明混入：文本是 schema 文档（含 "id: string" 式说明）
         # 的典型特征——两个以上 ID 字段的值是类型标记 → 整块跳过

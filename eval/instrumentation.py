@@ -176,7 +176,8 @@ _CALL_NAME_TO_ACTOR = {
     # V1 2-Agent：Decision Agent 复用 agent_response（LLMAgent 子类），
     # Knowledge Agent 用独立 call_name 区分
     "knowledge_agent_response": "knowledge_agent",
-    # V6.0：Decision Checkpoint 的单轮短判定调用（Runtime 注入）
+    # V6.1：checkpoint 不再有独立 LLM 判定调用（架构收紧——零额外
+    # 调用）;条目映射保留作历史 trace 兼容,新代码不产生该 call_name
     "decision_checkpoint": "decision_agent",
     "classify_authentication": "evaluator",
     "nl_assertions_eval": "evaluator",
